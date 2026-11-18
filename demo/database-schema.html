@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Follow an order through the warehouse and explore the database behind Aardvarkland WMS.">
+    <meta name="theme-color" content="#f2f8f4">
+    <title>Database Diagram · Aardvarkland WMS</title>
+    <link rel="icon" href="assets/logo.png">
+    <script>try{document.documentElement.dataset.theme=localStorage.getItem('wms-schema-theme')==='dark'?'dark':'light'}catch{};document.querySelector('meta[name="theme-color"]').content=document.documentElement.dataset.theme==='dark'?'#171d1a':'#f2f8f4'</script>
+    <link rel="stylesheet" href="database-schema.css?v=order-guide">
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="index.html"><span class="brand-mark"><img src="assets/logo.png" alt=""></span><span><strong>Aardvarkland WMS</strong><small data-i18n="pageName">Database diagram</small></span></a>
+      <div class="topbar-tools">
+        <button class="icon-button language-toggle" type="button" data-language-toggle aria-label="Switch to Czech" aria-pressed="false" title="Switch to Czech">
+          <svg class="flag-icon language-flag language-flag--en" viewBox="0 0 24 16" aria-hidden="true"><rect width="24" height="16" fill="#23406f"/><path d="M0 0 24 16M24 0 0 16" stroke="#fff" stroke-width="4"/><path d="M0 0 24 16M24 0 0 16" stroke="#c83b4a" stroke-width="1.5"/><path d="M12 0v16M0 8h24" stroke="#fff" stroke-width="6"/><path d="M12 0v16M0 8h24" stroke="#c83b4a" stroke-width="2.6"/></svg>
+          <svg class="flag-icon language-flag language-flag--cs" viewBox="0 0 24 16" aria-hidden="true"><rect width="24" height="8" fill="#fff"/><rect y="8" width="24" height="8" fill="#d7141a"/><path d="M0 0v16l12-8z" fill="#11457e"/></svg>
+        </button>
+        <button class="icon-button theme-button" type="button" data-theme-toggle aria-label="Switch to dark mode" aria-pressed="false" title="Switch to dark mode">
+          <svg class="theme-icon theme-icon--sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.42 1.42m11.3 11.3 1.42 1.42M2 12h2m16 0h2M4.93 19.07l1.42-1.42m11.3-11.3 1.42-1.42"/></svg>
+          <svg class="theme-icon theme-icon--moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.2 15.4A8.5 8.5 0 0 1 8.6 3.8 8.6 8.6 0 1 0 20.2 15.4Z"/></svg>
+        </button>
+        <a class="back-link" href="index.html" data-i18n="backLink">← Back to WMS preview</a>
+      </div>
+    </header>
+    <main class="page-shell">
+      <header class="presentation-intro">
+        <h1 data-i18n="presentationTitle">How an order leaves the warehouse</h1>
+        <p data-i18n="presentationIntro">Aardvarkland WMS helps warehouse teams track stock, find items in the right location, and check what went into each parcel.</p>
+        <nav class="presentation-switch" aria-label="Choose a view" data-i18n-aria="viewChoice">
+          <button type="button" data-schema-view="guide" aria-controls="order-guide" aria-pressed="true" data-i18n="guideView">Follow an order</button>
+          <button type="button" data-schema-view="diagram" aria-controls="diagram-view" aria-pressed="false" data-i18n="diagramView">Explore the database</button>
+        </nav>
+      </header>
+      <section id="order-guide" class="order-guide" aria-labelledby="guide-step-title">
+        <div class="guide-steps" role="group" aria-label="Order stages" data-i18n-aria="guideStages">
+          <button type="button" data-guide-step="0" aria-pressed="true" data-i18n="guidePicking">1. Picking</button>
+          <button type="button" data-guide-step="1" aria-pressed="false" data-i18n="guidePacking">2. Packing</button>
+          <button type="button" data-guide-step="2" aria-pressed="false" data-i18n="guideDispatch">3. Dispatch</button>
+        </div>
+        <div class="guide-summary" aria-live="polite" aria-atomic="true">
+          <h2 id="guide-step-title"></h2>
+          <p id="guide-step-copy"></p>
+        </div>
+        <ul id="guide-cards" class="guide-cards"></ul>
+        <footer class="guide-footer">
+          <a id="guide-demo-link" class="guide-demo-link" href="./?walkthrough=order&amp;lang=en" data-i18n="tryOrder">Try sample order</a>
+          <p data-i18n="sampleOrderNote">DEMO-1042 uses fictional data and simulates scanning and shipping.</p>
+        </footer>
+      </section>
+      <div id="diagram-view" hidden>
+      <section class="intro">
+        <div><p class="eyebrow" data-i18n="eyebrow">DATA MODEL · POSTGRESQL</p><h2 id="diagram-heading" tabindex="-1" data-i18n="title">Database diagram</h2><p class="lede" data-i18n="lede">Explore the tables and relationships behind the WMS. Select a table to open its connected group in the same diagram.</p></div>
+        <label class="search-box"><span aria-hidden="true">⌕</span><input id="table-search" list="table-options" type="search" placeholder="Find a table…" data-i18n-placeholder="searchPlaceholder" autocomplete="off"><datalist id="table-options"></datalist><kbd>/</kbd></label>
+      </section>
+      <section class="diagram-card" aria-label="Interactive database diagram" data-i18n-aria="diagramAria">
+        <div class="diagram-toolbar">
+          <nav id="breadcrumbs" class="breadcrumbs" aria-label="Diagram path" data-i18n-aria="pathAria"><button type="button" data-home>OVERVIEW</button></nav>
+          <div class="diagram-tools"><label id="group-filter-control" class="group-filter" hidden><span data-i18n="groupFilter">Group</span><select id="group-filter"><option value="all" data-i18n="allGroups">All groups</option></select></label><div class="diagram-actions"><span id="diagram-count" class="diagram-count">Loading schema…</span><button type="button" data-zoom="out" aria-label="Zoom out" data-i18n-aria="zoomOut">−</button><button type="button" data-zoom="in" aria-label="Zoom in" data-i18n-aria="zoomIn">+</button><button type="button" class="fit-button" data-fit aria-label="Fit diagram" data-i18n-aria="fitDiagram" data-i18n-title="fitDiagram" title="Fit diagram"><svg class="fit-icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M7 3H3v4M13 3h4v4M17 13v4h-4M7 17H3v-4M3 3l5 5m9-5-5 5m5 9-5-5m-9 5 5-5"/></svg></button><button type="button" data-home aria-label="Show overview" data-i18n-aria="showOverview" data-i18n="overview">Overview</button></div></div>
+        </div>
+        <div class="diagram-stage" id="diagram-stage">
+          <svg id="diagram" viewBox="0 0 1600 920" role="img" aria-label="Connected tables in the WMS database" data-i18n-aria="diagramSvgAria">
+            <defs><pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r=".8" fill="#cfe0d5"/></pattern></defs>
+            <rect class="grid-bg" x="0" y="0" width="100%" height="100%" fill="url(#grid)" />
+            <g transform="scale(.68)"><g id="edges-layer"></g><g id="nodes-layer"></g></g>
+          </svg>
+          <div id="loading" class="loading" data-i18n="loading">Loading table relationships…</div>
+        </div>
+        <div class="diagram-legend"><span><i class="legend-line"></i><span data-i18n="solidLegend">Schema-defined relationship</span></span><span><i class="legend-line legend-line--dashed"></i><span data-i18n="dashedLegend">ID-field reference</span></span><span><i class="legend-dot"></i>1 : N</span><span class="legend-hint" data-i18n="panHint">Drag to pan · scroll or use buttons to zoom</span></div>
+      </section>
+      <aside id="details" class="details" aria-live="polite">
+        <div class="details-empty"><span class="eyebrow" data-i18n="howToRead">HOW TO READ THE DIAGRAM</span><h2 data-i18n="startOverview">Start with the overview</h2><p data-i18n="readIntro">Each box represents a database table. Lines show relationships between tables. Select a box to open its connected group; select another table to continue exploring.</p><p data-i18n="readRelationships">Solid lines represent relationships defined in the schema. Dashed lines represent references inferred from ID fields that are not declared as database foreign keys.</p></div>
+      </aside>
+      </div>
+      <footer class="page-footer"><span data-i18n="footerGenerated">Generated from the current WMS data model.</span><span data-i18n="footerNote">Shows database structure, not live warehouse records.</span></footer>
+    </main>
+    <script src="database-schema.js?v=order-guide" defer></script>
+  </body>
+</html>
