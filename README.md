@@ -2,7 +2,7 @@
 
 Self-hosted warehouse software for receiving, stock control, picking, packing and shipping. The application uses a React frontend, a NestJS API and PostgreSQL.
 
-[Live Preview](https://michalmachalik.github.io/Aardvarkland-WMS-Public/) · [Order guide and interactive database map](https://michalmachalik.github.io/Aardvarkland-WMS-Public/database-schema.html) · [Order walkthrough](https://michalmachalik.github.io/Aardvarkland-WMS-Public/?walkthrough=order&lang=en) · [WMS Mini](https://github.com/MichalMachalik/Aardvarkland-WMS-Mini-Public)
+[Live Preview](https://michalmachalik.github.io/Aardvarkland-WMS/) · [Order guide and interactive database map](https://michalmachalik.github.io/Aardvarkland-WMS/database-schema.html) · [Order walkthrough](https://michalmachalik.github.io/Aardvarkland-WMS/?walkthrough=order&lang=en) · [WMS Mini](https://github.com/MichalMachalik/Aardvarkland-WMS-Mini)
 
 Choose a sample worker, manager or administrator to explore the browser preview. The guided order runs through picking, packing and dispatch with fictional data. Printing, integrations and dispatch are simulated locally.
 
@@ -24,8 +24,8 @@ In the manager preview, open **Cycle counts** to create and release a plan, reco
 Requires Docker Desktop with Compose.
 
 ```bash
-git clone https://github.com/MichalMachalik/Aardvarkland-WMS-Public.git
-cd Aardvarkland-WMS-Public
+git clone https://github.com/MichalMachalik/Aardvarkland-WMS.git
+cd Aardvarkland-WMS
 docker compose up --build
 ```
 
