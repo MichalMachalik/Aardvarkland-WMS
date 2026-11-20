@@ -73,6 +73,15 @@ For local testing, set `BASE_COM_API_URL` to a loopback mock and use a test toke
 
 ## Checks
 
+To run the published walkthrough on localhost, build the static preview from the repository root and open the [guided order](http://127.0.0.1:4176/?walkthrough=order&lang=en). Picking, packing and dispatch in this build use fictional records in the browser. The server-side Base.com flow uses the NestJS API and PostgreSQL described above.
+
+```sh
+node demo/scripts/build-pages-artifact.mjs
+python -m http.server 4176 --bind 127.0.0.1 --directory demo/_site
+```
+
+Run the application checks after installing the backend and frontend dependencies.
+
 ```bash
 cd backend && npm run verify
 cd ../frontend && npm run typecheck && npm run lint && npm run build && npm test
