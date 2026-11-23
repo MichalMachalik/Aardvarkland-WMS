@@ -238,14 +238,14 @@ export function exportInvoiceCsv(input: {
     input.warehouseCode,
     toIsoDate(input.periodStart),
     toIsoDate(input.periodEnd),
-    String(line.lineNumber),
+    line.lineNumber,
     line.eventType,
     line.description,
-    String(line.quantity),
-    String(line.netAmountMinor ?? line.amountMinor),
-    line.vatRateBps === undefined || line.vatRateBps === null ? '' : String(line.vatRateBps),
-    String(line.taxAmountMinor ?? 0),
-    String(line.grossAmountMinor ?? line.amountMinor),
+    line.quantity,
+    line.netAmountMinor ?? line.amountMinor,
+    line.vatRateBps === undefined || line.vatRateBps === null ? '' : line.vatRateBps,
+    line.taxAmountMinor ?? 0,
+    line.grossAmountMinor ?? line.amountMinor,
     line.currency,
   ]);
   return [header, ...rows].map((row) => row.map(csvEscape).join(',')).join('\n');
@@ -360,14 +360,14 @@ export function exportCreditNoteCsv(input: {
     input.invoiceNumber,
     input.clientCode,
     input.warehouseCode,
-    String(line.lineNumber),
+    line.lineNumber,
     line.eventType,
     line.description,
-    String(line.quantity),
-    String(line.netAmountMinor ?? line.amountMinor),
-    line.vatRateBps === undefined || line.vatRateBps === null ? '' : String(line.vatRateBps),
-    String(line.taxAmountMinor ?? 0),
-    String(line.grossAmountMinor ?? line.amountMinor),
+    line.quantity,
+    line.netAmountMinor ?? line.amountMinor,
+    line.vatRateBps === undefined || line.vatRateBps === null ? '' : line.vatRateBps,
+    line.taxAmountMinor ?? 0,
+    line.grossAmountMinor ?? line.amountMinor,
     line.currency,
   ]);
   return [header, ...rows].map((row) => row.map(csvEscape).join(',')).join('\n');
@@ -593,8 +593,12 @@ function toIsoDate(value: Date | string): string {
   return new Date(value).toISOString().slice(0, 10);
 }
 
-function csvEscape(value: string): string {
-  return /[",\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
+function csvEscape(value: string | number): string {
+  const text = String(value);
+  if (typeof value === 'string' && /^[\s\uFEFF]*[=+\-@＝＋－＠]/u.test(text)) {
+    return '"' + '\t' + text.replaceAll('"', '""') + '"';
+  }
+  return /[",;\r\n]/.test(text) ? '"' + text.replaceAll('"', '""') + '"' : text;
 }
 
 function shortHash(value: string): string {

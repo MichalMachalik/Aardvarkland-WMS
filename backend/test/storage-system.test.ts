@@ -5,7 +5,32 @@ import { cwd } from 'node:process';
 import test from 'node:test';
 
 import { getHomePageHtml } from '../src/app-home.page';
+import { exportCreditNoteCsv, exportInvoiceCsv } from '../src/clients/billing-invoice.helpers';
 import { validateEnv } from '../src/config/env';
+
+test('billing CSV escapes user text and preserves signed numeric amounts', () => {
+  const fixture = {
+    creditNoteNumber: 'QA-CREDIT',
+    invoiceNumber: 'QA-INVOICE',
+    clientCode: '@QA',
+    warehouseCode: 'QA',
+    periodStart: '2026-01-01',
+    periodEnd: '2026-01-31',
+    lines: [{
+      lineNumber: 1,
+      eventType: 'ADJUSTMENT',
+      description: ' =1+2",QA',
+      quantity: -1,
+      amountMinor: -100,
+      currency: 'CZK',
+    }],
+  };
+
+  for (const csv of [exportInvoiceCsv(fixture), exportCreditNoteCsv(fixture)]) {
+    assert.ok(csv.includes('"\t@QA"'));
+    assert.ok(csv.includes('"\t =1+2"",QA",-1,-100,,0,-100,CZK'));
+  }
+});
 
 test('package metadata is product scoped', () => {
   const pkg = JSON.parse(readFileSync(join(cwd(), 'package.json'), 'utf8')) as {
