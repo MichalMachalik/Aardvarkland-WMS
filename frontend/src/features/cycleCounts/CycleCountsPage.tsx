@@ -42,6 +42,9 @@ interface CycleCountTask {
 
 const emptyPlans: CycleCountPlan[] = [];
 const emptyTasks: CycleCountTask[] = [];
+const emptyTaskList = { warehouseId: '', planId: '', tasks: emptyTasks };
+const emptyCountForm = { countedQuantity: '', reason: '' };
+const maxCount = 2_147_483_647;
 const scopeTypes = ['LOCATION', 'SKU', 'ZONE', 'ALL'];
 const planStatuses = ['DRAFT', 'RELEASED', 'COUNTING', 'RECONCILING', 'APPROVED', 'CANCELLED'];
 
@@ -61,7 +64,7 @@ export function CycleCountsPage() {
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [planForm, setPlanForm] = useState({ code: '', scopeType: 'LOCATION', scopeReference: '', reason: '' });
   const [releaseBlindCount, setReleaseBlindCount] = useState(true);
-  const [countForm, setCountForm] = useState({ countedQuantity: '0', reason: '' });
+  const [countForm, setCountForm] = useState(emptyCountForm);
 
   const rows = useMemo(() => {
     const query = filter.query.trim().toLowerCase();
@@ -71,26 +74,48 @@ export function CycleCountsPage() {
       return queryMatches && statusMatches;
     });
   }, [filter.query, filter.status, plansResource.data]);
-  const selectedPlan = plansResource.data.find((plan) => plan.id === selectedPlanId) ?? rows[0];
-  const tasksResource = useApiResource<CycleCountTask[]>({
-    fallback: emptyTasks,
-    productionFallback: emptyTasks,
-    enabled: Boolean(selectedPlan?.id),
-    loader: () => listCycleCountTasks<unknown[]>(warehouseId, selectedPlan?.id ?? ''),
-    map: mapTasks,
-    dependencies: [warehouseId, selectedPlan?.id],
+  const selectedPlan = rows.find((plan) => plan.id === selectedPlanId);
+  const planId = selectedPlan?.id ?? '';
+  const tasksResource = useApiResource<typeof emptyTaskList>({
+    fallback: emptyTaskList,
+    productionFallback: emptyTaskList,
+    enabled: Boolean(planId),
+    loader: async () => ({
+      warehouseId,
+      planId,
+      tasks: mapTasks(await listCycleCountTasks<unknown[]>(warehouseId, planId)),
+    }),
+    map: (payload) => payload as typeof emptyTaskList,
+    dependencies: [warehouseId, planId],
   });
-  const selectedTask = tasksResource.data.find((task) => task.id === selectedTaskId) ?? tasksResource.data[0];
+  const tasks = tasksResource.data.warehouseId === warehouseId && tasksResource.data.planId === planId
+    ? tasksResource.data.tasks
+    : emptyTasks;
+  const selectedTask = tasks.find((task) => task.id === selectedTaskId);
+  const countedQuantity = Number(countForm.countedQuantity);
+  const validCount = /^\d+$/.test(countForm.countedQuantity.trim()) && countedQuantity <= maxCount;
+  const canEnterCount = tasksResource.status === 'live' && Boolean(selectedTask && ['OPEN', 'IN_PROGRESS'].includes(selectedTask.status));
+  const canSubmitCount = canEnterCount && validCount && mutation.status !== 'running';
+  const canApproveCount = tasksResource.status === 'live' && selectedTask?.status === 'SUBMITTED' && mutation.status !== 'running';
+  const canReleasePlan = plansResource.status === 'live' && selectedPlan?.status === 'DRAFT' && mutation.status !== 'running';
+  const canCreatePlan = mutation.status !== 'running' && (planForm.scopeType === 'ALL' || Boolean(planForm.scopeReference.trim()));
   const openPlans = plansResource.data.filter((plan) => !['APPROVED', 'CANCELLED'].includes(plan.status)).length;
-  const submittedTasks = tasksResource.data.filter((task) => task.status === 'SUBMITTED').length;
-  const varianceTasks = tasksResource.data.filter((task) => (task.varianceQuantity ?? 0) !== 0).length;
+  const submittedTasks = tasks.filter((task) => task.status === 'SUBMITTED').length;
+  const varianceTasks = tasks.filter((task) => (task.varianceQuantity ?? 0) !== 0).length;
+
+  function selectPlan(id: string | null) {
+    setSelectedPlanId(id);
+    setSelectedTaskId(null);
+    setCountForm(emptyCountForm);
+    setReleaseBlindCount(true);
+  }
 
   const planColumns: Column<CycleCountPlan>[] = [
     { key: 'code', label: text.columns.code, render: (row) => <strong>{row.code}</strong> },
     { key: 'status', label: text.columns.status, render: (row) => <Badge tone={row.status === 'APPROVED' ? 'good' : row.status === 'RECONCILING' ? 'warning' : 'neutral'}>{planStatusLabel(row.status, language)}</Badge> },
     { key: 'scope', label: text.columns.scope, render: (row) => `${scopeLabel(row.scopeType, language)} ${row.scopeReference ?? ''}`.trim() },
     { key: 'released', label: text.columns.released, render: (row) => row.releasedAt ? formatDate(row.releasedAt) : text.notSet },
-    { key: 'action', label: text.columns.action, align: 'right', render: (row) => <Button size="sm" type="button" onClick={() => { setSelectedPlanId(row.id); setSelectedTaskId(null); }}>{text.select}</Button> },
+    { key: 'action', label: text.columns.action, align: 'right', render: (row) => <Button size="sm" type="button" aria-pressed={selectedPlan?.id === row.id} onClick={() => selectPlan(row.id)}>{text.select}</Button> },
   ];
   const taskColumns: Column<CycleCountTask>[] = [
     { key: 'task', label: text.columns.task, render: (row) => <strong>{shortId(row.warehouseTaskId ?? row.id)}</strong> },
@@ -99,25 +124,28 @@ export function CycleCountsPage() {
     { key: 'counted', label: text.columns.counted, align: 'right', render: (row) => row.countedQuantity ?? text.notSet },
     { key: 'variance', label: text.columns.variance, align: 'right', render: (row) => row.varianceQuantity ?? text.notSet },
     { key: 'status', label: text.columns.status, render: (row) => <Badge tone={row.status === 'APPROVED' ? 'good' : row.status === 'SUBMITTED' || row.status === 'REJECTED' ? 'warning' : 'neutral'}>{taskStatusLabel(row.status, language)}</Badge> },
-    { key: 'action', label: text.columns.action, align: 'right', render: (row) => <Button size="sm" type="button" onClick={() => { setSelectedTaskId(row.id); setCountForm((form) => ({ ...form, countedQuantity: String(row.countedQuantity ?? row.expectedQuantity ?? 0) })); }}>{text.select}</Button> },
+    { key: 'action', label: text.columns.action, align: 'right', render: (row) => <Button size="sm" type="button" aria-pressed={selectedTask?.id === row.id} onClick={() => { setSelectedTaskId(row.id); setCountForm(emptyCountForm); }}>{text.select}</Button> },
   ];
 
   async function createPlan(event: FormEvent) {
     event.preventDefault();
-    const result = await mutation.run(text.actions.createPlan, () => createCycleCountPlan(warehouseId, {
-      code: planForm.code || undefined,
+    if (!canCreatePlan) return;
+    const result = await mutation.run(text.actions.createPlan, () => createCycleCountPlan<CycleCountPlan>(warehouseId, {
+      code: planForm.code.trim() || undefined,
       scopeType: planForm.scopeType,
-      scopeReference: planForm.scopeType === 'ALL' ? undefined : planForm.scopeReference,
-      metadata: { reason: planForm.reason || undefined, source: 'cycle-count-ui' },
+      scopeReference: planForm.scopeType === 'ALL' ? undefined : planForm.scopeReference.trim(),
+      metadata: { reason: planForm.reason.trim() || undefined, source: 'cycle-count-ui' },
     }));
     if (result) {
       setPlanForm({ code: '', scopeType: 'LOCATION', scopeReference: '', reason: '' });
+      setFilter({ query: '', status: '' });
+      selectPlan(result.id);
       plansResource.refresh();
     }
   }
 
   async function releasePlan() {
-    if (!selectedPlan) return;
+    if (!canReleasePlan || !selectedPlan) return;
     const result = await mutation.run(text.actions.releasePlan, () => releaseCycleCountPlan(warehouseId, selectedPlan.id, {
       metadata: { hideExpectedFromRf: releaseBlindCount, source: 'cycle-count-ui' },
     }));
@@ -129,9 +157,9 @@ export function CycleCountsPage() {
 
   async function submitTask(event: FormEvent) {
     event.preventDefault();
-    if (!selectedTask) return;
+    if (!canSubmitCount || !selectedTask) return;
     const result = await mutation.run(text.actions.submitTask, () => submitCycleCountTask(warehouseId, selectedTask.id, {
-      countedQuantity: Number(countForm.countedQuantity) || 0,
+      countedQuantity,
       metadata: { source: 'cycle-count-ui' },
     }));
     if (result) {
@@ -141,7 +169,7 @@ export function CycleCountsPage() {
   }
 
   async function approveTask() {
-    if (!selectedTask) return;
+    if (!canApproveCount || !selectedTask) return;
     const result = await mutation.run(text.actions.approveTask, () => approveCycleCountTask(warehouseId, selectedTask.id, {
       reason: countForm.reason || undefined,
       metadata: { source: 'cycle-count-ui' },
@@ -163,7 +191,7 @@ export function CycleCountsPage() {
       <Card title={text.health} className="span-12">
         <div className="metric-stack metric-stack--inline">
           <article><span>{text.metrics.openPlans}</span><strong>{openPlans}</strong></article>
-          <article><span>{text.metrics.tasks}</span><strong>{tasksResource.data.length}</strong></article>
+          <article><span>{text.metrics.tasks}</span><strong>{tasks.length}</strong></article>
           <article><span>{text.metrics.submitted}</span><strong>{submittedTasks}</strong></article>
           <article><span>{text.metrics.variances}</span><strong>{varianceTasks}</strong></article>
         </div>
@@ -184,8 +212,12 @@ export function CycleCountsPage() {
             <article><span>{text.columns.scope}</span><strong>{scopeLabel(selectedPlan.scopeType, language)} {selectedPlan.scopeReference ?? ''}</strong></article>
             <article><span>{text.columns.approved}</span><strong>{selectedPlan.approvedAt ? formatDate(selectedPlan.approvedAt) : text.notSet}</strong></article>
             <PermissionGate permission="cycle-count.manage">
-              <label className="checkbox-row"><input type="checkbox" checked={releaseBlindCount} onChange={(event) => setReleaseBlindCount(event.target.checked)} />{text.fields.blindCount}</label>
-              <Button type="button" onClick={releasePlan} disabled={mutation.status === 'running' || selectedPlan.status !== 'DRAFT'}>{text.release}</Button>
+              {selectedPlan.status === 'DRAFT' && (
+                <>
+                  <label className="checkbox-row"><input type="checkbox" checked={releaseBlindCount} onChange={(event) => setReleaseBlindCount(event.target.checked)} />{text.fields.blindCount}</label>
+                  <Button type="button" onClick={releasePlan} disabled={!canReleasePlan}>{text.release}</Button>
+                </>
+              )}
             </PermissionGate>
           </div>
         ) : <p className="muted-copy">{text.emptySelection}</p>}
@@ -193,29 +225,29 @@ export function CycleCountsPage() {
 
       <Card title={text.tasks} className="span-8">
         <DataSourceBanner label={text.tasks} resource={tasksResource} />
-        <DataTable rows={tasksResource.data} columns={taskColumns} getRowKey={(row) => row.id} emptyTitle={text.emptyTasksTitle} emptyText={text.emptyTasksText} />
+        <DataTable rows={tasks} columns={taskColumns} getRowKey={(row) => row.id} emptyTitle={text.emptyTasksTitle} emptyText={text.emptyTasksText} />
       </Card>
 
       <PermissionGate permission="cycle-count.manage">
         <Card title={text.countAction} eyebrow={selectedTask ? shortId(selectedTask.id) : text.notSet} className="span-4">
-          <form className="stacked-form" onSubmit={submitTask}>
-            <label>{text.fields.counted}<input value={countForm.countedQuantity} onChange={(event) => setCountForm((form) => ({ ...form, countedQuantity: event.target.value }))} inputMode="numeric" /></label>
-            <label>{text.fields.reason}<textarea value={countForm.reason} onChange={(event) => setCountForm((form) => ({ ...form, reason: event.target.value }))} rows={3} /></label>
+          <form aria-label={text.countAction} className="stacked-form" onSubmit={submitTask}>
+            <label>{text.fields.counted}<input type="number" min={0} max={maxCount} step={1} required value={countForm.countedQuantity} onChange={(event) => setCountForm((form) => ({ ...form, countedQuantity: event.target.value }))} inputMode="numeric" disabled={!canEnterCount || mutation.status === 'running'} /></label>
+            <label>{text.fields.reason}<textarea value={countForm.reason} onChange={(event) => setCountForm((form) => ({ ...form, reason: event.target.value }))} rows={3} disabled={!canApproveCount} /></label>
             <div className="form-actions">
-              <Button tone="primary" type="submit" disabled={mutation.status === 'running' || !selectedTask || !['OPEN', 'IN_PROGRESS'].includes(selectedTask.status)}>{text.submit}</Button>
-              <Button type="button" onClick={approveTask} disabled={mutation.status === 'running' || selectedTask?.status !== 'SUBMITTED'}>{text.approve}</Button>
+              <Button tone="primary" type="submit" disabled={!canSubmitCount}>{text.submit}</Button>
+              <Button type="button" onClick={approveTask} disabled={!canApproveCount}>{text.approve}</Button>
             </div>
           </form>
           <ActionStatus mutation={mutation} />
         </Card>
 
         <Card title={text.createPlan} className="span-12">
-          <form className="stacked-form" onSubmit={createPlan}>
-            <label>{text.fields.code}<input value={planForm.code} onChange={(event) => setPlanForm((form) => ({ ...form, code: event.target.value }))} /></label>
+          <form aria-label={text.createPlan} className="stacked-form" onSubmit={createPlan}>
+            <label>{text.fields.code}<input maxLength={80} value={planForm.code} onChange={(event) => setPlanForm((form) => ({ ...form, code: event.target.value }))} /></label>
             <label>{text.fields.scope}<select value={planForm.scopeType} onChange={(event) => setPlanForm((form) => ({ ...form, scopeType: event.target.value }))}>{scopeTypes.map((scope) => <option key={scope} value={scope}>{scopeLabel(scope, language)}</option>)}</select></label>
-            <label>{text.fields.scopeReference}<input value={planForm.scopeReference} onChange={(event) => setPlanForm((form) => ({ ...form, scopeReference: event.target.value }))} disabled={planForm.scopeType === 'ALL'} /></label>
+            <label>{text.fields.scopeReference}<input maxLength={120} required={planForm.scopeType !== 'ALL'} value={planForm.scopeReference} onChange={(event) => setPlanForm((form) => ({ ...form, scopeReference: event.target.value }))} disabled={planForm.scopeType === 'ALL'} /></label>
             <label>{text.fields.reason}<input value={planForm.reason} onChange={(event) => setPlanForm((form) => ({ ...form, reason: event.target.value }))} /></label>
-            <Button tone="primary" type="submit" disabled={mutation.status === 'running'}>{text.save}</Button>
+            <Button tone="primary" type="submit" disabled={!canCreatePlan}>{text.save}</Button>
           </form>
         </Card>
       </PermissionGate>

@@ -1,7 +1,8 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 
 import { AuthenticatedUser } from '../access-control/types';
 import { lockPostgresRowById, PrismaService, withTransactionRetry } from '../database';
+import { assertNoBlockingStockFreeze } from '../inventory/stock-freeze.helpers';
 import { calculateCountVariance, makeCycleCountPlanCode } from './cycle-counts.helpers';
 import {
   CycleCountApprovalResponse,
@@ -37,13 +38,18 @@ export class CycleCountsService {
     actor: AuthenticatedUser,
   ): Promise<CycleCountPlanResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
+    const scopeType = dto.scopeType ?? CycleCountScopeType.LOCATION;
+    const scopeReference = normalizeNullableString(dto.scopeReference);
+    if (scopeType !== CycleCountScopeType.ALL && !scopeReference) {
+      throw new BadRequestException(`${scopeType} cycle count requires a scope reference`);
+    }
     const plan = await this.client.cycleCountPlan.create({
       data: {
         warehouseId: warehouse.id,
-        code: normalizeCode(dto.code ?? makeCycleCountPlanCode()),
+        code: normalizeNullableString(dto.code)?.toUpperCase() ?? makeCycleCountPlanCode(),
         status: CycleCountPlanStatus.DRAFT,
-        scopeType: dto.scopeType ?? CycleCountScopeType.LOCATION,
-        scopeReference: normalizeNullableString(dto.scopeReference),
+        scopeType,
+        scopeReference: scopeType === CycleCountScopeType.ALL ? null : scopeReference,
         createdByUserId: actor.id,
         metadata: dto.metadata ?? undefined,
       },
@@ -90,8 +96,21 @@ export class CycleCountsService {
 
       let tasksCreated = 0;
       let freezesCreated = 0;
+      const blindCount = dto.metadata?.['hideExpectedFromRf'] !== false;
 
-      for (const quant of quants) {
+      for (const candidateQuant of quants.sort((left, right) => left.id.localeCompare(right.id))) {
+        await lockPostgresRowById(tx, 'stock_quants', candidateQuant.id);
+        const quant = await tx.stockQuant.findFirst({ where: { id: candidateQuant.id } });
+        if (!quant || !['AVAILABLE', 'RESERVED'].includes(quant.status)) {
+          throw new ConflictException('Stock changed while releasing the cycle count plan');
+        }
+        await assertNoBlockingStockFreeze(tx, {
+          warehouseId: warehouse.id,
+          stockQuantId: quant.id,
+          locationId: quant.locationId,
+          skuId: quant.skuId,
+          operation: 'cycle count release',
+        });
         const task = await tx.warehouseTask.create({
           data: {
             warehouseId: warehouse.id,
@@ -99,12 +118,12 @@ export class CycleCountsService {
             status: 'OPEN',
             skuId: quant.skuId,
             fromLocationId: quant.locationId,
-            quantity: quant.quantity,
+            quantity: blindCount ? null : quant.quantity,
             priority: 80,
             metadata: {
               cycleCountPlanId: plan.id,
               stockQuantId: quant.id,
-              blindCount: true,
+              blindCount,
               releaseMetadata: dto.metadata ?? null,
             },
           },
@@ -120,7 +139,7 @@ export class CycleCountsService {
             expectedQuantity: quant.quantity,
             status: CycleCountTaskStatus.OPEN,
             metadata: {
-              blindCount: true,
+              blindCount,
               releaseMetadata: dto.metadata ?? null,
             },
           },
@@ -201,14 +220,15 @@ export class CycleCountsService {
     const warehouse = await this.resolveWarehouse(warehouseReference);
 
     return this.transaction(async (tx: CycleCountTransactionClient) => {
-      const countTask = await this.resolveCountTaskWithClient(tx, warehouse.id, taskReference);
+      const candidate = await this.resolveCountTaskWithClient(tx, warehouse.id, taskReference);
+      if (candidate.warehouseTaskId) {
+        await lockPostgresRowById(tx, 'warehouse_tasks', candidate.warehouseTaskId);
+      }
+      await lockPostgresRowById(tx, 'cycle_count_plans', candidate.planId);
+      const countTask = await this.resolveCountTaskWithClient(tx, warehouse.id, candidate.id);
 
       if (!['OPEN', 'IN_PROGRESS'].includes(countTask.status)) {
         throw new ConflictException('Cycle count task cannot be submitted from current status');
-      }
-
-      if (countTask.warehouseTaskId) {
-        await lockPostgresRowById(tx, 'warehouse_tasks', countTask.warehouseTaskId);
       }
 
       const varianceQuantity = calculateCountVariance(
@@ -321,7 +341,7 @@ export class CycleCountsService {
             stockQuantId: stockQuant.id,
             actorUserId: actor.id,
             type: 'ADJUST',
-            quantity: variance,
+            quantity: Math.abs(variance),
             fromLocationId: variance < 0 ? countTask.locationId : null,
             toLocationId: variance > 0 ? countTask.locationId : null,
             referenceType: 'cycle_count_task',
@@ -331,6 +351,7 @@ export class CycleCountsService {
               expectedQuantity: countTask.expectedQuantity,
               countedQuantity: countTask.countedQuantity,
               varianceQuantity: variance,
+              quantityDelta: variance,
               approvalMetadata: dto.metadata ?? null,
             },
           },

@@ -77,7 +77,15 @@ test('RF count completion rejects a linked cycle-count task without a counted qu
   assert.equal(calls.warehouseTaskUpdates.length, 0);
 });
 
-function createRfCycleCountService(): {
+test('an open blind count from an earlier version hides the stored RF quantity', async () => {
+  const { service } = createRfCycleCountService(null);
+  const result = await service.getSession('MAIN', 'session-1');
+  assert.equal(result.task?.quantity, null);
+  assert.deepEqual(result.step.expected, { type: 'QUANTITY', value: null });
+  assert.doesNotMatch(result.step.instruction, /10/);
+});
+
+function createRfCycleCountService(taskQuantity: number | null = 10): {
   calls: RecordedCalls;
   service: RfWorkflowsService;
 } {
@@ -108,7 +116,7 @@ function createRfCycleCountService(): {
     assignedUserId: 'worker-1',
     assignedAt: new Date('2026-05-22T09:00:00.000Z'),
     startedAt: new Date('2026-05-22T09:00:00.000Z'),
-    quantity: 10,
+    quantity: taskQuantity,
     skuId: 'sku-1',
     fromLocationId: 'loc-1',
     toLocationId: null,

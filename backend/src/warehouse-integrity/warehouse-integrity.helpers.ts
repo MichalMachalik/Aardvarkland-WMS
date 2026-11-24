@@ -313,7 +313,7 @@ function validateWarehouseTasks(snapshot: WarehouseIntegritySnapshot): Warehouse
         issues.push(errorIssue('WAREHOUSE_TASK_DONE_WITHOUT_COMPLETED_AT', 'warehouse_task', task.id, 'Completed warehouse task must have a completedAt timestamp.'));
       }
 
-      if (quantity <= 0) {
+      if (task.type !== 'COUNT' && quantity <= 0) {
         issues.push(errorIssue('WAREHOUSE_TASK_DONE_NON_POSITIVE_QUANTITY', 'warehouse_task', task.id, 'Completed warehouse task quantity must be positive.', 1, quantity));
       }
     }

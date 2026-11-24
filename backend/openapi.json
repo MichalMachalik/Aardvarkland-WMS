@@ -19181,7 +19181,9 @@
         "properties": {
           "countedQuantity": {
             "type": "number",
-            "example": 47
+            "example": 47,
+            "minimum": 0,
+            "maximum": 2147483647
           },
           "metadata": {
             "type": "object",
@@ -19189,7 +19191,10 @@
               "scannerSessionId": "..."
             }
           }
-        }
+        },
+        "required": [
+          "countedQuantity"
+        ]
       },
       "ApproveCycleCountDto": {
         "type": "object",

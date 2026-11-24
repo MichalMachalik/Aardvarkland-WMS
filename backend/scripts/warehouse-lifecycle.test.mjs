@@ -147,9 +147,15 @@ test('warehouse workflows on a disposable database', {
     const plan = await own('/cycle-counts', {
       code: `COUNT-TEST-${run}`, scopeType: 'SKU', scopeReference: countedSku,
     });
+    await own('/cycle-counts', { scopeType: 'SKU', scopeReference: ' ' }, 400);
+    const overlapping = await own('/cycle-counts', {
+      code: `COUNT-OVERLAP-${run}`, scopeType: 'SKU', scopeReference: countedSku,
+    });
     const released = await own(`/cycle-counts/${plan.code}/release`, {});
     assert.equal(released.plan.status, 'RELEASED');
     assert.equal(released.tasksCreated, 2);
+    await own(`/cycle-counts/${overlapping.id}/release`, {}, 409);
+    assert.deepEqual(await own(`/cycle-counts/${overlapping.id}/tasks`), []);
     const tasks = await own(`/cycle-counts/${plan.id}/tasks`);
     const sourceTask = tasks.find(task => task.stockQuantId === sourceId);
     const destinationTask = tasks.find(task => task.stockQuantId === destinationId);
@@ -160,7 +166,21 @@ test('warehouse workflows on a disposable database', {
     await own('/inventory/quants/receive', {
       skuReference: countedSku, locationReference: 'A-01-01', quantity: 1, status: 'AVAILABLE',
     }, 409);
-    const counted = await own(`/cycle-counts/tasks/${destinationTask.id}/submit`, { countedQuantity: 4 });
+    const submitPath = `/cycle-counts/tasks/${destinationTask.id}/submit`;
+    for (const countedQuantity of [undefined, null, '', ' ', false, [], -1, 1.5, 2147483648]) {
+      await own(submitPath, { countedQuantity }, 400);
+    }
+    assert.equal((await own(`/cycle-counts/${plan.id}/tasks`)).find(task => task.id === destinationTask.id).status, 'OPEN');
+    const submissions = await Promise.allSettled([
+      own(submitPath, { countedQuantity: 4 }),
+      own(submitPath, { countedQuantity: '4' }),
+    ]);
+    const accepted = submissions.filter(result => result.status === 'fulfilled');
+    const rejected = submissions.filter(result => result.status === 'rejected');
+    assert.equal(accepted.length, 1, JSON.stringify(submissions));
+    assert.equal(rejected.length, 1);
+    assert.match(rejected[0].reason.message, /returned 409/);
+    const counted = accepted[0].value;
     assert.equal(counted.varianceQuantity, 1);
     assert.equal((await own(`/inventory/quants/${destinationId}`)).quantity, 3);
     const approvalPath = `/cycle-counts/tasks/${destinationTask.id}/approve`;
@@ -172,7 +192,22 @@ test('warehouse workflows on a disposable database', {
     assert.equal(conflicts.length, 1);
     assert.match(conflicts[0].reason.message, /returned 409/);
     assert.equal((await own(`/inventory/quants/${destinationId}`)).quantity, 4);
-    await own(`/cycle-counts/tasks/${sourceTask.id}/submit`, { countedQuantity: 3 });
+    try {
+      token = worker.accessToken;
+      const rfPath = '/rf/sessions';
+      const instruction = await own(rfPath, { taskReference: sourceTask.warehouseTaskId });
+      assert.equal(instruction.task.quantity, null);
+      const scan = `${rfPath}/${instruction.sessionId}/scan`;
+      await own(scan, { scannedValue: 'A-01-01' });
+      const countInstruction = await own(scan, { scannedValue: countedSku });
+      assert.equal(countInstruction.step.key, 'CONFIRM_QUANTITY');
+      assert.equal(countInstruction.step.expected.value, null);
+      await own(scan, { scannedValue: '2147483648' }, 409);
+      const completed = await own(scan, { scannedValue: '3' });
+      assert.equal(completed.status, 'COMPLETED');
+    } finally {
+      token = admin.accessToken;
+    }
     const finalApproval = await own(`/cycle-counts/tasks/${sourceTask.id}/approve`, {});
     assert.equal(finalApproval.adjustmentCreated, false);
     assert.equal(finalApproval.planCompleted, true);

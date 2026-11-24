@@ -57,6 +57,7 @@ jobs:
         working-directory: demo
         env:
           WMS_LIVE_UI_URL: http://127.0.0.1:4000/
+          WMS_LIVE_UI_WRITE: "true"
         run: |
           npm ci --ignore-scripts
           node node_modules/@playwright/test/cli.js install --with-deps chromium

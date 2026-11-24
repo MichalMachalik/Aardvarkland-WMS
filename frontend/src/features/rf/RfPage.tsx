@@ -11,7 +11,7 @@ import { ProgressBar } from '../../components/ui/ProgressBar';
 import { StatusPill } from '../../components/ui/StatusPill';
 import { useApiMutation } from '../../core/api/useApiMutation';
 import { useApiResource } from '../../core/api/useApiResource';
-import { getRfQueue, listScanners, reportRfTaskException, resolveScan, scanRfSession, startRfTask, syncRfOfflineQueue, updateScannerTelemetry } from '../../core/api/wms';
+import { getRfQueue, listScanners, reportRfTaskException, resolveScan, resumeRfSession, scanRfSession, startRfTask, syncRfOfflineQueue, updateScannerTelemetry } from '../../core/api/wms';
 import { config } from '../../app/config';
 import {
   loadRfOfflineQueue,
@@ -24,7 +24,7 @@ import { useWorkspace, type Language } from '../../core/workspace/workspace';
 
 type ExpectedType = 'LOCATION' | 'SKU' | 'HANDLING_UNIT' | 'QUANTITY' | 'NONE';
 type RfExceptionCode = 'SHORT_PICK' | 'WRONG_ITEM' | 'WRONG_LOCATION' | 'DAMAGED_STOCK' | 'MISSING_HU' | 'BARCODE_NOT_RECOGNIZED';
-interface RfQueueTask {
+interface RfTaskSummary {
   id: string;
   type: string;
   status: string;
@@ -33,11 +33,15 @@ interface RfQueueTask {
   fromLocationCode: string | null;
   toLocationCode: string | null;
   handlingUnitCode: string | null;
+}
+interface RfWorkflowTask extends RfTaskSummary {
+  workflow: string;
+}
+interface RfQueueTask extends RfWorkflowTask {
   priority: number;
   dueAt: string | Date | null;
   externalReference: string | null;
   assignedUserId: string | null;
-  workflow: string;
   suggestedAction: 'START' | 'RESUME' | 'WAIT';
 }
 interface RfQueueResponse {
@@ -50,7 +54,7 @@ interface RfInstruction {
   sessionId: string;
   status: string;
   workflow: string;
-  task: RfQueueTask | null;
+  task: RfTaskSummary | null;
   step: {
     key: string | null;
     sequence: number | null;
@@ -174,27 +178,34 @@ function scanObjectTypeLabel(value: string | null, language: Language) {
   return labels[value] ? pickLanguage(language, labels[value]) : value;
 }
 type ExpectedStep = { key: string; label: string; instruction: string; expectedCode: string; helper: string };
-function toExpectedSteps(task: RfQueueTask | undefined, language: Language): ExpectedStep[] {
+function toExpectedSteps(task: RfWorkflowTask | undefined, language: Language): ExpectedStep[] {
   const text = pickLanguage(language, { cs: czech, en: english, ua: ukrainian });
   if (!task) return [{ key: 'wait', label: text.step.task, instruction: text.noLiveTask, expectedCode: '', helper: text.queueEmpty }];
-  return [
+  const displayedQuantity = task.workflow === 'COUNT' ? task.quantity : (task.quantity ?? 1);
+  const steps = [
     { key: 'task', label: text.step.task, instruction: text.stepInstruction.task, expectedCode: task.id, helper: `${rfWorkflowLabel(task.workflow, language)} · ${rfStatusLabel(task.status, language)}` },
     { key: 'source', label: text.step.source, instruction: text.stepInstruction.source, expectedCode: task.fromLocationCode ?? 'SOURCE', helper: task.fromLocationCode ?? text.sourceMissing },
-    { key: 'sku', label: 'SKU', instruction: text.stepInstruction.sku, expectedCode: task.skuCode ?? 'SKU', helper: `${text.quantity} ${task.quantity ?? 1}` },
-    { key: 'qty', label: text.step.quantity, instruction: text.stepInstruction.quantity, expectedCode: String(task.quantity ?? 1), helper: text.quantityConfirm },
-    { key: 'target', label: text.step.target, instruction: text.stepInstruction.target, expectedCode: task.toLocationCode ?? 'TARGET', helper: task.toLocationCode ?? text.targetMissing },
+    { key: 'sku', label: 'SKU', instruction: text.stepInstruction.sku, expectedCode: task.skuCode ?? 'SKU', helper: displayedQuantity === null ? '' : `${text.quantity} ${displayedQuantity}` },
+    { key: 'qty', label: text.step.quantity, instruction: text.stepInstruction.quantity, expectedCode: displayedQuantity === null ? '' : String(displayedQuantity), helper: text.quantityConfirm },
   ];
+  if (task.workflow !== 'COUNT') {
+    steps.push({ key: 'target', label: text.step.target, instruction: text.stepInstruction.target, expectedCode: task.toLocationCode ?? 'TARGET', helper: task.toLocationCode ?? text.targetMissing });
+  }
+  return steps;
 }
-function getInstructionExpected(instruction: RfInstruction | null, task: RfQueueTask | undefined, stepIndex: number, language: Language): ExpectedStep {
+function getInstructionExpected(instruction: RfInstruction | null, task: RfWorkflowTask | undefined, stepIndex: number, language: Language): ExpectedStep {
   const text = pickLanguage(language, { cs: czech, en: english, ua: ukrainian });
-  if (instruction?.step?.expected?.value) {
-      return {
-        key: instruction.step.key ?? (instruction.step.expected.type === 'QUANTITY' ? 'qty' : 'scan'),
-        label: instruction.step.expected.type === 'QUANTITY' ? text.step.quantity : instruction.step.expected.type,
-        instruction: instruction.step.instruction,
-        expectedCode: instruction.step.expected.value,
-        helper: instruction.step.errorCode ? `${text.error}: ${instruction.step.errorCode}` : rfStatusLabel(instruction.status, language),
-      };
+  if (instruction?.status === 'COMPLETED') {
+    return { key: 'done', label: text.step.task, instruction: rfStatusLabel(instruction.status, language), expectedCode: '', helper: '' };
+  }
+  if (instruction?.step.key) {
+    return {
+      key: instruction.step.key,
+      label: instruction.step.expected.type === 'QUANTITY' ? text.step.quantity : instruction.step.expected.type,
+      instruction: instruction.step.instruction,
+      expectedCode: instruction.step.expected.value ?? '',
+      helper: instruction.step.errorCode ? `${text.error}: ${instruction.step.errorCode}` : rfStatusLabel(instruction.status, language),
+    };
   }
   return toExpectedSteps(task, language)[stepIndex] ?? toExpectedSteps(task, language)[0];
 }
@@ -258,7 +269,7 @@ function uniqueExceptionActions(actions: RfExceptionAction[]) {
   });
 }
 
-function getExceptionActions(current: ExpectedStep, selectedTask: RfQueueTask | undefined, text: RfExceptionCopy): RfExceptionAction[] {
+function getExceptionActions(current: ExpectedStep, selectedTask: RfWorkflowTask | undefined, text: RfExceptionCopy): RfExceptionAction[] {
   const key = current.key.toUpperCase();
   const label = current.label.toUpperCase();
   const actionText = text.exceptionActions;
@@ -289,10 +300,9 @@ function getExceptionActions(current: ExpectedStep, selectedTask: RfQueueTask | 
   return uniqueExceptionActions(actions).slice(0, 4);
 }
 
-function parseQuantityCandidate(value: string, fallback: string, taskQuantity?: number | null) {
-  const parsed = Number.parseInt(value.trim() || fallback, 10);
-  if (Number.isFinite(parsed)) return parsed;
-  return taskQuantity ?? 0;
+function parseScanQuantity(value: string): number | undefined {
+  const quantity = Number(value);
+  return /^\d+$/.test(value.trim()) && quantity <= 2_147_483_647 ? quantity : undefined;
 }
 
 function isQuantityKey(key: string) {
@@ -334,16 +344,26 @@ export function RfPage() {
   const [offlineQueueError, setOfflineQueueError] = useState(false);
   const [log, setLog] = useState<string[]>([]);
   const tasksQueue = queueResource.data.tasks;
-  const selectedTask = tasksQueue.find((task) => task.id === selectedTaskId) ?? tasksQueue[0];
+  const queuedTask = selectedTaskId ? tasksQueue.find((task) => task.id === selectedTaskId) : tasksQueue[0];
+  const selectedTask = session?.task ? { ...session.task, workflow: session.workflow } : queuedTask;
   const expectedSteps = useMemo(() => toExpectedSteps(selectedTask, language), [selectedTask, language]);
   const current = getInstructionExpected(session, selectedTask, stepIndex, language);
-  const progress = Math.round(((stepIndex + 1) / expectedSteps.length) * 100);
+  const sessionCompleted = session?.status === 'COMPLETED';
+  const progress = sessionCompleted ? 100 : Math.round(((stepIndex + 1) / expectedSteps.length) * 100);
   const offlineStatus = queueResource.data.offlineQueue ?? fallbackQueue.offlineQueue;
   const exceptionActions = useMemo(() => getExceptionActions(current, selectedTask, text), [current, selectedTask, text]);
   const isQuantityStep = isQuantityKey(current.key);
-  const quantityCandidate = parseQuantityCandidate(scanValue, current.expectedCode, selectedTask?.quantity);
+  const expectedQuantity = parseScanQuantity(current.expectedCode);
+  const enteredQuantity = parseScanQuantity(scanValue);
+  const quantityCandidate = enteredQuantity ?? expectedQuantity;
+  const canConfirmScan = Boolean(selectedTask && scannerDeviceReference.trim() && scanValue.trim())
+    && !sessionCompleted
+    && (!isQuantityStep || enteredQuantity !== undefined);
   const showTestAssist = import.meta.env.DEV || config.enableMocks;
   const activeScanner = scannerResource.data.find((scanner) => scanner.code === scannerDeviceReference);
+  const registeredScannerReference = !activeScanner && scannerDeviceReference === defaultScannerReference(warehouseId)
+    ? undefined
+    : scannerDeviceReference || undefined;
   const rfDisplayMode = workContext?.rfMode ?? 'DESKTOP';
 
   useEffect(() => {
@@ -395,29 +415,29 @@ export function RfPage() {
       scannerDeviceReference: scannerDeviceReference || (workContext?.scannerDeviceReference ?? null),
       metadata: { source: 'rf-page' },
     });
-    if (scannerDeviceReference) {
-      await updateScannerTelemetry(warehouseId, scannerDeviceReference, {
+    if (registeredScannerReference) {
+      await updateScannerTelemetry(warehouseId, registeredScannerReference, {
         deviceMode: rfMode,
         metadata: { source: 'rf-page' },
       }).catch(() => undefined);
       scannerResource.refresh();
     }
   };
-  const setQuantityScan = (quantity: number) => {
-    setScanValue(String(Math.max(0, Math.round(quantity))));
-  };
   const adjustQuantityScan = (delta: number) => {
-    setQuantityScan(quantityCandidate + delta);
+    setScanValue(String(Math.min(2_147_483_647, Math.max(0, (quantityCandidate ?? 0) + delta))));
   };
   const startSession = async () => {
-    if (!selectedTask) return undefined;
-    const result = await mutation.run(text.actions.startSession, () => startRfTask<RfInstruction>(warehouseId, selectedTask.id, {
-      scannerDeviceReference,
-      taskReference: selectedTask.id,
-      workflow: selectedTask.workflow,
-      metadata: { source: 'rf-scanner-ui', role: roleProfile.id, scannerDeviceReference },
-    }));
+    if (!selectedTask || sessionCompleted) return undefined;
+    const result = await mutation.run(text.actions.startSession, () => session?.status === 'ACTIVE'
+      ? resumeRfSession<RfInstruction>(warehouseId, session.sessionId)
+      : startRfTask<RfInstruction>(warehouseId, selectedTask.id, {
+        scannerDeviceReference: registeredScannerReference,
+        taskReference: selectedTask.id,
+        workflow: selectedTask.workflow,
+        metadata: { source: 'rf-scanner-ui', role: roleProfile.id, scannerDeviceReference },
+      }));
     if (result?.sessionId) {
+      setSelectedTaskId(selectedTask.id);
       setSession(result);
       appendLog(`${text.log.session} ${result.sessionId} · ${selectedTask.id}`);
     }
@@ -426,12 +446,12 @@ export function RfPage() {
   const submitScan = async (event: FormEvent) => {
     event.preventDefault();
     const value = scanValue.trim();
-    if (!value || !selectedTask || !scannerDeviceReference.trim() || scanInFlight.current || mutation.status === 'running') return;
+    if (!canConfirmScan || !selectedTask || scanInFlight.current || mutation.status === 'running') return;
     scanInFlight.current = true;
     setScanPending(true);
     try {
       const expected = current.expectedCode;
-      const matched = value.toLowerCase() === String(expected).toLowerCase();
+      const matched = isQuantityStep ? enteredQuantity !== undefined : value.toLowerCase() === expected.toLowerCase();
       const resolvedScan = !offline ? await resolveScan<ScanResolveResponse>(warehouseId, {
         scannedValue: value,
         metadata: { source: 'rf-ui', stepKey: current.key, taskReference: selectedTask.id },
@@ -448,7 +468,7 @@ export function RfPage() {
           taskReference: selectedTask.id,
           stepKey: current.key,
           scannedValue: value,
-          quantity: isQuantityKey(current.key) ? Number(value) || undefined : undefined,
+          quantity: isQuantityStep ? enteredQuantity : undefined,
           recordedAt: new Date().toISOString(),
           metadata: { expected, matched, role: roleProfile.id, offlineUi: true },
         };
@@ -473,11 +493,12 @@ export function RfPage() {
       if (!baseSession?.sessionId) return;
       const result = await mutation.run(text.actions.confirmScan, () => scanRfSession<RfInstruction>(warehouseId, baseSession.sessionId, {
         scannedValue: value,
-        quantity: isQuantityKey(current.key) ? Number(value) || undefined : undefined,
+        quantity: isQuantityStep ? enteredQuantity : undefined,
         metadata: { stepKey: current.key, expected, uiMatched: matched, role: roleProfile.id },
       }));
       if (result) {
         setSession(result);
+        if (result.status === 'COMPLETED') queueResource.refresh();
         appendLog(`${current.label}: ${result.step.errorCode ? text.log.mismatch : 'OK'} · ${value}`);
         if (!result.step.errorCode) {
           setStepIndex((index) => Math.min(index + 1, expectedSteps.length - 1));
@@ -492,7 +513,7 @@ export function RfPage() {
   const syncPending = async () => {
     if (!pending.length) return;
     const result = await mutation.run(text.actions.syncQueue, () => syncRfOfflineQueue<OfflineSyncResponse>(warehouseId, {
-      scannerDeviceReference,
+      scannerDeviceReference: registeredScannerReference,
       scans: pending,
       metadata: { source: 'rf-ui', scannerDeviceReference },
     }));
@@ -511,7 +532,7 @@ export function RfPage() {
     queueResource.refresh();
   };
   const reportProblem = async (action: RfExceptionAction) => {
-    if (!selectedTask) return;
+    if (!selectedTask || sessionCompleted) return;
     const shortQuantity = action.code === 'SHORT_PICK' ? Number.parseInt(scanValue.trim(), 10) : NaN;
     const result = await mutation.run(action.label, () => reportRfTaskException<RfExceptionReportResponse>(warehouseId, selectedTask.id, {
       code: action.code,
@@ -584,17 +605,17 @@ export function RfPage() {
           <div className="scanner-terminal__screen">
             <span>{current.label}</span>
             <h2>{current.instruction}</h2>
-            <div className="scanner-target">
+            {current.expectedCode && <div className="scanner-target">
               <small>{text.expectedScan}</small>
               <strong data-testid="rf-expected-scan">{current.expectedCode}</strong>
               <em>{current.helper}</em>
-            </div>
+            </div>}
             {isQuantityStep && (
               <div className="rf-quantity-controls" aria-label={text.quantityControls}>
-                <Button size="lg" type="button" onClick={() => adjustQuantityScan(-1)} disabled={!selectedTask || quantityCandidate <= 0}>-1</Button>
-                <div className="rf-quantity-controls__value"><span>{text.quantityNow}</span><strong>{quantityCandidate}</strong></div>
-                <Button size="lg" type="button" onClick={() => adjustQuantityScan(1)} disabled={!selectedTask}>+1</Button>
-                <Button size="lg" type="button" onClick={() => setQuantityScan(parseQuantityCandidate('', current.expectedCode, selectedTask?.quantity))} disabled={!selectedTask}>{text.useExpected}</Button>
+                <Button size="lg" type="button" onClick={() => adjustQuantityScan(-1)} disabled={!selectedTask || !quantityCandidate}>-1</Button>
+                <div className="rf-quantity-controls__value"><span>{text.quantityNow}</span><strong>{enteredQuantity ?? '—'}</strong></div>
+                <Button size="lg" type="button" onClick={() => adjustQuantityScan(1)} disabled={!selectedTask || quantityCandidate === 2_147_483_647}>+1</Button>
+                {expectedQuantity !== undefined && <Button size="lg" type="button" onClick={() => setScanValue(String(expectedQuantity))} disabled={!selectedTask}>{text.useExpected}</Button>}
               </div>
             )}
             <ProgressBar value={progress} />
@@ -606,19 +627,19 @@ export function RfPage() {
               onValueChange={setScanValue}
               onSubmitValue={() => scanForm.current?.requestSubmit()}
               placeholder={current.expectedCode}
-              inputMode={current.key === 'qty' ? 'numeric' : 'text'}
-              disabled={!selectedTask || !scannerDeviceReference.trim()}
+              inputMode={isQuantityStep ? 'numeric' : 'text'}
+              disabled={!selectedTask || !scannerDeviceReference.trim() || sessionCompleted}
               readOnly={scanPending}
               data-testid="rf-scan-input"
             />
-            <PermissionGate permission="rf.manage"><Button tone="primary" type="submit" data-e2e-action="rf-confirm-scan" disabled={scanPending || !selectedTask || !scannerDeviceReference.trim() || mutation.status === 'running'}>{text.confirmScan}</Button></PermissionGate>
+            <PermissionGate permission="rf.manage"><Button tone="primary" type="submit" data-e2e-action="rf-confirm-scan" disabled={scanPending || !canConfirmScan || mutation.status === 'running'}>{text.confirmScan}</Button></PermissionGate>
           </form>
           <div className="scanner-fast-actions">
-            {showTestAssist && <Button size="sm" data-e2e-action="rf-fill-expected" onClick={() => setScanValue(current.expectedCode)} disabled={!selectedTask}>{text.fillExpected}</Button>}
-            <Button size="sm" data-e2e-action="rf-reset-flow" disabled={scanPending} onClick={() => { setStepIndex(0); setSession(null); }}>{text.resetFlow}</Button>
-            <Button size="sm" data-e2e-action="rf-start-resume" onClick={() => { void startSession(); }} disabled={scanPending || !scannerDeviceReference.trim() || mutation.status === 'running'}>{text.startOrResume}</Button>
+            {showTestAssist && current.expectedCode && <Button size="sm" data-e2e-action="rf-fill-expected" onClick={() => setScanValue(current.expectedCode)} disabled={!selectedTask}>{text.fillExpected}</Button>}
+            <Button size="sm" data-e2e-action="rf-reset-flow" disabled={scanPending} onClick={() => { setStepIndex(0); setSession(null); setScanValue(''); }}>{text.resetFlow}</Button>
+            <Button size="sm" data-e2e-action="rf-start-resume" onClick={() => { void startSession(); }} disabled={scanPending || !selectedTask || sessionCompleted || !scannerDeviceReference.trim() || mutation.status === 'running'}>{text.startOrResume}</Button>
           </div>
-          <div className="scanner-exception-actions" aria-label={text.exceptionTitle}>
+          {!sessionCompleted && <div className="scanner-exception-actions" aria-label={text.exceptionTitle}>
             <span>{text.exceptionHint}</span>
             <div>
               {exceptionActions.map((action, index) => (
@@ -635,7 +656,7 @@ export function RfPage() {
                 </Button>
               ))}
             </div>
-          </div>
+          </div>}
           <ActionStatus mutation={mutation} />
         </div>
       </Card>
@@ -643,7 +664,7 @@ export function RfPage() {
       <Card title={text.taskQueue} className="span-5">
         <div className="rf-task-queue">
           {tasksQueue.length ? tasksQueue.slice(0, 8).map((task) => (
-            <button key={task.id} data-e2e-row="rf-task" data-e2e-value={task.id} aria-pressed={selectedTask?.id === task.id} disabled={scanPending} className={cx('rf-task-row', selectedTask?.id === task.id && 'is-active')} onClick={() => { setSelectedTaskId(task.id); setSession(null); setStepIndex(0); }}>
+            <button key={task.id} data-e2e-row="rf-task" data-e2e-value={task.id} aria-pressed={selectedTask?.id === task.id} disabled={scanPending || mutation.status === 'running'} className={cx('rf-task-row', selectedTask?.id === task.id && 'is-active')} onClick={() => { setSelectedTaskId(task.id); setSession(null); setStepIndex(0); setScanValue(''); }}>
               <span>
                 <strong>{rfWorkflowLabel(task.workflow, language)}</strong>
                 <small>{task.fromLocationCode ?? '—'} → {task.toLocationCode ?? '—'}</small>

@@ -1,3 +1,5 @@
+export const MAX_COUNT_QUANTITY = 2_147_483_647;
+
 export function calculateCountVariance(
   expectedQuantity: number | null,
   countedQuantity: number,

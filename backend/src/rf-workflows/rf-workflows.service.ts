@@ -1,7 +1,7 @@
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 
 import { AuthenticatedUser } from '../access-control/types';
-import { calculateCountVariance } from '../cycle-counts/cycle-counts.helpers';
+import { calculateCountVariance, MAX_COUNT_QUANTITY } from '../cycle-counts/cycle-counts.helpers';
 import { CycleCountPlanStatus, CycleCountTaskStatus } from '../cycle-counts/cycle-counts.types';
 import { lockPostgresRowById, PrismaService, withTransactionRetry } from '../database';
 import { WarehouseTaskType } from '../generated/prisma/client';
@@ -15,6 +15,7 @@ import {
   getInitialStepForTask,
   getNextStepAfterScan,
   isExpectedScan,
+  quantityStep,
   workflowFromTaskType,
 } from './rf-workflows.helpers';
 import {
@@ -652,11 +653,9 @@ export class RfWorkflowsService {
       return false;
     }
 
+    await lockPostgresRowById(tx, 'warehouse_tasks', task.id);
     const countTask = await tx.cycleCountTask.findFirst({
-      where: {
-        warehouseId,
-        warehouseTaskId: task.id,
-      },
+      where: { warehouseId, warehouseTaskId: task.id },
     });
 
     if (!countTask) {
@@ -680,7 +679,6 @@ export class RfWorkflowsService {
       throw new ConflictException('RF cycle count requires a counted quantity');
     }
 
-    await lockPostgresRowById(tx, 'warehouse_tasks', task.id);
     const submittedAt = new Date();
     const varianceQuantity = calculateCountVariance(countTask.expectedQuantity, countedQuantity);
 
@@ -1298,6 +1296,7 @@ export class RfWorkflowsService {
     const expected = step
       ? expectedFromStep(step)
       : ({ type: 'NONE', value: null } as RfExpectedScan);
+    const blindQuantity = expected.type === 'QUANTITY' && task?.type === 'COUNT' && task.quantity === null;
     const status = session.status as ScannerSessionStatus;
 
     return {
@@ -1308,8 +1307,8 @@ export class RfWorkflowsService {
       step: {
         key: step?.stepKey ?? null,
         sequence: step?.sequence ?? null,
-        instruction: step?.instruction ?? 'RF workflow dokončen.',
-        expected,
+        instruction: blindQuantity ? quantityStep(null).instruction : (step?.instruction ?? 'RF workflow dokončen.'),
+        expected: blindQuantity ? { type: 'QUANTITY', value: null } : expected,
         errorCode: errorCode ?? step?.errorCode ?? null,
       },
       nextActions: status === ScannerSessionStatus.ACTIVE ? ['SCAN', 'REPORT_EXCEPTION'] : [],
@@ -1436,19 +1435,9 @@ function normalizeNullableString(value: string | null | undefined): string | nul
 }
 
 function resolveRfCountedQuantity(dto: ScanRfStepDto): number | null {
-  if (dto.quantity !== undefined) {
-    return dto.quantity;
-  }
-
-  const scannedValue = dto.scannedValue?.trim();
-
-  if (!scannedValue || !/^\d+$/.test(scannedValue)) {
-    return null;
-  }
-
-  const quantity = Number(scannedValue);
-
-  return Number.isSafeInteger(quantity) ? quantity : null;
+  const scannedValue = dto.scannedValue?.trim() ?? '';
+  const quantity = dto.quantity ?? (/^\d+$/.test(scannedValue) ? Number(scannedValue) : NaN);
+  return Number.isInteger(quantity) && quantity >= 0 && quantity <= MAX_COUNT_QUANTITY ? quantity : null;
 }
 
 function hasCycleCountMetadata(metadata: unknown): boolean {

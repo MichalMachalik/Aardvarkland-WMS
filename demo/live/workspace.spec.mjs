@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { randomUUID } from 'node:crypto';
 
 const base = process.env.WMS_LIVE_UI_URL;
 const roles = {
@@ -181,4 +182,185 @@ test('worker deep links to restricted pages return to the scanner', async ({ pag
   await expect(page).toHaveURL(/#\/rf$/);
   await expect(page.locator('.content').getByRole('heading', { name: 'RF skener' })).toBeVisible();
   await expect(desktopNav(page).getByRole('button', { name: 'Nastavení' })).toHaveCount(0);
+});
+
+test('cycle counts isolate plans, hide the RF quantity and write only approved counts to stock', async ({ page, browser }) => {
+  test.skip(process.env.WMS_LIVE_UI_WRITE !== 'true', 'Enable writes only on a disposable database.');
+  test.setTimeout(60000);
+  await login(page, roles.manager);
+  const warehouse = '/api/warehouses/MAIN';
+
+  async function api(path, { token, data } = {}) {
+    const url = new URL(path, base).href;
+    const headers = token ? { Authorization: `Bearer ${token}` } : {};
+    const response = data === undefined
+      ? await page.request.get(url, { headers })
+      : await page.request.post(url, { data, headers: { ...headers, 'Idempotency-Key': randomUUID() } });
+    expect(response.ok(), `${response.status()} ${path}`).toBe(true);
+    const body = await response.json();
+    return body.data ?? body;
+  }
+
+  const { accessToken: admin } = await api('/api/auth/login', {
+    data: { email: roles.system.email, password: roles.system.password },
+  });
+  const { accessToken: worker } = await api('/api/auth/login', {
+    data: { email: roles.worker.email, password: roles.worker.password },
+  });
+  const run = randomUUID().slice(0, 8).toUpperCase();
+  async function stock(label) {
+    const code = `COUNT-${label}-${run}`;
+    const product = await api('/api/products', { token: admin, data: { code, name: 'Inventory browser fixture' } });
+    await api('/api/products/skus', { token: admin, data: { productReference: product.id, code, name: 'Inventory browser SKU' } });
+    const receipt = await api(warehouse + '/inventory/quants/receive', {
+      token: admin, data: { skuReference: code, locationReference: 'A-01-01', quantity: 7 },
+    });
+    return { code, quantId: receipt.quant.id };
+  }
+  const first = await stock('A');
+  const second = await stock('B');
+  const otherPlan = await api(warehouse + '/cycle-counts', {
+    token: admin, data: { code: `PLAN-B-${run}`, scopeType: 'SKU', scopeReference: second.code },
+  });
+  const code = `PLAN-A-${run}`;
+  const assertQuantity = async (quantId, quantity) => {
+    const quant = await api(warehouse + '/inventory/quants/' + quantId, { token: admin });
+    expect(quant.quantity).toBe(quantity);
+  };
+  const queue = () => api(warehouse + '/rf/queue?workflow=COUNT&limit=50', { token: worker });
+  const planButton = planCode => page.getByRole('row').filter({ hasText: planCode }).getByRole('button', { name: 'Vybrat' });
+  const countCard = page.locator('section.card').filter({ has: page.getByRole('heading', { name: 'Úkoly inventury' }) });
+  const countForm = page.getByRole('form', { name: 'Počet a schválení' });
+  const count = countForm.getByRole('spinbutton', { name: 'Spočtené množství' });
+  const submit = countForm.getByRole('button', { name: 'Odevzdat počet' });
+  const approve = countForm.getByRole('button', { name: 'Schválit rozdíl' });
+
+  await desktopNav(page).getByRole('button', { name: 'Inventury' }).click();
+  await expect(planButton(otherPlan.code)).toBeVisible();
+  const create = page.getByRole('form', { name: 'Nový plán inventury' });
+  const save = create.getByRole('button', { name: 'Uložit plán' });
+  await expect(save).toBeDisabled();
+  await create.getByLabel('Kód plánu').fill(code);
+  await create.getByRole('combobox').selectOption('SKU');
+  await create.getByLabel('Reference rozsahu').fill(first.code);
+  await save.click();
+  await expect(planButton(code)).toHaveAttribute('aria-pressed', 'true');
+  const release = page.getByRole('button', { name: 'Uvolnit do úkolů' });
+  const blind = page.getByRole('checkbox', { name: 'Skrýt systémové množství v RF' });
+  await expect(blind).toBeChecked();
+  await release.click();
+  const selectTask = countCard.getByRole('button', { name: 'Vybrat' });
+  await expect(selectTask).toHaveCount(1);
+  expect((await queue()).tasks.find(task => task.skuCode === first.code)).toMatchObject({ quantity: null });
+  await expect(count).toBeDisabled();
+  await selectTask.click();
+  await expect(count).toHaveValue('');
+  await expect(submit).toBeDisabled();
+  for (const invalid of ['-1', '1.5', '2147483648', '1e2']) {
+    await count.fill(invalid);
+    await expect(submit).toBeDisabled();
+  }
+  await count.fill('4');
+  await expect(submit).toBeEnabled();
+  await expect(approve).toBeDisabled();
+
+  let resume;
+  const pending = new Promise(resolve => { resume = resolve; });
+  const tasksUrl = `**/api/warehouses/*/cycle-counts/${otherPlan.id}/tasks`;
+  await page.route(tasksUrl, async route => {
+    await pending;
+    await route.continue();
+  }, { times: 1 });
+  const switching = page.waitForRequest(request => request.url().endsWith(`/cycle-counts/${otherPlan.id}/tasks`));
+  try {
+    await planButton(otherPlan.code).click();
+    await switching;
+    await expect(selectTask).toHaveCount(0);
+    await expect(count).toHaveValue('');
+    await expect(submit).toBeDisabled();
+    await expect(approve).toBeDisabled();
+  } finally {
+    resume();
+  }
+  await blind.uncheck();
+  await release.click();
+  await expect(selectTask).toHaveCount(1);
+  expect((await queue()).tasks.find(task => task.skuCode === second.code)).toMatchObject({ quantity: 7 });
+
+  await planButton(code).click();
+  await selectTask.click();
+  await expect(count).toHaveValue('');
+  await page.setViewportSize({ width: 390, height: 844 });
+  await count.fill('0');
+  await submit.click();
+  await expect(countCard.getByText('Odevzdáno', { exact: true })).toBeVisible();
+  await assertQuantity(first.quantId, 7);
+  await countForm.getByLabel('Důvod / poznámka').fill('Fyzicky ověřeno');
+  await approve.click();
+  await expect(countCard.getByText('Schváleno', { exact: true })).toBeVisible();
+  await assertQuantity(first.quantId, 0);
+  await assertQuantity(second.quantId, 7);
+  const movements = await api(warehouse + `/inventory/movements?type=ADJUST&quantReference=${first.quantId}`, { token: admin });
+  expect(movements).toEqual([expect.objectContaining({ quantity: 7, quantityDelta: -7 })]);
+
+  const emptyPlan = await api(warehouse + '/cycle-counts', {
+    token: admin, data: { code: `ZERO-${run}`, scopeType: 'SKU', scopeReference: first.code },
+  });
+  await api(warehouse + `/cycle-counts/${emptyPlan.id}/release`, {
+    token: admin, data: { metadata: { hideExpectedFromRf: false } },
+  });
+  const [zeroTask] = await api(warehouse + `/cycle-counts/${emptyPlan.id}/tasks`, { token: admin });
+  expect((await queue()).tasks.find(task => task.id === zeroTask.warehouseTaskId)).toMatchObject({ quantity: 0 });
+  await api(warehouse + `/cycle-counts/tasks/${zeroTask.id}/submit`, { token: admin, data: { countedQuantity: 0 } });
+  await api(warehouse + `/cycle-counts/tasks/${zeroTask.id}/approve`, { token: admin, data: {} });
+
+  const rfPlan = await api(warehouse + '/cycle-counts', {
+    token: admin, data: { code: `RF-COUNT-${run}`, scopeType: 'SKU', scopeReference: first.code },
+  });
+  await api(warehouse + `/cycle-counts/${rfPlan.id}/release`, { token: admin, data: {} });
+  const [rfTask] = await api(warehouse + `/cycle-counts/${rfPlan.id}/tasks`, { token: admin });
+  const workerPage = await browser.newPage({ viewport: { width: 390, height: 844 } });
+  try {
+    await login(workerPage, roles.worker);
+    await mobileNav(workerPage).getByRole('button', { name: 'Skenování', exact: true }).click();
+    const taskRow = workerPage.locator(`[data-e2e-row="rf-task"][data-e2e-value="${rfTask.warehouseTaskId}"]`);
+    await taskRow.click();
+    const starting = workerPage.waitForResponse(response => response.url().endsWith(`/rf/tasks/${rfTask.warehouseTaskId}/start`));
+    await workerPage.locator('[data-e2e-action="rf-start-resume"]').click();
+    expect((await starting).ok()).toBe(true);
+    const input = workerPage.getByTestId('rf-scan-input');
+    const confirm = workerPage.locator('[data-e2e-action="rf-confirm-scan"]');
+    const expected = workerPage.getByTestId('rf-expected-scan');
+    await expect(expected).toHaveText('A-01-01');
+    await workerPage.evaluate(() => window.dispatchEvent(new Event('wms:realtime')));
+    await expect(taskRow).toHaveCount(0);
+    await expect(expected).toHaveText('A-01-01');
+    const resuming = workerPage.waitForResponse(response => /\/rf\/sessions\/[^/]+\/resume$/.test(response.url()));
+    await workerPage.locator('[data-e2e-action="rf-start-resume"]').click();
+    expect((await resuming).ok()).toBe(true);
+    await input.fill('A-01-01');
+    await confirm.click();
+    await expect(expected).toHaveText(first.code);
+    await input.fill(first.code);
+    await confirm.click();
+    await expect(workerPage.locator('.rf-quantity-controls')).toBeVisible();
+    await expect(input).toHaveAttribute('inputmode', 'numeric');
+    await expect(input).toHaveValue('');
+    await expect(expected).toHaveCount(0);
+    await expect(workerPage.getByRole('button', { name: 'Použít očekávané' })).toHaveCount(0);
+    await expect(confirm).toBeDisabled();
+    await input.fill('2147483648');
+    await expect(confirm).toBeDisabled();
+    await input.fill('3');
+    await confirm.click();
+    await expect(input).toBeDisabled();
+    await expect(workerPage.getByRole('heading', { name: 'Dokončeno' })).toBeVisible();
+    const [submitted] = await api(warehouse + `/cycle-counts/${rfPlan.id}/tasks`, { token: admin });
+    expect(submitted).toMatchObject({ status: 'SUBMITTED', countedQuantity: 3, expectedQuantity: 0, varianceQuantity: 3 });
+    await assertQuantity(first.quantId, 0);
+    await api(warehouse + `/cycle-counts/tasks/${submitted.id}/approve`, { token: admin, data: {} });
+    await assertQuantity(first.quantId, 3);
+  } finally {
+    await workerPage.close();
+  }
 });
