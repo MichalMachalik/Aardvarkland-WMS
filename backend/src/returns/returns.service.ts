@@ -1,7 +1,10 @@
 import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 
 import { AuthenticatedUser } from '../access-control/types';
-import { PrismaService } from '../database';
+import { lockPostgresRowById, PrismaService, withTransactionRetry } from '../database';
+import { Prisma } from '../generated/prisma/client';
+import { assertNoBlockingStockFreeze } from '../inventory/stock-freeze.helpers';
+import { lockStockQuantIdentity } from '../inventory/stock-quant-identity.helpers';
 import { CreateReturnOrderDto } from './dto/create-return-order.dto';
 import { InspectReturnLineDto } from './dto/inspect-return-line.dto';
 import { ReceiveReturnLineDto } from './dto/receive-return-line.dto';
@@ -20,6 +23,8 @@ import {
   ReturnOrderResponse,
   ReturnOrderStatus,
 } from './returns.types';
+
+type ReturnSqlClient = Pick<Prisma.TransactionClient, '$queryRawUnsafe' | '$executeRawUnsafe'>;
 
 @Injectable()
 export class ReturnsService {
@@ -51,44 +56,52 @@ export class ReturnsService {
     if (!Array.isArray(dto.lines) || dto.lines.length === 0) {
       throw new ConflictException('Return order must have at least one line.');
     }
-
-    const orderRows = await this.query<ReturnOrderRow>(
-      `INSERT INTO return_orders
-        (warehouse_id, owner_client_id, rma_number, status, customer_reference, external_reference, reason_code, metadata)
-       VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8::jsonb)
-       RETURNING *`,
-      warehouse.id,
-      ownerClient?.id ?? null,
-      normalizeReturnReference(dto.rmaNumber),
-      ReturnOrderStatus.CREATED,
-      nullable(dto.customerReference),
-      nullable(dto.externalReference),
-      nullableUpper(dto.reasonCode),
-      json(dto.metadata),
-    );
-    const order = requiredRow(orderRows, 'Return order was not created');
-
-    for (const line of dto.lines) {
-      const sku = await this.resolveSku(line.skuReference);
-      await this.query<ReturnLineRow>(
-        `INSERT INTO return_order_lines
-          (return_order_id, line_number, sku_id, expected_quantity, received_quantity, inspected_quantity, status, metadata)
-         VALUES ($1::uuid, $2, $3::uuid, $4, 0, 0, $5, $6::jsonb)`,
-        order.id,
-        line.lineNumber.trim(),
-        sku.id,
-        assertReturnQuantity(Number(line.expectedQuantity), 'expectedQuantity'),
-        ReturnLineStatus.OPEN,
-        json(line.metadata),
-      );
+    const lineNumbers = dto.lines.map(line => line.lineNumber.trim());
+    if (lineNumbers.some(line => !line) || new Set(lineNumbers).size !== lineNumbers.length) {
+      throw new ConflictException('Return order line numbers must be non-empty and unique.');
     }
 
-    await this.writeAudit(actor, warehouse.id, 'return_order.created', 'return_order', order.id, {
-      rmaNumber: order.rma_number,
-      lineCount: dto.lines.length,
-    });
+    return withTransactionRetry(() => this.prisma.$transaction(async (tx) => {
+      const orderRows = await tx.$queryRawUnsafe<ReturnOrderRow[]>(
+        `INSERT INTO return_orders
+          (warehouse_id, owner_client_id, rma_number, status, customer_reference, external_reference, reason_code, metadata)
+         VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, $7, $8::jsonb)
+         ON CONFLICT (warehouse_id, rma_number) DO NOTHING
+         RETURNING *`,
+        warehouse.id,
+        ownerClient?.id ?? null,
+        normalizeReturnReference(dto.rmaNumber),
+        ReturnOrderStatus.CREATED,
+        nullable(dto.customerReference),
+        nullable(dto.externalReference),
+        nullableUpper(dto.reasonCode),
+        json(dto.metadata),
+      );
+      const [order] = orderRows;
+      if (!order) throw new ConflictException('A return with this RMA number already exists.');
 
-    return this.toReturnOrderResponse(order);
+      for (const line of dto.lines) {
+        const sku = await this.resolveSku(line.skuReference, tx);
+        await tx.$executeRawUnsafe(
+          `INSERT INTO return_order_lines
+            (return_order_id, line_number, sku_id, expected_quantity, received_quantity, inspected_quantity, status, metadata)
+           VALUES ($1::uuid, $2, $3::uuid, $4, 0, 0, $5, $6::jsonb)`,
+          order.id,
+          line.lineNumber.trim(),
+          sku.id,
+          assertReturnQuantity(Number(line.expectedQuantity), 'expectedQuantity'),
+          ReturnLineStatus.OPEN,
+          json(line.metadata),
+        );
+      }
+
+      await this.writeAudit(tx, actor, warehouse.id, 'return_order.created', 'return_order', order.id, {
+        rmaNumber: order.rma_number,
+        lineCount: dto.lines.length,
+      });
+
+      return this.toReturnOrderResponse(order, tx);
+    }));
   }
 
   async receiveLine(
@@ -100,37 +113,40 @@ export class ReturnsService {
   ): Promise<ReturnOrderResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
     const order = await this.resolveReturnOrder(warehouse.id, returnReference);
-    const line = await this.resolveReturnLine(order.id, lineReference);
-    const quantity = assertReturnQuantity(Number(dto.quantity), 'quantity');
-    const nextReceived = line.received_quantity + quantity;
+    return withTransactionRetry(() => this.prisma.$transaction(async (tx) => {
+      await lockPostgresRowById(tx, 'return_orders', order.id);
+      const line = await this.resolveReturnLine(order.id, lineReference, tx);
+      const quantity = assertReturnQuantity(Number(dto.quantity), 'quantity');
+      const nextReceived = line.received_quantity + quantity;
 
-    if (nextReceived > line.expected_quantity) {
-      throw new ConflictException('Received quantity cannot exceed expected return quantity.');
-    }
+      if (nextReceived > line.expected_quantity) {
+        throw new ConflictException('Received quantity cannot exceed expected return quantity.');
+      }
 
-    const status = nextReturnLineStatus({
-      expectedQuantity: line.expected_quantity,
-      receivedQuantity: nextReceived,
-      inspectedQuantity: line.inspected_quantity,
-      disposition: line.disposition as ReturnDisposition | null,
-    });
-    await this.execute(
-      `UPDATE return_order_lines
-       SET received_quantity = $1, status = $2, metadata = COALESCE(metadata, '{}'::jsonb) || $3::jsonb, updated_at = now()
-       WHERE id = $4::uuid`,
-      nextReceived,
-      status,
-      json({ receive: dto.metadata ?? {}, receivedAt: dto.receivedAt ?? new Date().toISOString() }),
-      line.id,
-    );
-    await this.refreshReturnOrderStatus(order.id);
-    await this.writeAudit(actor, warehouse.id, 'return_line.received', 'return_order_line', line.id, {
-      rmaNumber: order.rma_number,
-      lineNumber: line.line_number,
-      quantity,
-    });
+      const status = nextReturnLineStatus({
+        expectedQuantity: line.expected_quantity,
+        receivedQuantity: nextReceived,
+        inspectedQuantity: line.inspected_quantity,
+        disposition: line.disposition as ReturnDisposition | null,
+      });
+      await tx.$executeRawUnsafe(
+        `UPDATE return_order_lines
+         SET received_quantity = $1, status = $2, metadata = COALESCE(metadata, '{}'::jsonb) || $3::jsonb, updated_at = now()
+         WHERE id = $4::uuid`,
+        nextReceived,
+        status,
+        json({ receive: dto.metadata ?? {}, receivedAt: dto.receivedAt ?? new Date().toISOString() }),
+        line.id,
+      );
+      await this.refreshReturnOrderStatus(order.id, tx);
+      await this.writeAudit(tx, actor, warehouse.id, 'return_line.received', 'return_order_line', line.id, {
+        rmaNumber: order.rma_number,
+        lineNumber: line.line_number,
+        quantity,
+      });
 
-    return this.getReturn(warehouse.id, order.id);
+      return this.toReturnOrderResponse(await this.resolveReturnOrder(warehouse.id, order.id, tx), tx);
+    }));
   }
 
   async inspectLine(
@@ -142,85 +158,89 @@ export class ReturnsService {
   ): Promise<ReturnInspectionResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
     const order = await this.resolveReturnOrder(warehouse.id, returnReference);
-    const line = await this.resolveReturnLine(order.id, lineReference);
-    const decision = decideReturnDisposition(dto.disposition);
-    const inspectedQuantity = assertReturnQuantity(Number(dto.inspectedQuantity), 'inspectedQuantity');
-    const acceptedQuantity = dto.acceptedQuantity ?? (decision.createsStock ? inspectedQuantity : 0);
-    const rejectedQuantity = dto.rejectedQuantity ?? Math.max(0, inspectedQuantity - acceptedQuantity);
+    return withTransactionRetry(() => this.prisma.$transaction(async (tx) => {
+      await lockPostgresRowById(tx, 'return_orders', order.id);
+      const line = await this.resolveReturnLine(order.id, lineReference, tx);
+      const decision = decideReturnDisposition(dto.disposition);
+      const inspectedQuantity = assertReturnQuantity(Number(dto.inspectedQuantity), 'inspectedQuantity');
+      const acceptedQuantity = dto.acceptedQuantity ?? (decision.createsStock ? inspectedQuantity : 0);
+      const rejectedQuantity = dto.rejectedQuantity ?? Math.max(0, inspectedQuantity - acceptedQuantity);
 
-    if (line.received_quantity <= 0 || inspectedQuantity > line.received_quantity - line.inspected_quantity) {
-      throw new ConflictException('Inspected quantity cannot exceed uninspected received quantity.');
-    }
+      if (line.received_quantity <= 0 || inspectedQuantity > line.received_quantity - line.inspected_quantity) {
+        throw new ConflictException('Inspected quantity cannot exceed uninspected received quantity.');
+      }
 
-    if (acceptedQuantity + rejectedQuantity !== inspectedQuantity) {
-      throw new ConflictException('Accepted + rejected quantity must equal inspected quantity.');
-    }
+      if (acceptedQuantity + rejectedQuantity !== inspectedQuantity) {
+        throw new ConflictException('Accepted + rejected quantity must equal inspected quantity.');
+      }
 
-    const stockQuantId = decision.createsStock && acceptedQuantity > 0
-      ? await this.createOrUpdateReturnedStock({
-          warehouseId: warehouse.id,
-          ownerClientId: order.owner_client_id,
-          skuId: line.sku_id,
-          quantity: acceptedQuantity,
-          status: decision.stockStatus ?? 'AVAILABLE',
-          locationReference: dto.locationReference,
-          lotReference: dto.lotReference,
-          returnOrderId: order.id,
-          returnLineId: line.id,
-          actorUserId: actor.id,
-          metadata: dto.metadata,
-        })
-      : null;
+      const stockQuantId = decision.createsStock && acceptedQuantity > 0
+        ? await this.createOrUpdateReturnedStock(tx, {
+            warehouseId: warehouse.id,
+            ownerClientId: order.owner_client_id,
+            skuId: line.sku_id,
+            quantity: acceptedQuantity,
+            status: decision.stockStatus ?? 'AVAILABLE',
+            locationReference: dto.locationReference,
+            lotReference: dto.lotReference,
+            returnOrderId: order.id,
+            returnLineId: line.id,
+            inspectedThrough: line.inspected_quantity + inspectedQuantity,
+            actorUserId: actor.id,
+            metadata: dto.metadata,
+          })
+        : null;
 
-    const inspectionRows = await this.query<ReturnInspectionRow>(
-      `INSERT INTO return_inspections
-        (warehouse_id, return_order_id, return_order_line_id, disposition, inspected_quantity, accepted_quantity, rejected_quantity, stock_quant_id, notes, metadata, created_by_user_id)
-       VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8::uuid, $9, $10::jsonb, $11::uuid)
-       RETURNING *`,
-      warehouse.id,
-      order.id,
-      line.id,
-      decision.disposition,
-      inspectedQuantity,
-      acceptedQuantity,
-      rejectedQuantity,
-      stockQuantId,
-      nullable(dto.notes),
-      json(dto.metadata),
-      actor.id,
-    );
-    const inspection = requiredRow(inspectionRows, 'Return inspection was not created');
-    const nextInspected = line.inspected_quantity + inspectedQuantity;
-    const lineStatus = nextReturnLineStatus({
-      expectedQuantity: line.expected_quantity,
-      receivedQuantity: line.received_quantity,
-      inspectedQuantity: nextInspected,
-      disposition: decision.disposition,
-    });
+      const inspectionRows = await tx.$queryRawUnsafe<ReturnInspectionRow[]>(
+        `INSERT INTO return_inspections
+          (warehouse_id, return_order_id, return_order_line_id, disposition, inspected_quantity, accepted_quantity, rejected_quantity, stock_quant_id, notes, metadata, created_by_user_id)
+         VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8::uuid, $9, $10::jsonb, $11::uuid)
+         RETURNING *`,
+        warehouse.id,
+        order.id,
+        line.id,
+        decision.disposition,
+        inspectedQuantity,
+        acceptedQuantity,
+        rejectedQuantity,
+        stockQuantId,
+        nullable(dto.notes),
+        json(dto.metadata),
+        actor.id,
+      );
+      const inspection = requiredRow(inspectionRows, 'Return inspection was not created');
+      const nextInspected = line.inspected_quantity + inspectedQuantity;
+      const lineStatus = nextReturnLineStatus({
+        expectedQuantity: line.expected_quantity,
+        receivedQuantity: line.received_quantity,
+        inspectedQuantity: nextInspected,
+        disposition: decision.disposition,
+      });
 
-    await this.execute(
-      `UPDATE return_order_lines
-       SET inspected_quantity = $1, disposition = $2, status = $3, updated_at = now()
-       WHERE id = $4::uuid`,
-      nextInspected,
-      decision.disposition,
-      decision.closesLine ? ReturnLineStatus.CLOSED : lineStatus,
-      line.id,
-    );
-    await this.refreshReturnOrderStatus(order.id);
-    await this.writeAudit(actor, warehouse.id, 'return_line.inspected', 'return_inspection', inspection.id, {
-      rmaNumber: order.rma_number,
-      lineNumber: line.line_number,
-      disposition: decision.disposition,
-      inspectedQuantity,
-      acceptedQuantity,
-      stockQuantId,
-    });
+      await tx.$executeRawUnsafe(
+        `UPDATE return_order_lines
+         SET inspected_quantity = $1, disposition = $2, status = $3, updated_at = now()
+         WHERE id = $4::uuid`,
+        nextInspected,
+        decision.disposition,
+        lineStatus,
+        line.id,
+      );
+      await this.refreshReturnOrderStatus(order.id, tx);
+      await this.writeAudit(tx, actor, warehouse.id, 'return_line.inspected', 'return_inspection', inspection.id, {
+        rmaNumber: order.rma_number,
+        lineNumber: line.line_number,
+        disposition: decision.disposition,
+        inspectedQuantity,
+        acceptedQuantity,
+        stockQuantId,
+      });
 
-    return toInspectionResponse(inspection);
+      return toInspectionResponse(inspection);
+    }));
   }
 
-  private async createOrUpdateReturnedStock(input: {
+  private async createOrUpdateReturnedStock(client: ReturnSqlClient, input: {
     warehouseId: string;
     ownerClientId: string | null;
     skuId: string;
@@ -230,14 +250,19 @@ export class ReturnsService {
     lotReference?: string;
     returnOrderId: string;
     returnLineId: string;
+    inspectedThrough: number;
     actorUserId: string;
     metadata?: Record<string, unknown>;
   }): Promise<string> {
     const location = input.locationReference
-      ? await this.resolveLocation(input.warehouseId, input.locationReference)
-      : await this.resolveDefaultReturnsLocation(input.warehouseId);
-    const lot = input.lotReference ? await this.resolveLot(input.warehouseId, input.skuId, input.lotReference) : null;
-    const updated = await this.query<{ id: string }>(
+      ? await this.resolveLocation(input.warehouseId, input.locationReference, client)
+      : await this.resolveDefaultReturnsLocation(input.warehouseId, client);
+    const lot = input.lotReference ? await this.resolveLot(input.warehouseId, input.skuId, input.lotReference, client) : null;
+    await assertNoBlockingStockFreeze(client, {
+      warehouseId: input.warehouseId, locationId: location.id, skuId: input.skuId, operation: 'return stock',
+    });
+    await lockStockQuantIdentity(client, { ...input, locationId: location.id, lotId: lot?.id });
+    const updated = await client.$queryRawUnsafe<{ id: string }[]>(
       `UPDATE stock_quants
        SET quantity = quantity + $1, updated_at = now(), metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb
        WHERE warehouse_id = $3::uuid
@@ -247,6 +272,8 @@ export class ReturnsService {
          AND owner_client_id IS NOT DISTINCT FROM $7::uuid
          AND lot_id IS NOT DISTINCT FROM $8::uuid
          AND handling_unit_id IS NULL
+         AND batch IS NULL
+         AND expiry_date IS NULL
        RETURNING id`,
       input.quantity,
       json({ returnOrderId: input.returnOrderId, returnLineId: input.returnLineId, source: 'returns' }),
@@ -257,9 +284,9 @@ export class ReturnsService {
       input.ownerClientId,
       lot?.id ?? null,
     );
-    const quantId = updated[0]?.id ?? (await this.insertReturnedQuant(input, location.id, lot?.id ?? null));
+    const quantId = updated[0]?.id ?? (await this.insertReturnedQuant(client, input, location.id, lot?.id ?? null));
 
-    await this.execute(
+    await client.$executeRawUnsafe(
       `INSERT INTO stock_movements
         (warehouse_id, owner_client_id, sku_id, stock_quant_id, actor_user_id, type, quantity, to_location_id, reference_type, reference_id, source_system, idempotency_key, metadata)
        VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, 'RECEIVE', $6, $7::uuid, 'RETURN_ORDER_LINE', $8, 'RETURNS', $9, $10::jsonb)
@@ -272,7 +299,7 @@ export class ReturnsService {
       input.quantity,
       location.id,
       input.returnLineId,
-      `return:${input.returnLineId}:${input.status}:${input.quantity}`,
+      `return:${input.returnLineId}:inspection:${input.inspectedThrough}`,
       json({ ...(input.metadata ?? {}), dispositionStockStatus: input.status }),
     );
 
@@ -280,6 +307,7 @@ export class ReturnsService {
   }
 
   private async insertReturnedQuant(
+    client: ReturnSqlClient,
     input: {
       warehouseId: string;
       ownerClientId: string | null;
@@ -291,7 +319,7 @@ export class ReturnsService {
     locationId: string,
     lotId: string | null,
   ): Promise<string> {
-    const rows = await this.query<{ id: string }>(
+    const rows = await client.$queryRawUnsafe<{ id: string }[]>(
       `INSERT INTO stock_quants
         (warehouse_id, owner_client_id, location_id, sku_id, lot_id, quantity, reserved_quantity, status, metadata)
        VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6, 0, $7::"StockQuantStatus", $8::jsonb)
@@ -308,17 +336,17 @@ export class ReturnsService {
     return requiredRow(rows, 'Returned stock quant was not created').id;
   }
 
-  private async refreshReturnOrderStatus(returnOrderId: string): Promise<void> {
-    const statuses = await this.query<{ status: string }>(
+  private async refreshReturnOrderStatus(returnOrderId: string, client: ReturnSqlClient): Promise<void> {
+    const statuses = await client.$queryRawUnsafe<{ status: string }[]>(
       `SELECT status FROM return_order_lines WHERE return_order_id = $1::uuid`,
       returnOrderId,
     );
     const nextStatus = nextReturnOrderStatus(statuses.map((row) => row.status as ReturnLineStatus));
-    await this.execute(`UPDATE return_orders SET status = $1, updated_at = now() WHERE id = $2::uuid`, nextStatus, returnOrderId);
+    await client.$executeRawUnsafe(`UPDATE return_orders SET status = $1, updated_at = now() WHERE id = $2::uuid`, nextStatus, returnOrderId);
   }
 
-  private async toReturnOrderResponse(order: ReturnOrderRow): Promise<ReturnOrderResponse> {
-    const lines = await this.query<ReturnLineRow>(
+  private async toReturnOrderResponse(order: ReturnOrderRow, client: ReturnSqlClient = this.prisma): Promise<ReturnOrderResponse> {
+    const lines = await client.$queryRawUnsafe<ReturnLineRow[]>(
       `SELECT * FROM return_order_lines WHERE return_order_id = $1::uuid ORDER BY line_number ASC`,
       order.id,
     );
@@ -360,8 +388,8 @@ export class ReturnsService {
     return row;
   }
 
-  private async resolveSku(reference: string): Promise<IdCodeRow> {
-    const rows = await this.query<IdCodeRow>(
+  private async resolveSku(reference: string, client: ReturnSqlClient = this.prisma): Promise<IdCodeRow> {
+    const rows = await client.$queryRawUnsafe<IdCodeRow[]>(
       `SELECT id, code FROM skus WHERE id::text = $1 OR code = $2 OR barcode = $3 LIMIT 1`,
       reference,
       normalizeReturnReference(reference),
@@ -372,8 +400,8 @@ export class ReturnsService {
     return row;
   }
 
-  private async resolveLocation(warehouseId: string, reference: string): Promise<IdCodeRow> {
-    const rows = await this.query<IdCodeRow>(
+  private async resolveLocation(warehouseId: string, reference: string, client: ReturnSqlClient = this.prisma): Promise<IdCodeRow> {
+    const rows = await client.$queryRawUnsafe<IdCodeRow[]>(
       `SELECT id, code FROM warehouse_locations WHERE warehouse_id = $1::uuid AND (id::text = $2 OR code = $3 OR barcode = $4) LIMIT 1`,
       warehouseId,
       reference,
@@ -385,8 +413,8 @@ export class ReturnsService {
     return row;
   }
 
-  private async resolveDefaultReturnsLocation(warehouseId: string): Promise<IdCodeRow> {
-    const rows = await this.query<IdCodeRow>(
+  private async resolveDefaultReturnsLocation(warehouseId: string, client: ReturnSqlClient = this.prisma): Promise<IdCodeRow> {
+    const rows = await client.$queryRawUnsafe<IdCodeRow[]>(
       `SELECT id, code FROM warehouse_locations
        WHERE warehouse_id = $1::uuid AND (type::text IN ('RECEIVING', 'QUARANTINE', 'BUFFER') OR bin_type IN ('RETURNS', 'QUARANTINE'))
        ORDER BY CASE WHEN bin_type = 'RETURNS' THEN 0 WHEN type::text = 'QUARANTINE' THEN 1 ELSE 2 END, code ASC
@@ -398,8 +426,8 @@ export class ReturnsService {
     return row;
   }
 
-  private async resolveLot(warehouseId: string, skuId: string, reference: string): Promise<{ id: string }> {
-    const rows = await this.query<{ id: string }>(
+  private async resolveLot(warehouseId: string, skuId: string, reference: string, client: ReturnSqlClient = this.prisma): Promise<{ id: string }> {
+    const rows = await client.$queryRawUnsafe<{ id: string }[]>(
       `SELECT id FROM sku_lots WHERE warehouse_id = $1::uuid AND sku_id = $2::uuid AND (id::text = $3 OR lot_code = $4) LIMIT 1`,
       warehouseId,
       skuId,
@@ -411,8 +439,8 @@ export class ReturnsService {
     return row;
   }
 
-  private async resolveReturnOrder(warehouseId: string, reference: string): Promise<ReturnOrderRow> {
-    const rows = await this.query<ReturnOrderRow>(
+  private async resolveReturnOrder(warehouseId: string, reference: string, client: ReturnSqlClient = this.prisma): Promise<ReturnOrderRow> {
+    const rows = await client.$queryRawUnsafe<ReturnOrderRow[]>(
       `SELECT * FROM return_orders WHERE warehouse_id = $1::uuid AND (id::text = $2 OR rma_number = $3) LIMIT 1`,
       warehouseId,
       reference,
@@ -423,8 +451,8 @@ export class ReturnsService {
     return row;
   }
 
-  private async resolveReturnLine(returnOrderId: string, reference: string): Promise<ReturnLineRow> {
-    const rows = await this.query<ReturnLineRow>(
+  private async resolveReturnLine(returnOrderId: string, reference: string, client: ReturnSqlClient = this.prisma): Promise<ReturnLineRow> {
+    const rows = await client.$queryRawUnsafe<ReturnLineRow[]>(
       `SELECT * FROM return_order_lines WHERE return_order_id = $1::uuid AND (id::text = $2 OR line_number = $3) LIMIT 1`,
       returnOrderId,
       reference,
@@ -436,6 +464,7 @@ export class ReturnsService {
   }
 
   private async writeAudit(
+    client: ReturnSqlClient,
     actor: AuthenticatedUser,
     warehouseId: string,
     action: string,
@@ -443,7 +472,7 @@ export class ReturnsService {
     resourceId: string,
     metadata: Record<string, unknown>,
   ): Promise<void> {
-    await this.execute(
+    await client.$executeRawUnsafe(
       `INSERT INTO audit_logs (actor_user_id, warehouse_id, action, resource_type, resource_id, metadata)
        VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6::jsonb)`,
       actor.id,
@@ -459,9 +488,6 @@ export class ReturnsService {
     return this.prisma.$queryRawUnsafe<T[]>(query, ...values);
   }
 
-  private execute(query: string, ...values: unknown[]): Promise<number> {
-    return this.prisma.$executeRawUnsafe(query, ...values);
-  }
 }
 
 function toLineResponse(line: ReturnLineRow): ReturnOrderLineResponse {

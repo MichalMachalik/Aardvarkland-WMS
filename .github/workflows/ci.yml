@@ -101,6 +101,12 @@ jobs:
       - run: node --test scripts/transaction-regressions.test.mjs
       - run: node --env-file=.env.example ./node_modules/ts-node/dist/bin.js --project tsconfig.scripts.json --transpile-only scripts/export-openapi.ts
       - run: node ../scripts/Check-AardvarklandFrontendOpenApiContract.mjs
+      - name: Test every documented API operation on PostgreSQL
+        env:
+          SEED_LOCAL_DEMO_USERS: "true"
+        run: |
+          node --env-file=.env.example ./node_modules/tsx/dist/cli.mjs prisma/seed.ts
+          node --env-file=.env.example --test scripts/api-operations.test.mjs
 
   frontend:
     runs-on: ubuntu-24.04

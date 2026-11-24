@@ -35,6 +35,7 @@ export class QualityService {
     const ownerClient = dto.ownerClientReference ? await this.resolveClient(dto.ownerClientReference) : null;
     const sku = dto.skuReference ? await this.resolveSku(dto.skuReference) : null;
     const lot = dto.lotReference && sku ? await this.resolveLot(warehouse.id, sku.id, dto.lotReference) : null;
+    const quant = dto.stockQuantId ? await this.resolveQuant(warehouse.id, dto.stockQuantId) : null;
 
     if (dto.lotReference && !sku) throw new ConflictException('lotReference requires skuReference.');
 
@@ -50,7 +51,7 @@ export class QualityService {
       ownerClient?.id ?? null,
       sku?.id ?? null,
       lot?.id ?? null,
-      nullable(dto.stockQuantId),
+      quant?.id ?? null,
       normalizeInspectionNumber(dto.inspectionNumber),
       QualityInspectionStatus.OPEN,
       sampleQuantity,

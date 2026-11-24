@@ -1,9 +1,10 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 
 import { AuthenticatedUser } from '../access-control/types';
 import { calculateCountVariance } from '../cycle-counts/cycle-counts.helpers';
 import { CycleCountPlanStatus, CycleCountTaskStatus } from '../cycle-counts/cycle-counts.types';
 import { lockPostgresRowById, PrismaService, withTransactionRetry } from '../database';
+import { WarehouseTaskType } from '../generated/prisma/client';
 import { assertNoBlockingStockFreeze, StockFreezeClient } from '../inventory/stock-freeze.helpers';
 import { CancelRfSessionDto } from './dto/cancel-rf-session.dto';
 import { ReportRfExceptionDto } from './dto/report-rf-exception.dto';
@@ -53,16 +54,24 @@ export class RfWorkflowsService {
       actor?: AuthenticatedUser;
     } = {},
   ): Promise<RfQueueResponse> {
+    const requestedLimit = options.limit ?? 12;
+    if (!Number.isSafeInteger(requestedLimit) || requestedLimit < 1) {
+      throw new BadRequestException('limit must be a positive integer');
+    }
+    const workflow = options.workflow?.trim() ? normalizeCode(options.workflow) : undefined;
+    if (workflow && !Object.hasOwn(WarehouseTaskType, workflow)) {
+      throw new BadRequestException('workflow must be a supported warehouse task type');
+    }
     await this.ensureOfflineSchema();
     const warehouse = await this.resolveWarehouse(warehouseReference);
-    const limit = Math.min(Math.max(Math.trunc(options.limit ?? 12), 1), 50);
+    const limit = Math.min(requestedLimit, 50);
     const where: Record<string, unknown> = {
       warehouseId: warehouse.id,
       status: { in: ['OPEN', 'ASSIGNED', 'BLOCKED'] },
     };
 
-    if (options.workflow) {
-      where['type'] = normalizeCode(options.workflow);
+    if (workflow) {
+      where['type'] = workflow;
     }
 
     if (options.assignedToMe && options.actor?.id) {

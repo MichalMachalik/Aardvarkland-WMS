@@ -6,6 +6,7 @@ import { RequireWarehousePermissions } from '../access-control/decorators/requir
 import { AuthenticatedUser } from '../access-control/types';
 import { CancelRfSessionDto } from './dto/cancel-rf-session.dto';
 import { ReportRfExceptionDto } from './dto/report-rf-exception.dto';
+import { RfQueueQueryDto } from './dto/rf-queue-query.dto';
 import { ScanRfStepDto } from './dto/scan-rf-step.dto';
 import { StartRfSessionDto } from './dto/start-rf-session.dto';
 import { SyncRfOfflineQueueDto } from './dto/sync-rf-offline-queue.dto';
@@ -22,17 +23,14 @@ export class RfWorkflowsController {
   @Get('queue')
   getQueue(
     @Param('warehouseId') warehouseId: string,
-    @Query('workflow') workflow?: string,
-    @Query('zone') zone?: string,
-    @Query('assignedToMe') assignedToMe?: string,
-    @Query('limit') limit?: string,
+    @Query() query: RfQueueQueryDto,
     @CurrentUser() actor?: AuthenticatedUser,
   ) {
     return this.rfWorkflowsService.getQueue(warehouseId, {
-      workflow,
-      zone,
-      assignedToMe: assignedToMe === 'true',
-      limit: limit ? Number(limit) : undefined,
+      workflow: query.workflow,
+      zone: query.zone,
+      assignedToMe: query.assignedToMe === 'true',
+      limit: query.limit === undefined ? undefined : Number(query.limit),
       actor,
     });
   }

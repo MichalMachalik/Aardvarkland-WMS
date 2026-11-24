@@ -203,6 +203,8 @@ cd demo
 WMS_LIVE_UI_URL=http://127.0.0.1:4000/ npm test -- live
 ```
 
+Samostatná sada v `backend/scripts/api-operations.test.mjs` prochází všechny operace z OpenAPI. Ověřuje autorizaci, parametry, odmítnutí neplatných zápisů a vybrané scénáře včetně uložených změn, opakovaných požadavků a stavů zásob. Spouští vlastní místní API nad připravenou testovací databází. Z adresáře `backend` spusťte po sestavení backendu a naplnění testovací databáze příkaz `node --env-file=.env.example --test scripts/api-operations.test.mjs` s proměnnou `WMS_TEST_DATABASE_URL` nastavenou na tuto databázi.
+
 Čtečky a tiskárny ověřte na fyzickém hardwaru.
 
 ### Struktura repozitáře

@@ -6,6 +6,7 @@ import { RequirePermissions } from '../access-control/decorators/require-permiss
 import { AuthenticatedUser } from '../access-control/types';
 import { CreateExternalSystemDto } from './dto/create-external-system.dto';
 import { ReplayDeadLetterDto } from './dto/replay-dead-letter.dto';
+import { ResolveExternalIdMappingDto } from './dto/resolve-external-id-mapping.dto';
 import { ResolveDeadLetterDto } from './dto/resolve-dead-letter.dto';
 import { RunReconciliationDto } from './dto/run-reconciliation.dto';
 import { UpsertExternalIdMappingDto } from './dto/upsert-external-id-mapping.dto';
@@ -56,12 +57,8 @@ export class IntegrationEnterpriseController {
 
   @RequirePermissions('integration.read')
   @Get('external-id-mappings/resolve')
-  resolveExternalIdMapping(
-    @Query('externalSystemReference') externalSystemReference: string,
-    @Query('resourceType') resourceType: string,
-    @Query('externalId') externalId: string,
-  ) {
-    return this.integrationEnterpriseService.resolveExternalIdMapping({ externalSystemReference, resourceType, externalId });
+  resolveExternalIdMapping(@Query() query: ResolveExternalIdMappingDto) {
+    return this.integrationEnterpriseService.resolveExternalIdMapping(query);
   }
 
   @RequirePermissions('integration.read')

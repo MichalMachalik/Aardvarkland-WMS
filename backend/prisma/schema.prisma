@@ -1393,7 +1393,7 @@ model HandlingUnit {
 }
 
 model StockQuant {
-  id                 String              @id @default(uuid()) @db.Uuid
+  id                 String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   warehouseId        String              @map("warehouse_id") @db.Uuid
   ownerClientId      String?             @map("owner_client_id") @db.Uuid
   locationId         String              @map("location_id") @db.Uuid
@@ -1419,7 +1419,7 @@ model StockQuant {
   reservations       Reservation[]
   movements          StockMovement[]
   createdAt          DateTime            @default(now()) @map("created_at")
-  updatedAt          DateTime            @updatedAt @map("updated_at")
+  updatedAt          DateTime            @default(now()) @updatedAt @map("updated_at")
 
   @@index([warehouseId, status])
   @@index([warehouseId, ownerClientId])
@@ -1466,7 +1466,7 @@ model Reservation {
 }
 
 model WarehouseTask {
-  id                    String               @id @default(uuid()) @db.Uuid
+  id                    String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   warehouseId           String               @map("warehouse_id") @db.Uuid
   ownerClientId         String?              @map("owner_client_id") @db.Uuid
   type                  WarehouseTaskType
@@ -1524,7 +1524,7 @@ model WarehouseTask {
 }
 
 model StockMovement {
-  id             String             @id @default(uuid()) @db.Uuid
+  id             String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   warehouseId    String             @map("warehouse_id") @db.Uuid
   ownerClientId  String?            @map("owner_client_id") @db.Uuid
   skuId          String             @map("sku_id") @db.Uuid
@@ -1584,7 +1584,7 @@ model IdempotencyRecord {
 }
 
 model OutboxEvent {
-  id            String            @id @default(uuid()) @db.Uuid
+  id            String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   type          String
   aggregateType String            @map("aggregate_type")
   aggregateId   String            @map("aggregate_id")
@@ -1595,7 +1595,7 @@ model OutboxEvent {
   availableAt   DateTime          @default(now()) @map("available_at")
   sentAt        DateTime?         @map("sent_at")
   createdAt     DateTime          @default(now()) @map("created_at")
-  updatedAt     DateTime          @updatedAt @map("updated_at")
+  updatedAt     DateTime          @default(now()) @updatedAt @map("updated_at")
 
   @@index([status, availableAt])
   @@index([aggregateType, aggregateId])
@@ -2022,7 +2022,7 @@ model PickTote {
 }
 
 model SkuLot {
-  id                  String               @id @default(uuid()) @db.Uuid
+  id                  String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   warehouseId         String               @map("warehouse_id") @db.Uuid
   ownerClientId       String?              @map("owner_client_id") @db.Uuid
   skuId               String               @map("sku_id") @db.Uuid
@@ -2055,7 +2055,7 @@ model SkuLot {
 }
 
 model SerialNumber {
-  id                    String               @id @default(uuid()) @db.Uuid
+  id                    String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   warehouseId           String               @map("warehouse_id") @db.Uuid
   ownerClientId         String?              @map("owner_client_id") @db.Uuid
   skuId                 String               @map("sku_id") @db.Uuid
@@ -2088,7 +2088,7 @@ model SerialNumber {
 }
 
 model SerialNumberEvent {
-  id             String             @id @default(uuid()) @db.Uuid
+  id             String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   warehouseId    String             @map("warehouse_id") @db.Uuid
   ownerClientId  String?            @map("owner_client_id") @db.Uuid
   serialNumberId String             @map("serial_number_id") @db.Uuid
@@ -2116,7 +2116,7 @@ model SerialNumberEvent {
 }
 
 model WarehouseOrder {
-  id             String               @id @default(uuid()) @db.Uuid
+  id             String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   warehouseId    String               @map("warehouse_id") @db.Uuid
   ownerClientId  String?              @map("owner_client_id") @db.Uuid
   orderNumber    String               @map("order_number")
@@ -2148,7 +2148,7 @@ model WarehouseOrder {
 }
 
 model WarehouseOrderLine {
-  id                String                   @id @default(uuid()) @db.Uuid
+  id                String                   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   warehouseId       String                   @map("warehouse_id") @db.Uuid
   ownerClientId     String?                  @map("owner_client_id") @db.Uuid
   warehouseOrderId  String                   @map("warehouse_order_id") @db.Uuid
@@ -2177,7 +2177,7 @@ model WarehouseOrderLine {
 }
 
 model WarehouseOrderTask {
-  id                   String              @id @default(uuid()) @db.Uuid
+  id                   String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   warehouseId          String              @map("warehouse_id") @db.Uuid
   ownerClientId        String?             @map("owner_client_id") @db.Uuid
   warehouseOrderId     String              @map("warehouse_order_id") @db.Uuid
@@ -2433,7 +2433,7 @@ model IntegrationDispatchLog {
 }
 
 model AuditLog {
-  id           String     @id @default(uuid()) @db.Uuid
+  id           String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   actorUserId  String?    @map("actor_user_id") @db.Uuid
   warehouseId  String?    @map("warehouse_id") @db.Uuid
   action       String
@@ -2451,14 +2451,14 @@ model AuditLog {
 }
 
 model ProductCategory {
-  id        String   @id @default(uuid()) @db.Uuid
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   parentId  String?  @map("parent_id") @db.Uuid
   code      String
   name      String
   status    String   @default("ACTIVE")
   metadata  Json?
   createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
 
   @@unique([code])
   @@index([parentId])
@@ -2467,7 +2467,7 @@ model ProductCategory {
 }
 
 model ProductCategoryLink {
-  id         String   @id @default(uuid()) @db.Uuid
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   productId  String   @map("product_id") @db.Uuid
   categoryId String   @map("category_id") @db.Uuid
   isPrimary  Boolean  @default(false) @map("is_primary")
@@ -2479,7 +2479,7 @@ model ProductCategoryLink {
 }
 
 model ProductUom {
-  id        String   @id @default(uuid()) @db.Uuid
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   code      String
   name      String
   kind      String   @default("EACH")
@@ -2487,7 +2487,7 @@ model ProductUom {
   isActive  Boolean  @default(true) @map("is_active")
   metadata  Json?
   createdAt DateTime @default(now()) @map("created_at")
-  updatedAt DateTime @updatedAt @map("updated_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
 
   @@unique([code])
   @@index([kind, isActive])
@@ -2495,7 +2495,7 @@ model ProductUom {
 }
 
 model ProductUomConversion {
-  id         String   @id @default(uuid()) @db.Uuid
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   fromUom    String   @map("from_uom")
   toUom      String   @map("to_uom")
   multiplier Decimal  @db.Decimal(18, 6)
@@ -2504,7 +2504,7 @@ model ProductUomConversion {
   isActive   Boolean  @default(true) @map("is_active")
   metadata   Json?
   createdAt  DateTime @default(now()) @map("created_at")
-  updatedAt  DateTime @updatedAt @map("updated_at")
+  updatedAt  DateTime @default(now()) @updatedAt @map("updated_at")
 
   @@unique([fromUom, toUom, productId, skuId])
   @@index([skuId, isActive])
@@ -2513,7 +2513,7 @@ model ProductUomConversion {
 }
 
 model SkuBarcode {
-  id          String   @id @default(uuid()) @db.Uuid
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   warehouseId String?  @map("warehouse_id") @db.Uuid
   skuId       String   @map("sku_id") @db.Uuid
   barcode     String
@@ -2522,7 +2522,7 @@ model SkuBarcode {
   status      String   @default("ACTIVE")
   metadata    Json?
   createdAt   DateTime @default(now()) @map("created_at")
-  updatedAt   DateTime @updatedAt @map("updated_at")
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at")
 
   @@unique([skuId, barcode])
   @@index([warehouseId, barcode])
@@ -2531,7 +2531,7 @@ model SkuBarcode {
 }
 
 model SkuStorageRequirement {
-  id                    String   @id @default(uuid()) @db.Uuid
+  id                    String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   skuId                 String   @unique @map("sku_id") @db.Uuid
   temperatureMinCelsius Decimal? @map("temperature_min_celsius") @db.Decimal(8, 3)
   temperatureMaxCelsius Decimal? @map("temperature_max_celsius") @db.Decimal(8, 3)
@@ -2541,14 +2541,14 @@ model SkuStorageRequirement {
   stackable             Boolean  @default(true)
   requirements          Json?
   createdAt             DateTime @default(now()) @map("created_at")
-  updatedAt             DateTime @updatedAt @map("updated_at")
+  updatedAt             DateTime @default(now()) @updatedAt @map("updated_at")
 
   @@index([fragile, hazardous, oversized])
   @@map("sku_storage_requirements")
 }
 
 model SkuPackagingLevel {
-  id              String   @id @default(uuid()) @db.Uuid
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   skuId           String   @map("sku_id") @db.Uuid
   levelCode       String   @map("level_code")
   uom             String
@@ -2563,7 +2563,7 @@ model SkuPackagingLevel {
   isDefault       Boolean  @default(false) @map("is_default")
   metadata        Json?
   createdAt       DateTime @default(now()) @map("created_at")
-  updatedAt       DateTime @updatedAt @map("updated_at")
+  updatedAt       DateTime @default(now()) @updatedAt @map("updated_at")
 
   @@unique([skuId, levelCode])
   @@index([skuId, unitsPerLevel])
@@ -2571,14 +2571,14 @@ model SkuPackagingLevel {
 }
 
 model ProductClientOwnership {
-  id                    String   @id @default(uuid()) @db.Uuid
+  id                    String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   productId             String   @map("product_id") @db.Uuid
   clientId              String   @map("client_id") @db.Uuid
   externalArticleNumber String?  @map("external_article_number")
   status                String   @default("ACTIVE")
   metadata              Json?
   createdAt             DateTime @default(now()) @map("created_at")
-  updatedAt             DateTime @updatedAt @map("updated_at")
+  updatedAt             DateTime @default(now()) @updatedAt @map("updated_at")
 
   @@unique([productId, clientId])
   @@index([clientId, status])
@@ -2586,7 +2586,7 @@ model ProductClientOwnership {
 }
 
 model ProductDocumentMetadata {
-  id             String   @id @default(uuid()) @db.Uuid
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   productId      String   @map("product_id") @db.Uuid
   documentType   String   @map("document_type")
   title          String
@@ -2595,14 +2595,14 @@ model ProductDocumentMetadata {
   checksumSha256 String?  @map("checksum_sha256")
   metadata       Json?
   createdAt      DateTime @default(now()) @map("created_at")
-  updatedAt      DateTime @updatedAt @map("updated_at")
+  updatedAt      DateTime @default(now()) @updatedAt @map("updated_at")
 
   @@index([productId, documentType])
   @@map("product_document_metadata")
 }
 
 model ReturnOrder {
-  id                String   @id @default(uuid()) @db.Uuid
+  id                String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   warehouseId       String   @map("warehouse_id") @db.Uuid
   ownerClientId     String?  @map("owner_client_id") @db.Uuid
   rmaNumber         String   @map("rma_number")
@@ -2612,7 +2612,7 @@ model ReturnOrder {
   reasonCode        String?  @map("reason_code")
   metadata          Json?
   createdAt         DateTime @default(now()) @map("created_at")
-  updatedAt         DateTime @updatedAt @map("updated_at")
+  updatedAt         DateTime @default(now()) @updatedAt @map("updated_at")
 
   @@unique([warehouseId, rmaNumber])
   @@index([warehouseId, ownerClientId, status])
@@ -2621,7 +2621,7 @@ model ReturnOrder {
 }
 
 model ReturnOrderLine {
-  id                String   @id @default(uuid()) @db.Uuid
+  id                String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   returnOrderId     String   @map("return_order_id") @db.Uuid
   lineNumber        String   @map("line_number")
   skuId             String   @map("sku_id") @db.Uuid
@@ -2632,7 +2632,7 @@ model ReturnOrderLine {
   status            String   @default("OPEN")
   metadata          Json?
   createdAt         DateTime @default(now()) @map("created_at")
-  updatedAt         DateTime @updatedAt @map("updated_at")
+  updatedAt         DateTime @default(now()) @updatedAt @map("updated_at")
 
   @@unique([returnOrderId, lineNumber])
   @@index([skuId, status])
@@ -2640,7 +2640,7 @@ model ReturnOrderLine {
 }
 
 model ReturnInspection {
-  id                String   @id @default(uuid()) @db.Uuid
+  id                String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   warehouseId       String   @map("warehouse_id") @db.Uuid
   returnOrderId     String   @map("return_order_id") @db.Uuid
   returnOrderLineId String   @map("return_order_line_id") @db.Uuid
@@ -2660,7 +2660,7 @@ model ReturnInspection {
 }
 
 model QualityInspection {
-  id                String    @id @default(uuid()) @db.Uuid
+  id                String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   warehouseId       String    @map("warehouse_id") @db.Uuid
   ownerClientId     String?   @map("owner_client_id") @db.Uuid
   skuId             String?   @map("sku_id") @db.Uuid
@@ -2678,7 +2678,7 @@ model QualityInspection {
   completedAt       DateTime? @map("completed_at")
   metadata          Json?
   createdAt         DateTime  @default(now()) @map("created_at")
-  updatedAt         DateTime  @updatedAt @map("updated_at")
+  updatedAt         DateTime  @default(now()) @updatedAt @map("updated_at")
 
   @@unique([warehouseId, inspectionNumber])
   @@index([warehouseId, status])
@@ -2688,7 +2688,7 @@ model QualityInspection {
 }
 
 model QualitySamplingRule {
-  id                String   @id @default(uuid()) @db.Uuid
+  id                String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   warehouseId       String   @map("warehouse_id") @db.Uuid
   clientId          String?  @map("client_id") @db.Uuid
   skuId             String?  @map("sku_id") @db.Uuid
@@ -2700,7 +2700,7 @@ model QualitySamplingRule {
   isActive          Boolean  @default(true) @map("is_active")
   metadata          Json?
   createdAt         DateTime @default(now()) @map("created_at")
-  updatedAt         DateTime @updatedAt @map("updated_at")
+  updatedAt         DateTime @default(now()) @updatedAt @map("updated_at")
 
   @@index([warehouseId, isActive])
   @@index([clientId, skuId])
@@ -2708,7 +2708,7 @@ model QualitySamplingRule {
 }
 
 model ExternalSystem {
-  id            String   @id @default(uuid()) @db.Uuid
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   code          String
   name          String
   systemType    String   @map("system_type")
@@ -2716,7 +2716,7 @@ model ExternalSystem {
   ownerClientId String?  @map("owner_client_id") @db.Uuid
   config        Json?
   createdAt     DateTime @default(now()) @map("created_at")
-  updatedAt     DateTime @updatedAt @map("updated_at")
+  updatedAt     DateTime @default(now()) @updatedAt @map("updated_at")
 
   @@unique([code])
   @@index([systemType, status])
@@ -2725,7 +2725,7 @@ model ExternalSystem {
 }
 
 model ExternalIdMapping {
-  id               String   @id @default(uuid()) @db.Uuid
+  id               String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   externalSystemId String   @map("external_system_id") @db.Uuid
   warehouseId      String?  @map("warehouse_id") @db.Uuid
   ownerClientId    String?  @map("owner_client_id") @db.Uuid
@@ -2735,7 +2735,7 @@ model ExternalIdMapping {
   externalType     String?  @map("external_type")
   metadata         Json?
   createdAt        DateTime @default(now()) @map("created_at")
-  updatedAt        DateTime @updatedAt @map("updated_at")
+  updatedAt        DateTime @default(now()) @updatedAt @map("updated_at")
 
   @@unique([externalSystemId, resourceType, externalId])
   @@index([resourceType, resourceId])
@@ -2744,7 +2744,7 @@ model ExternalIdMapping {
 }
 
 model IntegrationDeadLetter {
-  id            String    @id @default(uuid()) @db.Uuid
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   endpointId    String?   @map("endpoint_id") @db.Uuid
   outboxEventId String?   @map("outbox_event_id") @db.Uuid
   inboxEventId  String?   @map("inbox_event_id") @db.Uuid
@@ -2761,7 +2761,7 @@ model IntegrationDeadLetter {
   resolvedAt    DateTime? @map("resolved_at")
   replayedAt    DateTime? @map("replayed_at")
   createdAt     DateTime  @default(now()) @map("created_at")
-  updatedAt     DateTime  @updatedAt @map("updated_at")
+  updatedAt     DateTime  @default(now()) @updatedAt @map("updated_at")
 
   @@unique([fingerprint])
   @@index([status, createdAt])
@@ -2771,7 +2771,7 @@ model IntegrationDeadLetter {
 }
 
 model DomainEvent {
-  id            String    @id @default(uuid()) @db.Uuid
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   warehouseId   String    @map("warehouse_id") @db.Uuid
   ownerClientId String?   @map("owner_client_id") @db.Uuid
   eventType     String    @map("event_type")
@@ -2784,7 +2784,7 @@ model DomainEvent {
   occurredAt    DateTime  @default(now()) @map("occurred_at")
   publishedAt   DateTime? @map("published_at")
   createdAt     DateTime  @default(now()) @map("created_at")
-  updatedAt     DateTime  @updatedAt @map("updated_at")
+  updatedAt     DateTime  @default(now()) @updatedAt @map("updated_at")
 
   @@unique([eventKey])
   @@index([warehouseId, eventType, createdAt])
@@ -2794,7 +2794,7 @@ model DomainEvent {
 }
 
 model WebhookSubscription {
-  id            String   @id @default(uuid()) @db.Uuid
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   warehouseId   String   @map("warehouse_id") @db.Uuid
   ownerClientId String?  @map("owner_client_id") @db.Uuid
   name          String
@@ -2804,7 +2804,7 @@ model WebhookSubscription {
   secretRef     String?  @map("secret_ref")
   metadata      Json?
   createdAt     DateTime @default(now()) @map("created_at")
-  updatedAt     DateTime @updatedAt @map("updated_at")
+  updatedAt     DateTime @default(now()) @updatedAt @map("updated_at")
 
   @@unique([warehouseId, name])
   @@index([warehouseId, status])
@@ -2812,7 +2812,7 @@ model WebhookSubscription {
 }
 
 model WebhookDeliveryAttempt {
-  id                 String    @id @default(uuid()) @db.Uuid
+  id                 String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   warehouseId        String    @map("warehouse_id") @db.Uuid
   ownerClientId      String?   @map("owner_client_id") @db.Uuid
   subscriptionId     String    @map("subscription_id") @db.Uuid
@@ -2825,7 +2825,7 @@ model WebhookDeliveryAttempt {
   nextRetryAt        DateTime? @map("next_retry_at")
   metadata           Json?
   createdAt          DateTime  @default(now()) @map("created_at")
-  updatedAt          DateTime  @updatedAt @map("updated_at")
+  updatedAt          DateTime  @default(now()) @updatedAt @map("updated_at")
 
   @@unique([subscriptionId, domainEventId, attemptNumber])
   @@index([status, nextRetryAt, createdAt])
@@ -2834,7 +2834,7 @@ model WebhookDeliveryAttempt {
 }
 
 model AutomationDevice {
-  id              String    @id @default(uuid()) @db.Uuid
+  id              String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   warehouseId     String    @map("warehouse_id") @db.Uuid
   ownerClientId   String?   @map("owner_client_id") @db.Uuid
   code            String
@@ -2845,7 +2845,7 @@ model AutomationDevice {
   capabilities    Json?
   metadata        Json?
   createdAt       DateTime  @default(now()) @map("created_at")
-  updatedAt       DateTime  @updatedAt @map("updated_at")
+  updatedAt       DateTime  @default(now()) @updatedAt @map("updated_at")
 
   @@unique([warehouseId, code])
   @@index([warehouseId, deviceType, status])
@@ -2854,7 +2854,7 @@ model AutomationDevice {
 }
 
 model AutomationCommand {
-  id            String    @id @default(uuid()) @db.Uuid
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   warehouseId   String    @map("warehouse_id") @db.Uuid
   ownerClientId String?   @map("owner_client_id") @db.Uuid
   deviceId      String?   @map("device_id") @db.Uuid
@@ -2870,15 +2870,16 @@ model AutomationCommand {
   errorMessage  String?   @map("error_message")
   metadata      Json?
   createdAt     DateTime  @default(now()) @map("created_at")
-  updatedAt     DateTime  @updatedAt @map("updated_at")
+  updatedAt     DateTime  @default(now()) @updatedAt @map("updated_at")
 
+  @@unique([warehouseId, correlationId])
   @@index([warehouseId, status, priority, createdAt])
   @@index([deviceId, status])
   @@map("automation_commands")
 }
 
 model AutomationEvent {
-  id            String   @id @default(uuid()) @db.Uuid
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   warehouseId   String   @map("warehouse_id") @db.Uuid
   ownerClientId String?  @map("owner_client_id") @db.Uuid
   deviceId      String?  @map("device_id") @db.Uuid
@@ -2887,7 +2888,7 @@ model AutomationEvent {
   severity      String   @default("INFO")
   payload       Json?
   createdAt     DateTime @default(now()) @map("created_at")
-  updatedAt     DateTime @updatedAt @map("updated_at")
+  updatedAt     DateTime @default(now()) @updatedAt @map("updated_at")
 
   @@index([deviceId, createdAt])
   @@index([warehouseId, eventType, createdAt])
@@ -2895,7 +2896,7 @@ model AutomationEvent {
 }
 
 model DockDoor {
-  id            String   @id @default(uuid()) @db.Uuid
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   warehouseId   String   @map("warehouse_id") @db.Uuid
   ownerClientId String?  @map("owner_client_id") @db.Uuid
   code          String
@@ -2904,7 +2905,7 @@ model DockDoor {
   zone          String?
   metadata      Json?
   createdAt     DateTime @default(now()) @map("created_at")
-  updatedAt     DateTime @updatedAt @map("updated_at")
+  updatedAt     DateTime @default(now()) @updatedAt @map("updated_at")
 
   @@unique([warehouseId, code])
   @@index([warehouseId, status])
@@ -2912,7 +2913,7 @@ model DockDoor {
 }
 
 model YardTrailer {
-  id            String    @id @default(uuid()) @db.Uuid
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   warehouseId   String    @map("warehouse_id") @db.Uuid
   ownerClientId String?   @map("owner_client_id") @db.Uuid
   trailerNumber String    @map("trailer_number")
@@ -2924,7 +2925,7 @@ model YardTrailer {
   dwellMinutes  Int?      @map("dwell_minutes")
   metadata      Json?
   createdAt     DateTime  @default(now()) @map("created_at")
-  updatedAt     DateTime  @updatedAt @map("updated_at")
+  updatedAt     DateTime  @default(now()) @updatedAt @map("updated_at")
 
   @@unique([warehouseId, trailerNumber])
   @@index([warehouseId, status])
@@ -2933,7 +2934,7 @@ model YardTrailer {
 }
 
 model DockAppointment {
-  id                String   @id @default(uuid()) @db.Uuid
+  id                String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   warehouseId       String   @map("warehouse_id") @db.Uuid
   ownerClientId     String?  @map("owner_client_id") @db.Uuid
   appointmentNumber String   @map("appointment_number")
@@ -2947,7 +2948,7 @@ model DockAppointment {
   externalReference String?  @map("external_reference")
   metadata          Json?
   createdAt         DateTime @default(now()) @map("created_at")
-  updatedAt         DateTime @updatedAt @map("updated_at")
+  updatedAt         DateTime @default(now()) @updatedAt @map("updated_at")
 
   @@unique([warehouseId, appointmentNumber])
   @@index([warehouseId, status, plannedStartAt])
@@ -2956,7 +2957,7 @@ model DockAppointment {
 }
 
 model CrossDockPlan {
-  id                String   @id @default(uuid()) @db.Uuid
+  id                String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   warehouseId       String   @map("warehouse_id") @db.Uuid
   ownerClientId     String?  @map("owner_client_id") @db.Uuid
   status            String   @default("PLANNED")
@@ -2966,7 +2967,7 @@ model CrossDockPlan {
   reasonCode        String?  @map("reason_code")
   metadata          Json?
   createdAt         DateTime @default(now()) @map("created_at")
-  updatedAt         DateTime @updatedAt @map("updated_at")
+  updatedAt         DateTime @default(now()) @updatedAt @map("updated_at")
 
   @@index([warehouseId, status, priority, createdAt])
   @@index([inboundShipmentId, outboundOrderId])
@@ -2974,7 +2975,7 @@ model CrossDockPlan {
 }
 
 model CrossDockPlanLine {
-  id                String   @id @default(uuid()) @db.Uuid
+  id                String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   warehouseId       String   @map("warehouse_id") @db.Uuid
   ownerClientId     String?  @map("owner_client_id") @db.Uuid
   planId            String   @map("plan_id") @db.Uuid
@@ -2986,7 +2987,7 @@ model CrossDockPlanLine {
   toLocationId      String?  @map("to_location_id") @db.Uuid
   metadata          Json?
   createdAt         DateTime @default(now()) @map("created_at")
-  updatedAt         DateTime @updatedAt @map("updated_at")
+  updatedAt         DateTime @default(now()) @updatedAt @map("updated_at")
 
   @@index([planId])
   @@index([skuId, lotId])
@@ -2994,7 +2995,7 @@ model CrossDockPlanLine {
 }
 
 model VasServiceCatalog {
-  id                     String   @id @default(uuid()) @db.Uuid
+  id                     String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   warehouseId            String   @map("warehouse_id") @db.Uuid
   ownerClientId          String?  @map("owner_client_id") @db.Uuid
   code                   String
@@ -3005,7 +3006,7 @@ model VasServiceCatalog {
   instructions           String?
   metadata               Json?
   createdAt              DateTime @default(now()) @map("created_at")
-  updatedAt              DateTime @updatedAt @map("updated_at")
+  updatedAt              DateTime @default(now()) @updatedAt @map("updated_at")
 
   @@unique([warehouseId, code])
   @@index([warehouseId, serviceType, status])
@@ -3013,7 +3014,7 @@ model VasServiceCatalog {
 }
 
 model KitBomHeader {
-  id            String   @id @default(uuid()) @db.Uuid
+  id            String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   warehouseId   String   @map("warehouse_id") @db.Uuid
   ownerClientId String?  @map("owner_client_id") @db.Uuid
   kitSkuId      String   @map("kit_sku_id") @db.Uuid
@@ -3022,7 +3023,7 @@ model KitBomHeader {
   version       Int      @default(1)
   metadata      Json?
   createdAt     DateTime @default(now()) @map("created_at")
-  updatedAt     DateTime @updatedAt @map("updated_at")
+  updatedAt     DateTime @default(now()) @updatedAt @map("updated_at")
 
   @@unique([warehouseId, code, version])
   @@index([kitSkuId, status])
@@ -3030,7 +3031,7 @@ model KitBomHeader {
 }
 
 model KitBomLine {
-  id             String   @id @default(uuid()) @db.Uuid
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   warehouseId    String   @map("warehouse_id") @db.Uuid
   ownerClientId  String?  @map("owner_client_id") @db.Uuid
   bomId          String   @map("bom_id") @db.Uuid
@@ -3047,7 +3048,7 @@ model KitBomLine {
 }
 
 model VasTask {
-  id                 String    @id @default(uuid()) @db.Uuid
+  id                 String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   warehouseId        String    @map("warehouse_id") @db.Uuid
   ownerClientId      String?   @map("owner_client_id") @db.Uuid
   serviceId          String?   @map("service_id") @db.Uuid
@@ -3060,7 +3061,7 @@ model VasTask {
   completedAt        DateTime? @map("completed_at")
   metadata           Json?
   createdAt          DateTime  @default(now()) @map("created_at")
-  updatedAt          DateTime  @updatedAt @map("updated_at")
+  updatedAt          DateTime  @default(now()) @updatedAt @map("updated_at")
 
   @@index([warehouseId, status, createdAt])
   @@index([targetResourceType, targetResourceId])

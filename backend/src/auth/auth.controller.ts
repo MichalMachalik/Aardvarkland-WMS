@@ -110,7 +110,9 @@ export class AuthController {
     @CurrentUser() user: AuthenticatedUser,
     @Param('warehouseId') warehouseId: string,
   ) {
-    return user.warehouses.find((warehouse) => warehouse.warehouseId === warehouseId);
+    return user.warehouses.find(
+      (warehouse) => warehouse.warehouseId === warehouseId || warehouse.warehouseCode === warehouseId,
+    );
   }
 
   private toRequestMetadata(request: AuthHttpRequest): AuthRequestMetadata {

@@ -1,7 +1,7 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 
 import { PrismaService } from '../database';
-import { ParcelStatus, Prisma, Warehouse, WarehouseLocationType } from '../generated/prisma/client';
+import { LabelJobStatus, ParcelStatus, Prisma, Warehouse, WarehouseLocationType } from '../generated/prisma/client';
 import {
   AnalyticsOverview,
   AnalyticsWarehouseScope,
@@ -61,11 +61,11 @@ export class AnalyticsService {
         this.getOptionalMetric(warehouse.id, 'labelPrintJob', [
           {
             key: 'queued',
-            statuses: ['QUEUED', 'PRINTING'],
+            statuses: [LabelJobStatus.QUEUED, LabelJobStatus.PRINTING],
           },
           {
             key: 'failed',
-            statuses: ['FAILED', 'ERROR'],
+            statuses: [LabelJobStatus.FAILED],
           },
         ]),
         this.getOptionalMetric(warehouse.id, 'notification', [

@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 
+import { ConflictException } from '@nestjs/common';
 import { createWebhookSignature, stableJsonStringify } from '../common/webhook-signature.helpers';
 import {
   AutomationCommandStatus,
@@ -149,9 +150,9 @@ export function nextAutomationCommandStatus(input: {
     [AutomationCommandStatus.CANCELLED]: {},
   };
 
-  const next = allowed[input.current][input.action];
+  const next = allowed[input.current]?.[input.action];
   if (!next) {
-    throw new Error(`Invalid automation command transition: ${input.current} -> ${input.action}`);
+    throw new ConflictException(`Invalid automation command transition: ${input.current} -> ${input.action}`);
   }
   return next;
 }

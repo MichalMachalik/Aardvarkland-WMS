@@ -9210,7 +9210,7 @@
           },
           {
             "name": "workflow",
-            "required": true,
+            "required": false,
             "in": "query",
             "schema": {
               "type": "string"
@@ -9218,7 +9218,7 @@
           },
           {
             "name": "zone",
-            "required": true,
+            "required": false,
             "in": "query",
             "schema": {
               "type": "string"
@@ -9226,15 +9226,19 @@
           },
           {
             "name": "assignedToMe",
-            "required": true,
+            "required": false,
             "in": "query",
             "schema": {
-              "type": "string"
+              "type": "string",
+              "enum": [
+                "true",
+                "false"
+              ]
             }
           },
           {
             "name": "limit",
-            "required": true,
+            "required": false,
             "in": "query",
             "schema": {
               "type": "string"

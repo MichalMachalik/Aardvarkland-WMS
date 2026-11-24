@@ -164,7 +164,7 @@ export class EnterpriseOpsService {
         `INSERT INTO automation_commands
           (warehouse_id, owner_client_id, device_id, command_type, status, priority, correlation_id, payload, not_before_at)
          VALUES ($1::uuid, $2::uuid, $3::uuid, $4, 'QUEUED', $5, $6, $7::jsonb, $8::timestamptz)
-         ON CONFLICT (correlation_id) WHERE correlation_id IS NOT NULL DO UPDATE SET
+         ON CONFLICT (warehouse_id, correlation_id) DO UPDATE SET
            payload = EXCLUDED.payload,
            priority = GREATEST(automation_commands.priority, EXCLUDED.priority),
            updated_at = now()
