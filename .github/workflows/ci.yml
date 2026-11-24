@@ -69,9 +69,6 @@ jobs:
         run: docker compose down --volumes
 
   backend:
-    env:
-      DATABASE_URL: postgresql://postgres:regression-test-only@127.0.0.1:55432/wms_regressions
-      WMS_TEST_DATABASE_URL: postgresql://postgres:regression-test-only@127.0.0.1:55432/wms_regressions
     services:
       regression-postgres:
         image: postgres:18-alpine
@@ -79,7 +76,7 @@ jobs:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: regression-test-only
           POSTGRES_DB: wms_regressions
-        ports: ['55432:5432']
+        ports: ['5432']
         options: --health-cmd "pg_isready -U postgres -d wms_regressions" --health-interval 5s --health-timeout 5s --health-retries 15
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -90,6 +87,13 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           persist-credentials: false
+      - name: Connect to the PostgreSQL service port
+        env:
+          TEST_DB_PORT: ${{ job.services.regression-postgres.ports[5432] }}
+        run: |
+          test -n "$TEST_DB_PORT"
+          url="postgresql://postgres:regression-test-only@127.0.0.1:$TEST_DB_PORT/wms_regressions"
+          printf 'DATABASE_URL=%s\nWMS_TEST_DATABASE_URL=%s\n' "$url" "$url" >> "$GITHUB_ENV"
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
         with:
           node-version: 24.15.0
