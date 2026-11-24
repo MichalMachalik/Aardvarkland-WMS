@@ -193,6 +193,16 @@ cd ../frontend && npm run typecheck && npm run lint && npm run build && npm test
 cd ../print-agent && npm ci && npm run check
 ```
 
+GitHub Actions navíc spouští aplikaci s testovací PostgreSQL. Testy procházejí obrazovky správce, vedoucího a skladníka na počítači i telefonu. API testy vytvářejí fiktivní objednávky a ověřují příjem, vychystání, balení, expedici i schválení inventurního rozdílu.
+
+Pro opakování použijte samostatnou místní instanci s prázdnou databází, demo uživateli a testovacím dopravcem. Spouštějte z kořene repozitáře po instalaci Playwrightu a Chromia.
+
+```sh
+WMS_E2E_WRITE_URL=http://127.0.0.1:4001/api node --test backend/scripts/warehouse-lifecycle.test.mjs
+cd demo
+WMS_LIVE_UI_URL=http://127.0.0.1:4000/ npm test -- live
+```
+
 Čtečky a tiskárny ověřte na fyzickém hardwaru.
 
 ### Struktura repozitáře

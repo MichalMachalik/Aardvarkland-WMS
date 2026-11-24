@@ -39,7 +39,7 @@ export function DataTable<T>({
         <thead>
           <tr>
             {columns.map((column) => (
-              <th key={column.key} className={column.align ? `align-${column.align}` : undefined}>{column.label}</th>
+              <th key={column.key} scope="col" className={column.align ? `align-${column.align}` : undefined}>{column.label}</th>
             ))}
           </tr>
         </thead>

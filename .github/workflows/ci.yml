@@ -13,6 +13,8 @@ jobs:
   docker-compose:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
+    env:
+      SEED_LOCAL_DEMO_USERS: "true"
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
@@ -40,6 +42,25 @@ jobs:
           curl --fail --silent --head http://127.0.0.1:4001/api/health/ready | grep --ignore-case 'cache-control: no-store, private'
           test "$(docker compose exec -T backend id -u)" != "0"
           test "$(docker compose exec -T frontend id -u)" != "0"
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: 24.15.0
+          cache: npm
+          cache-dependency-path: demo/package-lock.json
+      - name: Verify live API and warehouse lifecycle
+        env:
+          WMS_E2E_WRITE_URL: http://127.0.0.1:4001/api
+        run: |
+          node backend/scripts/live-api-e2e.mjs
+          node --test backend/scripts/warehouse-lifecycle.test.mjs
+      - name: Verify the live workspace for each seeded role
+        working-directory: demo
+        env:
+          WMS_LIVE_UI_URL: http://127.0.0.1:4000/
+        run: |
+          npm ci --ignore-scripts
+          node node_modules/@playwright/test/cli.js install --with-deps chromium
+          node node_modules/@playwright/test/cli.js test live --workers=1 --reporter=line
       - if: failure()
         run: |
           docker compose ps
@@ -78,6 +99,8 @@ jobs:
       - run: npm run verify
       - run: npm run prisma:deploy
       - run: node --test scripts/transaction-regressions.test.mjs
+      - run: node --env-file=.env.example ./node_modules/ts-node/dist/bin.js --project tsconfig.scripts.json --transpile-only scripts/export-openapi.ts
+      - run: node ../scripts/Check-AardvarklandFrontendOpenApiContract.mjs
 
   frontend:
     runs-on: ubuntu-24.04

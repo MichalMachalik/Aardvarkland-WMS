@@ -28,7 +28,7 @@ services:
       DATABASE_URL: postgresql://aardvarkland:${POSTGRES_PASSWORD:-aardvarkland}@postgres:5432/aardvarkland_storage?schema=public
       ADMIN_INITIAL_PASSWORD: ${ADMIN_INITIAL_PASSWORD:-Local-Seed-42!}
       ALLOW_DEMO_SEED: "true"
-      SEED_LOCAL_DEMO_USERS: "false"
+      SEED_LOCAL_DEMO_USERS: ${SEED_LOCAL_DEMO_USERS:-false}
     depends_on:
       postgres:
         condition: service_healthy
