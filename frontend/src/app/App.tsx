@@ -126,7 +126,7 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => void }) {
   return (
     <>
       <Shell route={route} onNavigate={navigate} onLogout={onLogout}>
-        <PwaStatusBanner route={route} />
+        <PwaStatusBanner />
         <RouteRenderer route={route} />
       </Shell>
       <CommandPalette open={commandOpen} onClose={() => setCommandOpen(false)} onNavigate={navigate} />

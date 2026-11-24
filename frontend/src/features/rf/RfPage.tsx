@@ -536,11 +536,10 @@ export function RfPage() {
 
   return (
     <div className="page-grid rf-production-page">
-      <div className="span-12"><DataSourceBanner label={text.banner} resource={queueResource} /></div>
+      {queueResource.status === 'error' && <div className="span-12"><DataSourceBanner label={text.banner} resource={queueResource} /></div>}
 
       <section className="rf-command-header span-12">
         <div>
-          <p className="eyebrow">{text.eyebrow}</p>
           <h1>{text.title}</h1>
         </div>
         <div className="rf-command-actions">
@@ -550,12 +549,12 @@ export function RfPage() {
             <Button size="sm" type="button" tone={rfDisplayMode === 'TERMINAL' ? 'primary' : 'secondary'} onClick={() => { void setRfDisplayMode('TERMINAL'); }} disabled={workContextStatus === 'loading'}>{text.rfModes.TERMINAL}</Button>
           </div>
           <Button data-e2e-action="rf-toggle-offline" disabled={scanPending || offlineQueueError || queueLoadedWarehouse !== warehouseId} onClick={() => setOffline((value) => !value)} tone={offline ? 'primary' : 'secondary'}>{offline ? text.offlineOn : text.goOffline}</Button>
-          <Button data-e2e-action="rf-sync-offline" onClick={syncPending} disabled={scanPending || offlineQueueError || !pending.length || mutation.status === 'running'}>{text.sendQueue} ({pending.length})</Button>
+          {pending.length > 0 && <Button data-e2e-action="rf-sync-offline" onClick={syncPending} disabled={scanPending || offlineQueueError || mutation.status === 'running'}>{text.sendQueue} ({pending.length})</Button>}
         </div>
       </section>
 
-      {offlineQueueError && <p role="alert">${text.error}: ${text.offlineQueue}</p>}
-      <Card title={text.scanner} eyebrow={selectedTask ? `${selectedTask.id} · ${rfWorkflowLabel(selectedTask.workflow, language)}` : text.noTask} className="span-7 scanner-card">
+      {offlineQueueError && <p role="alert" className="span-12">{text.error}: {text.offlineQueue}</p>}
+      <Card title={text.scanner} className="span-7 scanner-card">
         <div className={cx('scanner-terminal', offline && 'is-offline', rfDisplayMode !== 'DESKTOP' && 'is-mobile-mode')}>
           <div className="scanner-terminal__top">
             <Badge tone={offline ? 'warning' : session ? 'good' : 'neutral'}>{offline ? text.offlineQueue : session?.sessionId ?? text.ready}</Badge>
@@ -568,12 +567,6 @@ export function RfPage() {
               <article><span>{text.lastActivity}</span><strong>{formatShortDate(activeScanner.lastActivityAt, language) || text.notSet}</strong></article>
             </div>
           )}
-          <div className="rf-offline-status" aria-live="polite">
-            <article><span>{text.offlineStats.local}</span><strong>{pending.length}</strong></article>
-            <article><span>{text.offlineStats.server}</span><strong>{offlineStatus.queued}</strong></article>
-            <article><span>{text.offlineStats.failed}</span><strong>{offlineStatus.failed}</strong></article>
-            <article><span>{text.offlineStats.syncedToday}</span><strong>{offlineStatus.syncedToday}</strong></article>
-          </div>
           <div className="scanner-device-row">
             <label>{text.scannerDevice}
               <input
@@ -647,20 +640,24 @@ export function RfPage() {
         </div>
       </Card>
 
-      <Card title={text.taskQueue} eyebrow={text.guidedWork} className="span-5">
+      <Card title={text.taskQueue} className="span-5">
         <div className="rf-task-queue">
           {tasksQueue.length ? tasksQueue.slice(0, 8).map((task) => (
-            <button key={task.id} data-e2e-row="rf-task" data-e2e-value={task.id} disabled={scanPending} className={cx('rf-task-row', selectedTask?.id === task.id && 'is-active')} onClick={() => { setSelectedTaskId(task.id); setSession(null); setStepIndex(0); }}>
-              <span><strong>{task.id}</strong><small>{task.fromLocationCode ?? '—'} → {task.toLocationCode ?? '—'}</small></span>
-              <span><StatusPill value={task.status} /><small>{text.priority} {task.priority}</small></span>
+            <button key={task.id} data-e2e-row="rf-task" data-e2e-value={task.id} aria-pressed={selectedTask?.id === task.id} disabled={scanPending} className={cx('rf-task-row', selectedTask?.id === task.id && 'is-active')} onClick={() => { setSelectedTaskId(task.id); setSession(null); setStepIndex(0); }}>
+              <span>
+                <strong>{rfWorkflowLabel(task.workflow, language)}</strong>
+                <small>{task.fromLocationCode ?? '—'} → {task.toLocationCode ?? '—'}</small>
+                <small className="rf-task-row__reference" title={task.id}>{task.id}</small>
+              </span>
+              <span className="rf-task-row__status"><StatusPill value={task.status} /><small>{text.priority} {task.priority}</small></span>
             </button>
           )) : <p>{text.noRfTasks}</p>}
         </div>
       </Card>
 
-      <Card title={text.offlineQueueTitle} eyebrow={text.safeRetry} className="span-6" action={<Badge tone={pending.length || offlineStatus.failed ? 'warning' : 'neutral'}>{pending.length} {text.waiting}</Badge>}>
+      <Card title={text.offlineQueueTitle} className="span-6">
         <div className="offline-queue">
-          <div className="rf-offline-status rf-offline-status--card">
+          <div className="rf-offline-status" aria-live="polite">
             <article><span>{text.offlineStats.local}</span><strong>{pending.length}</strong></article>
             <article><span>{text.offlineStats.server}</span><strong>{offlineStatus.queued}</strong></article>
             <article><span>{text.offlineStats.failed}</span><strong>{offlineStatus.failed}</strong></article>
@@ -703,7 +700,7 @@ const czech = {
   noTask: 'Žádný úkol',
   offlineQueue: 'Offline fronta',
   ready: 'PŘIPRAVENO',
-  expectedScan: 'Očekávaný sken',
+  expectedScan: 'Kód ke skenování',
   scan: 'Sken',
   confirmScan: 'Potvrdit sken',
   fillExpected: 'Vyplnit očekávané',
@@ -755,7 +752,7 @@ const czech = {
   },
   step: { task: 'Úkol', source: 'Zdroj', quantity: 'Množství', target: 'Cíl' },
   stepInstruction: {
-    task: 'Naskenujte čárový kód úkolu.',
+    task: 'Naskenujte kód úkolu.',
     source: 'Potvrďte zdrojovou lokaci.',
     sku: 'Naskenujte SKU nebo EAN.',
     quantity: 'Zadejte množství.',

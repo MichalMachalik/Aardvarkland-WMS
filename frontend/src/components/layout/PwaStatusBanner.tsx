@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
 import { activateWaitingServiceWorker, installPwaListeners, promptPwaInstall, registerWmsServiceWorker, type PwaState } from '../../app/pwa';
-import type { RouteKey } from '../../app/navigation';
 import { Button } from '../ui/Button';
 import { Badge } from '../ui/Badge';
 import { reportFrontendEvent } from '../../core/observability/frontendObservability';
@@ -13,11 +12,11 @@ const initialState: PwaState = {
   installPromptAvailable: false,
 };
 
-export function PwaStatusBanner({ route }: { route: RouteKey }) {
+export function PwaStatusBanner() {
   const { language } = useWorkspace();
   const text = pickLanguage(language, copy);
   const [state, setState] = useState<PwaState>(initialState);
-  const visible = route === '/rf' || state.offline || state.serviceWorker === 'update-available' || state.installPromptAvailable || state.serviceWorker === 'error';
+  const visible = state.offline || state.serviceWorker === 'update-available' || state.installPromptAvailable || state.serviceWorker === 'error';
 
   useEffect(() => {
     const apply = (patch: Partial<PwaState>) => setState((current) => ({ ...current, ...patch }));

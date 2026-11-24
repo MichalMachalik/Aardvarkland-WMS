@@ -5,12 +5,14 @@ import { APP_NAME, APP_TAGLINES } from '../../app/constants';
 import { languageMenuItems, pickLanguage, type Language } from '../../core/i18n/i18n';
 import { FlagIcon } from '../ui/FlagIcon';
 import { ThemeToggle } from '../ui/ThemeToggle';
+import { AccountMenu } from './AccountMenu';
 
 interface TopbarProps {
   route: RouteKey;
+  onLogout: () => void;
 }
 
-export function Topbar({ route }: TopbarProps) {
+export function Topbar({ route, onLogout }: TopbarProps) {
   const { language, setLanguage } = useWorkspace();
   const text = pickLanguage(language, {
     cs: { languageAria: 'Přepnout jazyk' },
@@ -33,6 +35,7 @@ export function Topbar({ route }: TopbarProps) {
       <div className="topbar__actions topbar__actions--workspace">
         <LanguageMenu language={language} setLanguage={setLanguage} ariaLabel={text.languageAria} />
         <ThemeToggle language={language} />
+        <AccountMenu onLogout={onLogout} />
       </div>
     </header>
   );

@@ -1,5 +1,5 @@
 import { pickLanguage } from '../../core/i18n/i18n';
-import { RouteKey } from '../../app/navigation';
+import { getNavigationForMode, RouteKey } from '../../app/navigation';
 import { SystemStatusPanel } from '../../components/ops/SystemStatusPanel';
 import { Badge } from '../../components/ui/Badge';
 import { Card } from '../../components/ui/Card';
@@ -210,25 +210,28 @@ function contentForMode(mode: WorkspaceMode, language: Language): RoleHomeConten
 }
 
 export function DashboardPage() {
-  const { roleProfile, warehouse, workspaceMode, language } = useWorkspace();
+  const { roleProfile, warehouse, workspaceMode, language, can } = useWorkspace();
   const content = contentForMode(workspaceMode, language);
-  const labels = pickLanguage(language, { cs: { context: 'Aktuální kontext', quick: 'Rychlé vstupy', shortest: 'nejkratší cesta', principle: 'Princip rozhraní', clean: 'čistý pohled podle role', system: 'Stav systému' }, en: { context: 'Current context', quick: 'Quick entries', shortest: 'shortest path', principle: 'Interface principle', clean: 'clean role view', system: 'System status' }, ua: { context: 'Поточний контекст', quick: 'Швидкі входи', shortest: 'найкоротший шлях', principle: 'Принцип інтерфейсу', clean: 'чистий вигляд за роллю', system: 'Стан системи' } });
+  const availableRoutes = new Set(getNavigationForMode(workspaceMode).filter(item => can(item.permission)).map(item => item.key));
+  const actions = content.actions.filter(action => availableRoutes.has(action.route));
+  const actionRoutes = new Set(actions.map(action => action.route));
+  const links = content.links.filter(link => availableRoutes.has(link.route) && !actionRoutes.has(link.route));
+  const showSystemStatus = workspaceMode === 'SPRAVCE' || workspaceMode === 'ADMIN';
+  const labels = pickLanguage(language, { cs: { context: 'Aktuální kontext', quick: 'Rychlé vstupy', system: 'Stav systému' }, en: { context: 'Current context', quick: 'Quick entries', system: 'System status' }, ua: { context: 'Поточний контекст', quick: 'Швидкі входи', system: 'Стан системи' } });
 
   return (
     <div className="page-grid role-home">
       <section className="role-home-hero span-12" aria-label={roleProfile.workspaceLabel}>
-        <p className="eyebrow">{roleProfile.workspaceLabel}</p>
-        <h2>{content.title}</h2>
-        <p className="role-home-quote">{content.quote}</p>
+        <h1>{content.title}</h1>
         <div className="role-home-meta" aria-label={labels.context}>
           <span>{warehouse.label}</span>
           <span>{roleProfile.label}</span>
         </div>
       </section>
 
-      <Card title={content.workTitle} className="span-8">
+      <Card title={content.workTitle} className={links.length || showSystemStatus ? 'span-8' : 'span-12'}>
         <div className="role-action-list">
-          {content.actions.map((action) => (
+          {actions.map((action) => (
             <a href={`#${action.route}`} className="role-action" key={action.title}>
               <Badge tone="neutral" compact>{action.badge}</Badge>
               <span>
@@ -240,19 +243,19 @@ export function DashboardPage() {
         </div>
       </Card>
 
-      <Card title={labels.quick} className="span-4">
+      {links.length > 0 && <Card title={labels.quick} className="span-4">
         <div className="role-link-grid">
-          {content.links.map((link) => (
+          {links.map((link) => (
             <a href={`#${link.route}`} key={link.label}>
               <strong>{link.label}</strong>
               <small>{link.detail}</small>
             </a>
           ))}
         </div>
-      </Card>
+      </Card>}
 
-      {(workspaceMode === 'SPRAVCE' || workspaceMode === 'ADMIN') && (
-        <Card title={labels.system} className="span-12">
+      {showSystemStatus && (
+        <Card title={labels.system} className={links.length ? 'span-12' : 'span-4'}>
           <SystemStatusPanel />
         </Card>
       )}

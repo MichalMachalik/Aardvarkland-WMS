@@ -13,9 +13,9 @@ interface ShellProps {
 export function Shell({ route, onNavigate, onLogout, children }: PropsWithChildren<ShellProps>) {
   return (
     <div className="shell">
-      <Sidebar route={route} onNavigate={onNavigate} onLogout={onLogout} />
+      <Sidebar route={route} onNavigate={onNavigate} />
       <main className="main">
-        <Topbar route={route} />
+        <Topbar route={route} onLogout={onLogout} />
         <div className="content">
           {children}
         </div>

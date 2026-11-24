@@ -84,8 +84,8 @@ export const navigationSectionsByMode: Record<WorkspaceMode, NavigationSection[]
     { label: 'PODPORA', routes: ['/inventory', '/locations', '/print-stations'] },
   ],
   ADMIN: [
-    { label: 'PROVOZ', routes: ['/overview', '/control-tower', '/outbound', '/tasks'] },
-    { label: 'SKLAD', routes: ['/products', '/locations', '/inbound', '/inventory', '/cycle-counts', '/quality', '/packing', '/carriers'] },
+    { label: 'PROVOZ', routes: ['/overview', '/control-tower', '/outbound', '/tasks', '/waves'] },
+    { label: 'SKLAD', routes: ['/products', '/locations', '/inbound', '/inventory', '/cycle-counts', '/quality', '/rf', '/packing', '/carriers'] },
     { label: 'PODPORA', routes: ['/print-stations', '/integrations'] },
   ],
   SPRAVCE: [

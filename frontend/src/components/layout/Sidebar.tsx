@@ -1,16 +1,14 @@
 import { pickLanguage } from '../../core/i18n/i18n';
 import { getNavigationForMode, getNavigationSections, RouteKey } from '../../app/navigation';
-import { AccountMenu } from './AccountMenu';
 import { cx } from '../../core/utils/format';
 import { useWorkspace } from '../../core/workspace/workspace';
 
 interface SidebarProps {
   route: RouteKey;
   onNavigate: (route: RouteKey) => void;
-  onLogout: () => void;
 }
 
-export function Sidebar({ route, onNavigate, onLogout }: SidebarProps) {
+export function Sidebar({ route, onNavigate }: SidebarProps) {
   const { can, language, workspaceMode } = useWorkspace();
   const visibleItems = getNavigationForMode(workspaceMode, language).filter((item) => can(item.permission));
   const visibleByKey = new Map(visibleItems.map((item) => [item.key, item]));
@@ -18,9 +16,6 @@ export function Sidebar({ route, onNavigate, onLogout }: SidebarProps) {
 
   return (
     <aside className="sidebar">
-      <div className="sidebar__account">
-        <AccountMenu onLogout={onLogout} />
-      </div>
 
       <nav className="nav" aria-label={pickLanguage(language, { cs: 'Hlavní navigace', en: 'Main navigation', ua: 'Головна навігація' })}>
         {sections.map((section) => {
@@ -41,7 +36,6 @@ export function Sidebar({ route, onNavigate, onLogout }: SidebarProps) {
                   <span className="nav__icon" aria-hidden="true"><SidebarNavIcon route={item.key} fallback={item.icon} /></span>
                   <span className="nav__copy">
                     <strong>{item.label}</strong>
-                    <small>{item.eyebrow}</small>
                   </span>
                 </button>
               ))}
