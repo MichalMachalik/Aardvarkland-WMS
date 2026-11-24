@@ -74,7 +74,9 @@ export class CycleCountsService {
     const warehouse = await this.resolveWarehouse(warehouseReference);
 
     return this.transaction(async (tx: CycleCountTransactionClient) => {
-      const plan = await this.resolvePlanWithClient(tx, warehouse.id, planReference);
+      const candidate = await this.resolvePlanWithClient(tx, warehouse.id, planReference);
+      await lockPostgresRowById(tx, 'cycle_count_plans', candidate.id);
+      const plan = await this.resolvePlanWithClient(tx, warehouse.id, candidate.id);
 
       if (plan.status !== CycleCountPlanStatus.DRAFT) {
         throw new ConflictException('Cycle count plan must be DRAFT before release');
@@ -274,7 +276,9 @@ export class CycleCountsService {
     const warehouse = await this.resolveWarehouse(warehouseReference);
 
     return this.transaction(async (tx: CycleCountTransactionClient) => {
-      const countTask = await this.resolveCountTaskWithClient(tx, warehouse.id, taskReference);
+      const candidate = await this.resolveCountTaskWithClient(tx, warehouse.id, taskReference);
+      await lockPostgresRowById(tx, 'cycle_count_plans', candidate.planId);
+      const countTask = await this.resolveCountTaskWithClient(tx, warehouse.id, candidate.id);
 
       if (countTask.status !== CycleCountTaskStatus.SUBMITTED) {
         throw new ConflictException('Cycle count task must be SUBMITTED before approval');
@@ -471,7 +475,7 @@ export class CycleCountsService {
     const plan = await tx.cycleCountPlan.findFirst({
       where: {
         warehouseId,
-        OR: [{ id: reference }, { code: normalizeCode(reference) }],
+        ...(isUuid(reference) ? { OR: [{ id: reference }, { code: normalizeCode(reference) }] } : { code: normalizeCode(reference) }),
       },
     });
 
@@ -487,6 +491,7 @@ export class CycleCountsService {
     warehouseId: string,
     reference: string,
   ): Promise<CycleCountTaskRecord> {
+    if (!isUuid(reference)) throw new NotFoundException('Cycle count task was not found');
     const task = await tx.cycleCountTask.findFirst({
       where: {
         warehouseId,
@@ -510,7 +515,7 @@ export class CycleCountsService {
       where: {
         warehouseId,
         OR: [
-          { id: reference },
+          ...(isUuid(reference) ? [{ id: reference }] : []),
           { code: normalizeCode(reference) },
           { barcode: normalizeCode(reference) },
         ],
@@ -530,7 +535,11 @@ export class CycleCountsService {
   ): Promise<SkuRecord> {
     const sku = await tx.sku.findFirst({
       where: {
-        OR: [{ id: reference }, { code: normalizeCode(reference) }, { barcode: reference.trim() }],
+        OR: [
+          ...(isUuid(reference) ? [{ id: reference }] : []),
+          { code: normalizeCode(reference) },
+          { barcode: reference.trim() },
+        ],
       },
     });
 

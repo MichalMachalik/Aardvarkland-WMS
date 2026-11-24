@@ -37,11 +37,15 @@ export function buildActiveStockFreezeWhere(input: StockFreezeCheckInput): Recor
   ];
 
   if (input.stockQuantId) {
-    scopedMatches.push({ stockQuantId: input.stockQuantId, locationId: null, skuId: null });
+    scopedMatches.push({ stockQuantId: input.stockQuantId });
   }
 
   if (input.locationId && input.skuId) {
-    scopedMatches.push({ stockQuantId: null, locationId: input.locationId, skuId: input.skuId });
+    scopedMatches.push({
+      ...(input.stockQuantId ? { stockQuantId: null } : {}),
+      locationId: input.locationId,
+      skuId: input.skuId,
+    });
   }
 
   if (input.locationId) {

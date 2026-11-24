@@ -7,7 +7,7 @@ import { hasSession } from '../core/auth/session';
 import { connectWarehouseRealtime, WMS_REALTIME_EVENT } from '../core/api/realtime';
 import { reportFrontendEvent, setFrontendObservabilityContext } from '../core/observability/frontendObservability';
 import { LoginPage } from '../features/auth/LoginPage';
-import { getNavigationForMode, RouteKey, navigation } from './navigation';
+import { getNavigationForMode, RouteKey } from './navigation';
 import { useHashRoute } from './useHashRoute';
 import { WorkspaceProvider, useWorkspace } from '../core/workspace/workspace';
 
@@ -83,19 +83,19 @@ export function App() {
 }
 
 function AuthenticatedApp({ onLogout }: { onLogout: () => void }) {
-  const { route, setRoute } = useHashRoute();
+  const { route: requestedRoute, setRoute } = useHashRoute();
   const [commandOpen, setCommandOpen] = useState(false);
   const { can, language, roleProfile, warehouseId, workspaceMode } = useWorkspace();
+  const routeAllowed = getNavigationForMode(workspaceMode).some((item) => item.key === requestedRoute && can(item.permission));
+  const route = routeAllowed ? requestedRoute : roleProfile.homeRoute;
   const navigate = useCallback((nextRoute: RouteKey) => {
     void routePreloaders[nextRoute]?.();
     setRoute(nextRoute);
   }, [setRoute]);
 
   useEffect(() => {
-    const active = navigation.find((item) => item.key === route);
-    const routeAllowedInMode = getNavigationForMode(workspaceMode).some((item) => item.key === route);
-    if (active && (!can(active.permission) || !routeAllowedInMode)) navigate(roleProfile.homeRoute);
-  }, [route, can, navigate, roleProfile.homeRoute, workspaceMode]);
+    if (requestedRoute !== route) navigate(route);
+  }, [requestedRoute, route, navigate]);
 
   useEffect(() => {
     setFrontendObservabilityContext({ route, language, roleId: roleProfile.id });

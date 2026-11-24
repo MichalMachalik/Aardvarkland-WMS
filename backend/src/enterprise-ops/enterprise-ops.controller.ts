@@ -1,6 +1,7 @@
-import { Body, Controller, Get, Param, Patch, Post, Query } from '@nestjs/common';
+import { Body, Controller, ForbiddenException, Get, NestInterceptor, Param, Patch, Post, Query, UseInterceptors } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 
+import { AuthenticatedRequest } from '../access-control/authenticated-request';
 import { CurrentUser } from '../access-control/decorators/current-user.decorator';
 import { RequireWarehousePermissions } from '../access-control/decorators/require-warehouse-permissions.decorator';
 import { AuthenticatedUser } from '../access-control/types';
@@ -23,8 +24,23 @@ import {
 } from './dto/enterprise-ops.dto';
 import { EnterpriseOpsService } from './enterprise-ops.service';
 
+const resolveWarehouseId: NestInterceptor = {
+  intercept(context, next) {
+    const request = context.switchToHttp().getRequest<AuthenticatedRequest>();
+    const params = request.params;
+    const reference = params?.['warehouseId'];
+    const access = request.user?.warehouses.find(
+      warehouse => warehouse.warehouseId === reference || warehouse.warehouseCode === reference,
+    );
+    if (!params || !access) throw new ForbiddenException('Missing required warehouse permission');
+    params['warehouseId'] = access.warehouseId;
+    return next.handle();
+  },
+};
+
 @ApiTags('enterprise-ops')
 @ApiBearerAuth()
+@UseInterceptors(resolveWarehouseId)
 @Controller('warehouses/:warehouseId/enterprise-ops')
 export class EnterpriseOpsController {
   constructor(private readonly enterpriseOpsService: EnterpriseOpsService) {}

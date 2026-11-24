@@ -1,10 +1,9 @@
 import { pickLanguage } from '../../core/i18n/i18n';
-import { FormEvent, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { Badge } from '../../components/ui/Badge';
 import { Button } from '../../components/ui/Button';
 import { Card } from '../../components/ui/Card';
 import { Column, DataTable } from '../../components/ui/DataTable';
-import { ProgressBar } from '../../components/ui/ProgressBar';
 import { StatusPill } from '../../components/ui/StatusPill';
 import { DataSourceBanner } from '../../components/ops/DataSourceBanner';
 import { ActionStatus } from '../../components/ops/ActionStatus';
@@ -19,7 +18,7 @@ import { numberFormat } from '../../core/utils/format';
 const emptyStockQuants: StockQuant[] = [];
 
 export function InventoryPage() {
-  const { warehouseId, warehouse, clientScope, language } = useWorkspace();
+  const { warehouseId, warehouse, language, can } = useWorkspace();
   const text = pickLanguage(language, { cs: czech, en: english, ua: ukrainian });
   const resource = useApiResource({ fallback: emptyStockQuants, productionFallback: emptyStockQuants, loader: () => listStockQuants<unknown[]>(warehouseId), map: mapStockQuants, dependencies: [warehouseId] });
   const mutation = useApiMutation();
@@ -28,6 +27,8 @@ export function InventoryPage() {
   const [selectedId, setSelectedId] = useState(sourceRows[0]?.id ?? '');
   const [quantity, setQuantity] = useState('1');
   const [targetLocation, setTargetLocation] = useState('');
+  const canMove = can('inventory.move');
+  const canAdjust = can('inventory.adjust');
 
   const rows = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -51,19 +52,21 @@ export function InventoryPage() {
   const totalAvailable = sourceRows.reduce((sum, quant) => sum + quant.available, 0);
   const reserved = sourceRows.reduce((sum, quant) => sum + quant.reserved, 0);
   const blocked = sourceRows.filter((row) => row.status === 'Blocked' || row.status === 'Quarantine').length;
-  const utilization = totalAvailable + reserved > 0 ? Math.round((reserved / (totalAvailable + reserved)) * 100) : 0;
-  const parsedQuantity = Math.max(1, Number.parseInt(quantity, 10) || 1);
+  const parsedQuantity = Number(quantity);
+  const validQuantity = Number.isSafeInteger(parsedQuantity) && parsedQuantity >= 1 && parsedQuantity <= 2147483647;
   const normalizedTargetLocation = targetLocation.trim();
   const targetIsCurrentLocation = Boolean(selected && normalizedTargetLocation && normalizedTargetLocation.toLowerCase() === selected.location.toLowerCase());
+  const tooManyToMove = Boolean(selected && validQuantity && parsedQuantity > selected.available);
+  const moveHint = targetIsCurrentLocation ? text.sameLocationHint : normalizedTargetLocation && tooManyToMove ? text.overAvailableHint : '';
+  const canSubmit = Boolean(selected && validQuantity && mutation.status !== 'running');
 
   const afterMutation = async (label: string, action: () => Promise<unknown>) => {
     const result = await mutation.run(label, action);
     if (result) resource.refresh();
   };
 
-  const receive = (event: FormEvent) => {
-    event.preventDefault();
-    if (!selected) return;
+  const receive = () => {
+    if (!selected || !canMove || !canSubmit) return;
     void afterMutation(text.actions.receive, () => receiveInventoryStock(warehouseId, {
       skuReference: selected.sku,
       locationReference: selected.location,
@@ -76,11 +79,11 @@ export function InventoryPage() {
   };
 
   const move = () => {
-    if (!selected || !normalizedTargetLocation || targetIsCurrentLocation) return;
+    if (!selected || !canMove || !canSubmit || !normalizedTargetLocation || moveHint) return;
     void afterMutation(text.actions.move, () => moveInventoryStock(warehouseId, {
       quantReference: selected.id,
       toLocationReference: normalizedTargetLocation,
-      quantity: Math.min(parsedQuantity, Math.max(1, selected.available)),
+      quantity: parsedQuantity,
       status: 'AVAILABLE',
       reason: text.reasons.move,
       idempotencyKey: createWmsIdempotencyKey('storage-move'),
@@ -89,7 +92,7 @@ export function InventoryPage() {
   };
 
   const adjust = () => {
-    if (!selected) return;
+    if (!selected || !canAdjust || !canSubmit) return;
     void afterMutation(text.actions.adjust, () => adjustInventoryStock(warehouseId, {
       quantReference: selected.id,
       quantityDelta: parsedQuantity,
@@ -105,54 +108,50 @@ export function InventoryPage() {
     <div className="page-grid page-grid--tight inventory-minimal-page">
       <section className="wms-page-intro span-12">
         <div>
-          <p className="eyebrow">{text.eyebrow}</p>
-          <h2>{text.title}</h2>
-          <span>{warehouse.label} · {clientScope}</span>
+          <h1>{text.title}</h1>
+          <span>{warehouse.label}</span>
         </div>
         <div className="wms-page-intro__actions">
-          <Badge tone={blocked > 0 ? 'warning' : 'good'}>{blocked} {text.blocked}</Badge>
+          {blocked > 0 && <Badge tone="warning">{text.blocked} {numberFormat(blocked)}</Badge>}
         </div>
       </section>
 
-      <div className="span-12"><DataSourceBanner label={text.banner} resource={resource} /></div>
+      {resource.status === 'error' && <div className="span-12"><DataSourceBanner label={text.banner} resource={resource} /></div>}
 
       <Card
         title={text.tableTitle}
-        eyebrow={text.tableEyebrow}
         className="span-8"
         action={<input className="search-input" type="search" data-testid="inventory-search" aria-label={text.searchPlaceholder} placeholder={text.searchPlaceholder} value={query} onChange={(event) => setQuery(event.target.value)} />}
       >
-        <DataTable rows={rows} columns={columns} getRowKey={(row) => row.id} emptyTitle={text.emptyTitle} emptyText={text.emptyText} />
+        <dl className="inventory-summary">
+          <div><dt>{text.columns.available}</dt><dd>{numberFormat(totalAvailable)}</dd></div>
+          <div><dt>{text.columns.reserved}</dt><dd>{numberFormat(reserved)}</dd></div>
+        </dl>
+        <DataTable rows={rows} columns={columns} getRowKey={(row) => row.id}
+          emptyTitle={query.trim() ? text.noResults : text.emptyTitle}
+          emptyText={query.trim() ? text.changeSearch : text.emptyText} />
       </Card>
 
-      <Card title={text.detailTitle} eyebrow={text.detailEyebrow} className="span-4 detail-card">
+      <Card title={text.detailTitle} className="span-4 detail-card">
         <div className="stock-detail">
           <div className="stock-detail__header">
             <div>
-              <span>{text.currentSelection}</span>
-              <strong>{selected?.sku ?? '-'}</strong>
-              <small>{selected?.product ?? text.noSelection}</small>
+              {selected ? <><strong>{selected.sku}</strong><small>{selected.product} · {selected.location}</small></> : <span>{text.noSelection}</span>}
             </div>
             {selected && <StatusPill value={selected.status} />}
           </div>
 
-          <div className="metric-stack metric-stack--compact">
-            <article><span>{text.metrics.available}</span><strong>{numberFormat(totalAvailable)}</strong></article>
-            <article><span>{text.metrics.reserved}</span><strong>{numberFormat(reserved)}</strong></article>
-            <article><span>{text.metrics.reservationLoad}</span><strong>{utilization}%</strong><ProgressBar value={utilization} /></article>
-          </div>
-
-          <form className="action-panel" onSubmit={receive}>
-            <label>{text.fields.quantity}<input data-testid="inventory-quantity" type="number" min="1" value={quantity} onChange={(event) => setQuantity(event.target.value)} /></label>
-            <label>{text.fields.targetLocation}<input data-testid="inventory-target-location" value={targetLocation} onChange={(event) => setTargetLocation(event.target.value)} placeholder={text.fields.targetPlaceholder} /></label>
-            {targetIsCurrentLocation && <p className="form-hint">{text.sameLocationHint}</p>}
-            <Button tone="primary" type="submit" data-e2e-action="inventory-receive" disabled={!selected || mutation.status === 'running'}>{text.buttons.receive}</Button>
+          {selected && (canMove || canAdjust) && <form className="action-panel" aria-label={text.detailTitle} onSubmit={(event) => event.preventDefault()}>
+            <label>{text.fields.quantity}<input data-testid="inventory-quantity" type="number" min="1" max="2147483647" step="1" required value={quantity} onChange={(event) => setQuantity(event.target.value)} /></label>
+            {canMove && <label>{text.fields.targetLocation}<input data-testid="inventory-target-location" value={targetLocation} onChange={(event) => setTargetLocation(event.target.value)} placeholder={text.fields.targetPlaceholder} aria-describedby={moveHint ? 'inventory-move-hint' : undefined} /></label>}
+            {moveHint && <p id="inventory-move-hint" className="form-hint">{moveHint}</p>}
             <div className="button-row">
-              <Button type="button" tone="secondary" data-e2e-action="inventory-move" disabled={!selected || !normalizedTargetLocation || targetIsCurrentLocation || mutation.status === 'running'} onClick={move}>{text.buttons.move}</Button>
-              <Button type="button" tone="secondary" data-e2e-action="inventory-adjust" disabled={!selected || mutation.status === 'running'} onClick={adjust}>{text.buttons.adjust}</Button>
+              {canMove && <Button type="button" tone="primary" data-e2e-action="inventory-move" disabled={!canSubmit || !normalizedTargetLocation || Boolean(moveHint)} onClick={move}>{text.buttons.move}</Button>}
+              {canMove && <Button type="button" tone="secondary" data-e2e-action="inventory-receive" disabled={!canSubmit} onClick={receive}>{text.buttons.receive}</Button>}
+              {canAdjust && <Button type="button" tone="secondary" data-e2e-action="inventory-adjust" disabled={!canSubmit} onClick={adjust}>{text.buttons.adjust}</Button>}
             </div>
             <ActionStatus mutation={mutation} />
-          </form>
+          </form>}
         </div>
       </Card>
 
@@ -161,69 +160,63 @@ export function InventoryPage() {
 }
 
 const czech = {
-  eyebrow: 'zásoby',
   title: 'Zásoby',
-  blocked: 'blokací',
+  blocked: 'Blokované položky',
   banner: 'API zásob',
   tableTitle: 'Položky',
-  tableEyebrow: 'živé zásoby',
   searchPlaceholder: 'Hledat SKU, lokaci nebo šarži...',
   detailTitle: 'Vybraná položka',
-  detailEyebrow: 'příjem · přesun · úprava',
-  currentSelection: 'Aktuální výběr',
   noSelection: 'Není vybraná žádná zásoba',
   emptyTitle: 'Žádné zásoby',
   emptyText: 'Server zatím nevrátil žádné zásoby.',
+  noResults: 'Žádné výsledky',
+  changeSearch: 'Zkuste jiné SKU, lokaci nebo šarži.',
   columns: { location: 'Lokace', lot: 'Šarže', available: 'Dostupné', reserved: 'Rezervované', status: 'Stav', owner: 'Vlastník' },
-  metrics: { available: 'Dostupné', reserved: 'Rezervované', reservationLoad: 'Zatížení rezervací' },
   fields: { quantity: 'Množství', targetLocation: 'Cílová lokace', targetPlaceholder: 'Např. A-01-01' },
   sameLocationHint: 'Zadejte jinou cílovou lokaci.',
+  overAvailableHint: 'Zadejte množství, které je v této lokaci dostupné.',
   buttons: { receive: 'Přijmout zásobu', move: 'Přesunout', adjust: 'Upravit +ks' },
   actions: { receive: 'Přijmout zásobu', move: 'Přesunout zásobu', adjust: 'Upravit zásobu' },
   reasons: { move: 'Přesun zásoby z jednoduchého UI', adjust: 'Ruční korekce z jednoduchého UI' },
 };
 
 const english = {
-  eyebrow: 'inventory',
   title: 'Inventory',
-  blocked: 'blocked',
+  blocked: 'Blocked items',
   banner: 'Inventory API',
   tableTitle: 'Items',
-  tableEyebrow: 'live stock',
   searchPlaceholder: 'Search SKU, location, or lot...',
   detailTitle: 'Selected item',
-  detailEyebrow: 'receive · move · adjust',
-  currentSelection: 'Current selection',
   noSelection: 'No stock is selected',
   emptyTitle: 'No inventory',
   emptyText: 'The server has not returned any inventory yet.',
+  noResults: 'No results',
+  changeSearch: 'Try a different SKU, location, or lot.',
   columns: { location: 'Location', lot: 'Lot', available: 'Available', reserved: 'Reserved', status: 'Status', owner: 'Owner' },
-  metrics: { available: 'Available', reserved: 'Reserved', reservationLoad: 'Reservation load' },
   fields: { quantity: 'Quantity', targetLocation: 'Target location', targetPlaceholder: 'For example A-01-01' },
   sameLocationHint: 'Enter a different target location.',
+  overAvailableHint: 'Enter a quantity available at this location.',
   buttons: { receive: 'Receive stock', move: 'Move', adjust: 'Adjust +pcs' },
   actions: { receive: 'Receive stock', move: 'Move stock', adjust: 'Adjust stock' },
   reasons: { move: 'Stock movement from the simple UI', adjust: 'Manual correction from the simple UI' },
 };
 
 const ukrainian = {
-  eyebrow: 'запаси',
   title: 'Запаси',
-  blocked: 'блокувань',
+  blocked: 'Заблоковані позиції',
   banner: 'API запасів',
   tableTitle: 'Позиції',
-  tableEyebrow: 'живі запаси',
   searchPlaceholder: 'Шукати SKU, локацію або партію...',
   detailTitle: 'Вибрана позиція',
-  detailEyebrow: 'приймання · переміщення · корекція',
-  currentSelection: 'Поточний вибір',
   noSelection: 'Не вибрано жодного запасу',
   emptyTitle: 'Немає запасів',
   emptyText: 'Сервер поки не повернув жодних запасів.',
+  noResults: 'Немає результатів',
+  changeSearch: 'Спробуйте інший SKU, локацію або партію.',
   columns: { location: 'Локація', lot: 'Партія', available: 'Доступно', reserved: 'Резерв', status: 'Стан', owner: 'Власник' },
-  metrics: { available: 'Доступно', reserved: 'Зарезервовано', reservationLoad: 'Навантаження резервів' },
   fields: { quantity: 'Кількість', targetLocation: 'Цільова локація', targetPlaceholder: 'Напр. A-01-01' },
   sameLocationHint: 'Введіть іншу цільову локацію.',
+  overAvailableHint: 'Введіть кількість, доступну в цій локації.',
   buttons: { receive: 'Прийняти запас', move: 'Перемістити', adjust: 'Корекція +шт' },
   actions: { receive: 'Прийняти запас', move: 'Перемістити запас', adjust: 'Коригувати запас' },
   reasons: { move: 'Переміщення запасу з простого UI', adjust: 'Ручна корекція з простого UI' },

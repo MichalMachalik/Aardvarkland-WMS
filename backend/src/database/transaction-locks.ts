@@ -9,6 +9,7 @@ const SAFE_TABLE_NAMES = new Set([
   'reservations',
   'outbound_orders',
   'warehouse_tasks',
+  'cycle_count_plans',
 ]);
 const SAFE_ADVISORY_LOCK_NAMESPACES = new Set([
   'stock_quant_identity',
