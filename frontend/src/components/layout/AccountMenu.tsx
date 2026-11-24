@@ -1,5 +1,6 @@
 import { FormEvent, useEffect, useMemo, useState } from 'react';
 import { toSVG } from 'bwip-js/generic';
+import { config } from '../../app/config';
 import { svgPreviewDataUri } from '../../core/scanning/svgPreview';
 import { changePassword, disableMfa, getMfaStatus, logout, startMfaSetup, verifyMfaSetup, type MfaSetupResponse, type MfaStatusResponse } from '../../core/api/auth';
 import { useWorkspace } from '../../core/workspace/workspace';
@@ -251,14 +252,16 @@ export function AccountMenu({ onLogout }: AccountMenuProps) {
               <button className="account-panel__action" type="button" onClick={openPasswordForm}>
                 {text.changePassword}
               </button>
-              <div className="account-mfa-entry">
-                <button className="account-panel__action account-panel__action--label" type="button" onClick={openMfaMenu}>
-                  {text.mfaLongName}
-                </button>
-                <button className="account-panel__action account-panel__action--primary" type="button" onClick={openMfaMenu} disabled={mfaLoading}>
-                  {text.verify}
-                </button>
-              </div>
+              {config.showMfaSettings && (
+                <div className="account-mfa-entry">
+                  <button className="account-panel__action account-panel__action--label" type="button" onClick={openMfaMenu}>
+                    {text.mfaLongName}
+                  </button>
+                  <button className="account-panel__action account-panel__action--primary" type="button" onClick={openMfaMenu} disabled={mfaLoading}>
+                    {text.verify}
+                  </button>
+                </div>
+              )}
             </>
           )}
 

@@ -44,3 +44,37 @@ test('real product MFA field fits mobile and accepts a verified MFA session',asy
   await page.locator('.login-form button[type="submit"]').click();
   await expect(page.locator('.shell')).toBeVisible();
 });
+
+test('an account awaiting MFA setup can sign in to try WMS with a password', async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem('aardvarkland-ui-language', 'en'));
+  await page.route('**/config.js', route => route.fulfill({
+    contentType: 'text/javascript',
+    body: 'window.__AARDVARKLAND_STORAGE_SYSTEM_CONFIG__ = { apiBaseUrl: "/api", showMfaSettings: false };',
+  }));
+  await page.route(requestUrl => requestUrl.pathname.startsWith('/api/'), route => {
+    if (new URL(route.request().url()).pathname === '/api/auth/login') {
+      return route.fulfill({
+        status: 201,
+        json: {
+          accessToken: 'enrollment-fixture',
+          mfaRequired: true,
+          mfaSatisfied: false,
+          mfaEnrollmentRequired: true,
+        },
+      });
+    }
+    return route.fulfill({ status: 503, json: { message: 'Unavailable in this test' } });
+  });
+
+  await page.goto(url);
+  await page.locator('input[autocomplete="username"]').fill('warehouse.admin');
+  await page.locator('input[autocomplete="current-password"]').fill('Demo-test-only-42!');
+  await page.locator('.login-form button[type="submit"]').click();
+
+  await expect(page.locator('.shell')).toBeVisible();
+  await expect(page.locator('input[autocomplete="one-time-code"]')).toHaveCount(0);
+  const account = page.locator('.account-menu');
+  await account.getByRole('button', { name: 'Settings', exact: true }).click();
+  await expect(account.getByRole('button', { name: 'Change password', exact: true })).toBeVisible();
+  await expect(account.getByRole('button', { name: 'Multi-factor authentication (MFA)', exact: true })).toHaveCount(0);
+});

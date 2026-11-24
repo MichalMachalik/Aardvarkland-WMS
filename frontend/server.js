@@ -48,10 +48,11 @@ function write(req, res, status, headers, body) {
 function runtimeConfig() {
   const enableMocks = String(process.env.VITE_ENABLE_MOCKS || process.env.ENABLE_MOCKS || 'false').toLowerCase() === 'true';
   const enableDemoMode = String(process.env.VITE_ENABLE_DEMO_MODE || process.env.ENABLE_DEMO_MODE || 'false').toLowerCase() === 'true';
+  const showMfaSettings = process.env.NODE_ENV !== 'development' && !enableDemoMode && !enableMocks;
   const defaultWarehouseId = process.env.VITE_DEFAULT_WAREHOUSE_ID || process.env.DEFAULT_WAREHOUSE_ID || 'MAIN';
   const candidateTimeout = Number(process.env.VITE_API_REQUEST_TIMEOUT_MS || process.env.API_REQUEST_TIMEOUT_MS || '12000');
   const apiRequestTimeoutMs = Number.isFinite(candidateTimeout) && candidateTimeout >= 1000 && candidateTimeout <= 60000 ? candidateTimeout : 12000;
-  return `window.__AARDVARKLAND_STORAGE_SYSTEM_CONFIG__ = ${JSON.stringify({ apiBaseUrl, apiRequestTimeoutMs, enableMocks, enableDemoMode, defaultWarehouseId })};\n`;
+  return `window.__AARDVARKLAND_STORAGE_SYSTEM_CONFIG__ = ${JSON.stringify({ apiBaseUrl, apiRequestTimeoutMs, enableMocks, enableDemoMode, showMfaSettings, defaultWarehouseId })};\n`;
 }
 function proxyApi(req, res, url) {
   const target = new URL(backendOrigin.origin);

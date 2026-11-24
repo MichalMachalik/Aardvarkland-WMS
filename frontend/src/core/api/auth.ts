@@ -71,7 +71,10 @@ export async function login(input: LoginInput) {
     method: 'POST',
     body: input,
   });
-  if (result?.requiresMfa || (result?.mfaRequired && result.mfaSatisfied !== true)) {
+  // Enrollment uses the session issued by the server. A code challenge is a separate step.
+  const needsCode = result?.requiresMfa ||
+    (result?.mfaRequired && result.mfaSatisfied !== true && result.mfaEnrollmentRequired !== true);
+  if (needsCode) {
     throw new ApiError('MFA code is required.', 401, { error: { code: 'MFA_CODE_REQUIRED' } });
   }
   if (!result || typeof result.accessToken !== 'string' || !result.accessToken.trim()) {

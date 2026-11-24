@@ -2,6 +2,7 @@ interface RuntimeConfig {
   apiBaseUrl: string;
   apiRequestTimeoutMs: number | string;
   enableMocks: boolean | string;
+  showMfaSettings: boolean | string;
   defaultWarehouseId: string;
   appVersion?: string;
   releaseSha?: string;
@@ -32,13 +33,15 @@ function normalizeApiBaseUrl(value: string): string {
 
 const runtime = typeof window !== 'undefined' ? window.__AARDVARKLAND_STORAGE_SYSTEM_CONFIG__ ?? {} : {};
 const viteEnableMocks = String(import.meta.env.VITE_ENABLE_MOCKS ?? 'false').toLowerCase() === 'true';
+const enableMocks = readBoolean(runtime.enableMocks, viteEnableMocks);
 const defaultApiBaseUrl = runtime.apiBaseUrl ?? import.meta.env.VITE_API_BASE_URL ?? '/api';
 const defaultTimeoutMs = Number.parseInt(String(import.meta.env.VITE_API_REQUEST_TIMEOUT_MS ?? '12000'), 10);
 
 export const config = {
   apiBaseUrl: normalizeApiBaseUrl(defaultApiBaseUrl),
   apiRequestTimeoutMs: readPositiveInt(runtime.apiRequestTimeoutMs, Number.isFinite(defaultTimeoutMs) ? defaultTimeoutMs : 12_000),
-  enableMocks: readBoolean(runtime.enableMocks, viteEnableMocks),
+  enableMocks,
+  showMfaSettings: !enableMocks && readBoolean(runtime.showMfaSettings, !import.meta.env.DEV),
   defaultWarehouseId: runtime.defaultWarehouseId ?? import.meta.env.VITE_DEFAULT_WAREHOUSE_ID ?? 'MAIN',
   appVersion: runtime.appVersion ?? import.meta.env.VITE_APP_VERSION ?? 'local',
   releaseSha: runtime.releaseSha ?? import.meta.env.VITE_RELEASE_SHA ?? '',
