@@ -17,13 +17,13 @@ test('warehouse workflows on a disposable database', {
   const sku = 'ABC-123';
   let token;
 
-  async function request(path, body, expectedStatus) {
+  async function request(path, body, expectedStatus, idempotencyKey = randomUUID()) {
     const method = body === undefined ? 'GET' : 'POST';
     const response = await fetch(root + path, {
       method,
       headers: {
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        ...(body === undefined ? {} : { 'Content-Type': 'application/json', 'Idempotency-Key': randomUUID() }),
+        ...(body === undefined ? {} : { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey }),
       },
       body: body === undefined ? undefined : JSON.stringify(body),
       redirect: 'error',
@@ -35,7 +35,7 @@ test('warehouse workflows on a disposable database', {
     else assert.equal(response.status, expectedStatus, message);
     return payload.data ?? payload;
   }
-  const own = (path, body, expectedStatus) => request(warehouse + path, body, expectedStatus);
+  const own = (path, body, expectedStatus, idempotencyKey) => request(warehouse + path, body, expectedStatus, idempotencyKey);
 
   const worker = await request('/auth/login', {
     email: 'demo-skladnik@aardvarkland.local', password: 'Demo-Local-42!',
@@ -121,6 +121,72 @@ test('warehouse workflows on a disposable database', {
     const shipped = await own(`/shipments/${shipment.id}/ship`, {});
     assert.equal(shipped.status, 'SHIPPED');
     assert.equal((await own(`/outbound-orders/${order.id}`)).status, 'SHIPPED');
+  });
+
+  await context.test('inbound receipts stay consistent across retries, concurrent writes and active stock freezes', async () => {
+    const testSku = `RECEIVE-SKU-${run}`;
+    const product = await request('/products', { code: `RECEIVE-PRODUCT-${run}`, name: 'Receiving test product' });
+    await request('/products/skus', { productReference: product.id, code: testSku, name: 'Receiving test SKU' });
+    const collection = '/inbound-shipments';
+    const create = (label, amounts) => own(collection, {
+      shipmentNumber: `RECEIVE-${label}-${run}`,
+      lines: amounts.map((expectedQuantity, index) => ({ lineNumber: String(index + 1), sku: testSku, expectedQuantity })),
+    });
+    const first = await create('PARTIAL', [4]);
+    const second = await create('PARALLEL', [1, 1]);
+    const frozen = await create('FROZEN', [1]);
+    const receivePath = shipment => `${collection}/${shipment.id}/receive`;
+    const state = shipment => own(`${collection}/${shipment.id}`);
+    const baseReceipt = { lineReference: '1', locationReference: 'A-01-01', createPutawayTask: false };
+    for (const quantity of [null, '', false, [], -1, 1.5, 2147483648]) {
+      await own(receivePath(first), { ...baseReceipt, quantity }, 400);
+    }
+    await own(receivePath(first), { ...baseReceipt, quantity: 0 }, 409);
+    await own(receivePath(first), { ...baseReceipt, quantity: 1, damagedQuantity: false }, 400);
+    await own(receivePath(first), { ...baseReceipt, quantity: 2147483647, damagedQuantity: 1, allowOverReceive: true }, 409);
+    assert.equal((await state(first)).lines[0].receivedQuantity, 0);
+
+    const key = randomUUID();
+    const receipt = { ...baseReceipt, quantity: 2, damagedQuantity: 1 };
+    const [left, right] = await Promise.all([
+      own(receivePath(first), receipt, 201, key),
+      own(receivePath(first), receipt, 201, key),
+    ]);
+    assert.deepEqual(left.movements.map(movement => movement.id), right.movements.map(movement => movement.id));
+    assert.equal(left.receivedQuantity, 2);
+    assert.equal(left.damagedQuantity, 1);
+    assert.equal((await state(first)).lines[0].receivedQuantity, 3);
+    await own(receivePath(first), { ...receipt, quantity: 1 }, 409, key);
+    await own(receivePath(second), receipt, 409, key);
+    assert.equal((await state(second)).lines[0].receivedQuantity, 0);
+
+    const competing = await Promise.allSettled([
+      own(receivePath(first), { ...baseReceipt, quantity: 1 }),
+      own(receivePath(first), { ...baseReceipt, quantity: 1 }),
+    ]);
+    assert.equal(competing.filter(result => result.status === 'fulfilled').length, 1);
+    assert.match(competing.find(result => result.status === 'rejected')?.reason?.message ?? '', /returned 409/);
+    assert.equal((await state(first)).lines[0].receivedQuantity, 4);
+
+    await Promise.all([
+      own(receivePath(second), { ...baseReceipt, quantity: '1' }),
+      own(receivePath(second), { ...baseReceipt, lineReference: '2', quantity: 1 }),
+    ]);
+    const completed = await state(second);
+    assert.equal(completed.status, 'RECEIVED');
+    assert.deepEqual(completed.lines.map(line => line.receivedQuantity), [1, 1]);
+    assert.equal((await own(`/inventory/quants/${left.quant.id}`)).quantity, 5);
+
+    const plan = await own('/cycle-counts', { code: `RECEIVE-COUNT-${run}`, scopeType: 'SKU', scopeReference: testSku });
+    await own(`/cycle-counts/${plan.id}/release`, {});
+    const frozenKey = randomUUID();
+    await own(receivePath(frozen), { ...baseReceipt, quantity: 1 }, 409, frozenKey);
+    assert.equal((await state(frozen)).lines[0].receivedQuantity, 0);
+    const [count] = await own(`/cycle-counts/${plan.id}/tasks`);
+    await own(`/cycle-counts/tasks/${count.id}/submit`, { countedQuantity: count.expectedQuantity });
+    await own(`/cycle-counts/tasks/${count.id}/approve`, {});
+    await own(receivePath(frozen), { ...baseReceipt, quantity: 1 }, 201, frozenKey);
+    assert.equal((await own(`/inventory/quants/${left.quant.id}`)).quantity, 6);
   });
 
   await context.test('move and correct stock, then count and approve a variance', async () => {

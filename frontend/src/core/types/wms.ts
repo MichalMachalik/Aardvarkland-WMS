@@ -9,11 +9,13 @@ export interface Metric {
 
 export interface Shipment {
   id: string;
+  number: string;
   supplier: string;
-  dock: string;
-  status: 'Plánováno' | 'Na rampě' | 'Přijímá se' | 'Dokončeno';
+  dock: string | null;
+  status: 'Plánováno' | 'Na rampě' | 'Přijímá se' | 'Dokončeno' | 'Cancelled' | 'Exception';
+  active: boolean;
   eta: string;
-  lines: number;
+  lines: Array<{ id: string; number: string; sku: string; remaining: number }>;
   progress: number;
 }
 

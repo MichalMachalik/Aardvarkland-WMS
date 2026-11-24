@@ -59,6 +59,17 @@ async function login(page, role) {
 const desktopNav = page => page.getByRole('navigation', { name: 'Hlavní navigace' });
 const mobileNav = page => page.getByRole('navigation', { name: 'Mobilní navigace' });
 
+async function liveApi(page, path, { token, data } = {}) {
+  const url = new URL(path, base).href;
+  const headers = token ? { Authorization: `Bearer ${token}` } : {};
+  const response = data === undefined
+    ? await page.request.get(url, { headers })
+    : await page.request.post(url, { data, headers: { ...headers, 'Idempotency-Key': randomUUID() } });
+  expect(response.ok(), `${response.status()} ${path}`).toBe(true);
+  const body = await response.json();
+  return body.data ?? body;
+}
+
 for (const [name, role] of Object.entries(roles)) {
   test(`${name} can open each permitted screen at desktop and phone sizes`, async ({ page }) => {
     test.setTimeout(90000);
@@ -184,22 +195,124 @@ test('worker deep links to restricted pages return to the scanner', async ({ pag
   await expect(desktopNav(page).getByRole('button', { name: 'Nastavení' })).toHaveCount(0);
 });
 
+test('receiving uses actual shipment lines, routes to the correct dock and retries without adding stock twice', async ({ page }) => {
+  test.skip(process.env.WMS_LIVE_UI_WRITE !== 'true', 'Enable writes only on a disposable database.');
+  test.setTimeout(60000);
+  await login(page, roles.worker);
+  const api = (path, options) => liveApi(page, path, options);
+  const warehouse = '/api/warehouses/MAIN';
+  const path = warehouse + '/inbound-shipments';
+  const id = randomUUID().slice(0, 8).toUpperCase();
+  const sku = `RECEIPT-${id}`;
+  const { accessToken: admin } = await api('/api/auth/login', {
+    data: { email: roles.system.email, password: roles.system.password },
+  });
+  const product = await api('/api/products', { token: admin, data: { code: sku, name: 'Receiving browser fixture' } });
+  await api('/api/products/skus', { token: admin, data: { code: sku, name: 'Receiving browser SKU', productReference: product.id } });
+  const dock = await api(warehouse + '/locations', {
+    token: admin, data: { code: `DOCK-${id}`, name: 'Receiving browser dock', type: 'RECEIVING' },
+  });
+  const create = (label, lines, extra = {}) => api(path, {
+    token: admin, data: { shipmentNumber: `ASN-${label}-${id}`, lines, ...extra },
+  });
+  const multi = await create('DEFAULT', [
+    { lineNumber: '20', sku, expectedQuantity: 4 },
+    { lineNumber: '90', sku, expectedQuantity: 1 },
+  ]);
+  const assigned = await create('DOCK', [{ lineNumber: '55', sku, expectedQuantity: 1 }], { dockLocationReference: dock.code });
+  const cancelled = await create('CANCELLED', [{ lineNumber: '30', sku, expectedQuantity: 1 }], { status: 'CANCELLED' });
+  const row = shipment => page.getByRole('radio', { name: shipment.shipmentNumber });
+  const count = page.getByTestId('inbound-quantity');
+  const line = page.getByTestId('inbound-line-reference');
+  const submit = page.locator('[data-e2e-action="inbound-receive"]');
+  const receipt = shipment => `${path}/${shipment.id}/receive`;
+  const isReceipt = (response, shipment) => response.request().method() === 'POST' && new URL(response.url()).pathname === receipt(shipment);
+  const state = shipment => api(`${path}/${shipment.id}`, { token: admin });
+  const quant = id => api(warehouse + '/inventory/quants/' + id, { token: admin });
+
+  await desktopNav(page).getByRole('button', { name: 'Příjem', exact: true }).click();
+  await expect(row(multi)).toBeVisible();
+  await expect(row(cancelled)).toHaveCount(0);
+  await expect(submit).toHaveCount(0);
+  await row(multi).check();
+  await expect(count).toBeDisabled();
+  const [first, second] = multi.lines;
+  await line.selectOption(first.id);
+  for (const invalid of ['-1', '0', '1.5', '5', '1e0', '2147483648']) {
+    await count.fill(invalid);
+    await expect(submit).toBeDisabled();
+  }
+  expect((await state(multi)).lines.map(item => item.receivedQuantity)).toEqual([0, 0]);
+
+  let lostReceipt;
+  let sentKey;
+  await page.route(`**${receipt(multi)}`, async route => {
+    const request = route.request();
+    sentKey = request.headers()['idempotency-key'];
+    expect(request.postDataJSON()).toMatchObject({ lineReference: first.id, quantity: 2 });
+    expect(request.postDataJSON()).not.toHaveProperty('locationReference');
+    const saved = await route.fetch();
+    expect(saved.ok()).toBe(true);
+    lostReceipt = await saved.json();
+    await route.abort();
+  }, { times: 1 });
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+  await count.fill('2');
+  await submit.click();
+  await expect(page.getByText(/Přijmout řádek selhalo/)).toBeVisible();
+  expect((await state(multi)).lines.map(item => item.receivedQuantity)).toEqual([2, 0]);
+  expect(await quant(lostReceipt.quant.id)).toMatchObject({ quantity: 2, location: { code: 'RCV-01' } });
+
+  const retry = page.waitForResponse(response => isReceipt(response, multi));
+  await submit.click();
+  const replay = await retry;
+  expect(replay.ok()).toBe(true);
+  expect(replay.request().headers()['idempotency-key']).toBe(sentKey);
+  expect((await replay.json()).movement.id).toBe(lostReceipt.movement.id);
+  await expect(count).toHaveValue('');
+  await expect(count).toHaveAttribute('max', '2');
+  expect(await quant(lostReceipt.quant.id)).toMatchObject({ quantity: 2 });
+
+  await line.selectOption(second.id);
+  await count.fill('1');
+  const secondSaved = page.waitForResponse(response => isReceipt(response, multi));
+  await submit.click();
+  expect((await secondSaved).ok()).toBe(true);
+  await expect(line.locator('option')).toHaveCount(2);
+  await expect(line).toHaveValue(first.id);
+  await expect(count).toHaveValue('');
+  await count.fill('2');
+  await submit.click();
+  await expect(row(multi)).toHaveCount(0);
+  expect(await state(multi)).toMatchObject({ status: 'RECEIVED' });
+  expect(await quant(lostReceipt.quant.id)).toMatchObject({ quantity: 5 });
+
+  await row(assigned).check();
+  await expect(line).toHaveValue(assigned.lines[0].id);
+  await count.fill('1');
+  const toDock = page.waitForResponse(response => isReceipt(response, assigned));
+  await submit.click();
+  const received = await toDock;
+  expect(received.ok()).toBe(true);
+  expect(received.request().postDataJSON()).toMatchObject({ locationReference: dock.code });
+  expect(await quant((await received.json()).quant.id)).toMatchObject({ quantity: 1, location: { code: dock.code } });
+
+  await page.getByRole('button', { name: 'Vše', exact: true }).click();
+  await expect(row(multi)).toBeVisible();
+  await row(cancelled).check();
+  const cancelledRow = page.getByRole('row').filter({ has: row(cancelled) });
+  await expect(cancelledRow.getByText('Zrušeno', { exact: true })).toBeVisible();
+  await expect(submit).toHaveCount(0);
+});
+
 test('cycle counts isolate plans, hide the RF quantity and write only approved counts to stock', async ({ page, browser }) => {
   test.skip(process.env.WMS_LIVE_UI_WRITE !== 'true', 'Enable writes only on a disposable database.');
   test.setTimeout(60000);
   await login(page, roles.manager);
   const warehouse = '/api/warehouses/MAIN';
 
-  async function api(path, { token, data } = {}) {
-    const url = new URL(path, base).href;
-    const headers = token ? { Authorization: `Bearer ${token}` } : {};
-    const response = data === undefined
-      ? await page.request.get(url, { headers })
-      : await page.request.post(url, { data, headers: { ...headers, 'Idempotency-Key': randomUUID() } });
-    expect(response.ok(), `${response.status()} ${path}`).toBe(true);
-    const body = await response.json();
-    return body.data ?? body;
-  }
+  const api = (path, options) => liveApi(page, path, options);
 
   const { accessToken: admin } = await api('/api/auth/login', {
     data: { email: roles.system.email, password: roles.system.password },

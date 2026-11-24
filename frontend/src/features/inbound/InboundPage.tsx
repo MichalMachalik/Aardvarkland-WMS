@@ -1,5 +1,5 @@
 import { pickLanguage } from '../../core/i18n/i18n';
-import { FormEvent, useMemo, useState } from 'react';
+import { FormEvent, useRef, useState } from 'react';
 import { Badge } from '../../components/ui/Badge';
 import { Button } from '../../components/ui/Button';
 import { Card } from '../../components/ui/Card';
@@ -18,48 +18,120 @@ import type { Shipment } from '../../core/types/wms';
 const emptyShipments: Shipment[] = [];
 
 export function InboundPage() {
-  const { warehouseId, language } = useWorkspace();
+  const { warehouseId } = useWorkspace();
+  return <InboundWorkspace key={warehouseId} />;
+}
+
+function InboundWorkspace() {
+  const { warehouseId, language, can } = useWorkspace();
   const text = pickLanguage(language, { cs: inboundCzech, en: inboundEnglish, ua: inboundUkrainian });
   const resource = useApiResource({ fallback: emptyShipments, productionFallback: emptyShipments, loader: () => listInboundShipments<unknown[]>(warehouseId), map: mapInboundShipments, dependencies: [warehouseId] });
   const mutation = useApiMutation();
-  const sourceRows = resource.data;
+  const [latestReceipt, setLatestReceipt] = useState<{ source: Shipment[]; shipment: Shipment }>();
+  const sourceRows = latestReceipt?.source === resource.data
+    ? resource.data.map((shipment) => shipment.id === latestReceipt.shipment.id ? latestReceipt.shipment : shipment)
+    : resource.data;
   const [filter, setFilter] = useState('active');
-  const [selectedId, setSelectedId] = useState(sourceRows[0]?.id ?? '');
-  const [lineReference, setLineReference] = useState('1');
-  const [quantity, setQuantity] = useState('1');
-  const selected = sourceRows.find((row) => row.id === selectedId) ?? sourceRows[0];
-  const rows = useMemo(() => filter === 'all' ? sourceRows : sourceRows.filter((shipment) => shipment.status !== 'Dokončeno'), [filter, sourceRows]);
+  const [selectedId, setSelectedId] = useState('');
+  const [lineId, setLineId] = useState('');
+  const [quantity, setQuantity] = useState('');
+  const retryKey = useRef<string | undefined>(undefined);
+  const rows = filter === 'all' ? sourceRows : sourceRows.filter((shipment) => shipment.active);
+  const selected = rows.find((row) => row.id === selectedId);
+  const outstanding = selected?.active ? selected.lines.filter((line) => line.remaining > 0) : [];
+  const selectedLine = outstanding.find((line) => line.id === lineId) ?? (outstanding.length === 1 ? outstanding[0] : undefined);
+  const amount = Number(quantity);
+  const canReceive = ['inbound.manage', 'inventory.move', 'task.manage'].every(can);
+  const running = mutation.status === 'running';
+  const canSubmit = canReceive && resource.status === 'live' && !running && Boolean(selectedLine)
+    && /^\d+$/.test(quantity.trim()) && amount > 0 && amount <= (selectedLine?.remaining ?? 0);
+
+  function clearQuantity() {
+    retryKey.current = undefined;
+    setQuantity('');
+  }
+
   const columns: Column<Shipment>[] = [
-    { key: 'select', label: '', render: (row) => <input type="radio" name="inbound" data-e2e-row="inbound" data-e2e-value={row.id} checked={selected?.id === row.id} onChange={() => setSelectedId(row.id)} /> },
-    { key: 'id', label: 'ASN', render: (row) => <strong>{row.id}</strong> },
+    { key: 'select', label: '', render: (row) => (
+      <input type="radio" name="inbound" aria-label={row.number} data-e2e-row="inbound" data-e2e-value={row.number}
+        checked={selected?.id === row.id} disabled={running} onChange={() => { setSelectedId(row.id); setLineId(''); clearQuantity(); }} />
+    ) },
+    { key: 'id', label: 'ASN', render: (row) => <strong>{row.number}</strong> },
     { key: 'supplier', label: text.supplier, render: (row) => row.supplier },
-    { key: 'dock', label: text.dock, render: (row) => <Badge>{row.dock}</Badge> },
+    { key: 'dock', label: text.dock, render: (row) => row.dock ? <Badge>{row.dock}</Badge> : '—' },
     { key: 'eta', label: 'ETA', render: (row) => row.eta },
-    { key: 'lines', label: text.lines, align: 'right', render: (row) => row.lines },
+    { key: 'lines', label: text.lines, align: 'right', render: (row) => row.lines.length },
     { key: 'progress', label: text.progress, render: (row) => <ProgressBar value={row.progress} /> },
     { key: 'status', label: text.status, render: (row) => <StatusPill value={row.status} /> },
   ];
-  const active = sourceRows.filter((item) => item.status !== 'Dokončeno').length;
-  const avgProgress = sourceRows.length ? Math.round(sourceRows.reduce((sum, item) => sum + item.progress, 0) / sourceRows.length) : 0;
-  const receive = (event: FormEvent) => {
+  async function receive(event: FormEvent) {
     event.preventDefault();
-    if (!selected) return;
-    void mutation.run(text.receiveLine, () => receiveInboundShipment(warehouseId, selected.id, {
-      lineReference,
-      quantity: Math.max(0, Number.parseInt(quantity, 10) || 0),
+    if (!canSubmit || !selected || !selectedLine) return;
+    const idempotencyKey = retryKey.current ?? createWmsIdempotencyKey('inbound-receipt');
+    retryKey.current = idempotencyKey;
+    const result = await mutation.run(text.receiveLine, () => receiveInboundShipment<{ shipment: unknown }>(warehouseId, selected.id, {
+      lineReference: selectedLine.id,
+      quantity: amount,
       qualityStatus: 'PASSED',
-      locationReference: selected.dock,
-      idempotencyKey: createWmsIdempotencyKey(`storage-inbound-${selected.id}`),
+      locationReference: selected.dock ?? undefined,
+      idempotencyKey,
       metadata: { source: 'storage-ui' },
-    })).then((result) => { if (result) resource.refresh(); });
-  };
-  return <div className="page-grid"><div className="span-12"><DataSourceBanner label={text.banner} resource={resource} /></div><Card title={text.title} className="span-8" action={<div className="segmented"><button className={filter === 'active' ? 'is-active' : ''} onClick={() => setFilter('active')}>{text.active}</button><button className={filter === 'all' ? 'is-active' : ''} onClick={() => setFilter('all')}>{text.all}</button></div>}><DataTable rows={rows} columns={columns} getRowKey={(row) => row.id} emptyTitle={text.emptyTitle} emptyText={text.emptyText} /></Card><Card title={text.controlTitle} className="span-4"><div className="metric-stack"><article><span>{text.activeInbound}</span><strong>{active}</strong></article><article><span>{text.avgProgress}</span><strong>{avgProgress}%</strong><ProgressBar value={avgProgress} /></article></div><form className="action-panel" onSubmit={receive}><label>{text.selectedAsn}<input data-testid="inbound-selected-asn" value={selected?.id ?? '—'} readOnly /></label><label>{text.line}<input data-testid="inbound-line-reference" value={lineReference} onChange={(event) => setLineReference(event.target.value)} /></label><label>{text.quantity}<input data-testid="inbound-quantity" type="number" min="0" value={quantity} onChange={(event) => setQuantity(event.target.value)} /></label><Button tone="primary" type="submit" data-e2e-action="inbound-receive" disabled={!selected || mutation.status === 'running'}>{text.receiveLine}</Button><ActionStatus mutation={mutation} /></form></Card></div>;
+    }));
+    if (result) {
+      const [shipment] = mapInboundShipments([result.shipment]);
+      if (shipment) setLatestReceipt({ source: resource.data, shipment });
+      clearQuantity();
+      resource.refresh();
+    }
+  }
+
+  function changeFilter(value: string) {
+    setFilter(value);
+    setSelectedId('');
+    setLineId('');
+    clearQuantity();
+  }
+
+  return (
+    <div className="page-grid">
+      <div className="span-12"><DataSourceBanner label={text.banner} resource={resource} /></div>
+      <Card title={text.title} className="span-8" action={
+        <div className="segmented">
+          <button type="button" aria-pressed={filter === 'active'} className={filter === 'active' ? 'is-active' : ''} disabled={running} onClick={() => changeFilter('active')}>{text.active}</button>
+          <button type="button" aria-pressed={filter === 'all'} className={filter === 'all' ? 'is-active' : ''} disabled={running} onClick={() => changeFilter('all')}>{text.all}</button>
+        </div>
+      }>
+        <DataTable rows={rows} columns={columns} getRowKey={(row) => row.id} emptyTitle={text.emptyTitle} emptyText={text.emptyText} />
+      </Card>
+      {canReceive && <Card title={text.controlTitle} className="span-4">
+        {selected && <p className="muted-copy">{text.selectedAsn} <strong>{selected.number}</strong></p>}
+        {outstanding.length > 0 ? (
+          <form className="action-panel" aria-label={text.controlTitle} onSubmit={receive}>
+            <label>{text.line}
+              <select data-testid="inbound-line-reference" value={selectedLine?.id ?? ''} disabled={running} required
+                onChange={(event) => { setLineId(event.target.value); clearQuantity(); }}>
+                <option value="" disabled>{text.chooseLine}</option>
+                {outstanding.map((line) => <option key={line.id} value={line.id}>{line.number} · {line.sku}</option>)}
+              </select>
+            </label>
+            {selectedLine && <p className="muted-copy" aria-live="polite">{text.remaining} <strong>{selectedLine.remaining}</strong></p>}
+            <label>{text.quantity}
+              <input data-testid="inbound-quantity" type="number" min={1} max={selectedLine?.remaining}
+                step={1} inputMode="numeric" required value={quantity} disabled={!selectedLine || running}
+                onChange={(event) => { retryKey.current = undefined; setQuantity(event.target.value); }} />
+            </label>
+            <Button tone="primary" type="submit" data-e2e-action="inbound-receive" disabled={!canSubmit}>{text.receiveLine}</Button>
+          </form>
+        ) : <p className="muted-copy">{selected ? text.nothingToReceive : text.chooseShipment}</p>}
+        <ActionStatus mutation={mutation} />
+      </Card>}
+    </div>
+  );
 }
 
 const inboundCzech = {
   banner: 'API příjmu',
   title: 'Příjem',
-  tableEyebrow: 'živý příjem',
   supplier: 'Dodavatel',
   dock: 'Rampa',
   lines: 'Řádků',
@@ -70,27 +142,19 @@ const inboundCzech = {
   active: 'Aktivní',
   all: 'Vše',
   controlTitle: 'Přijmout řádek',
-  controlEyebrow: 'živý příjem ASN',
-  activeInbound: 'Aktivní příjmy',
-  avgProgress: 'Průměrný průběh',
   selectedAsn: 'Vybrané ASN',
   line: 'Řádek',
+  chooseLine: 'Vyberte řádek',
+  chooseShipment: 'Vyberte příjem v tabulce.',
+  remaining: 'Zbývá přijmout',
+  nothingToReceive: 'V tomto příjmu už není co přijmout.',
   quantity: 'Množství',
   receiveLine: 'Přijmout řádek',
-  checksTitle: 'Kontroly příjmu',
-  checksEyebrow: 'živá mutace',
-  checks: [
-    ['Kontrola kvality', 'Příjem posílá stav kvality PASSED.'],
-    ['Idempotence', 'Každý příjem má unikátní klíč pro bezpečné opakování.'],
-    ['Rampa příjmu', 'Lokace příjmu se bere z vybrané rampy.'],
-    ['Obnovení dat', 'Po úspěšné mutaci se tabulka znovu načte z API.'],
-  ],
 };
 
 const inboundEnglish = {
   banner: 'Receiving API',
   title: 'Receiving',
-  tableEyebrow: 'live receiving',
   supplier: 'Supplier',
   dock: 'Dock',
   lines: 'Lines',
@@ -101,27 +165,19 @@ const inboundEnglish = {
   active: 'Active',
   all: 'All',
   controlTitle: 'Receive line',
-  controlEyebrow: 'live ASN receiving',
-  activeInbound: 'Active receiving',
-  avgProgress: 'Average progress',
   selectedAsn: 'Selected ASN',
   line: 'Line',
+  chooseLine: 'Choose a line',
+  chooseShipment: 'Select a shipment in the table.',
+  remaining: 'Remaining to receive',
+  nothingToReceive: 'No items remain to be received on this shipment.',
   quantity: 'Quantity',
   receiveLine: 'Receive line',
-  checksTitle: 'Receiving checks',
-  checksEyebrow: 'live mutation',
-  checks: [
-    ['Quality check', 'Receiving sends the PASSED quality state.'],
-    ['Idempotency', 'Each receipt has a unique key for safe retry.'],
-    ['Receiving dock', 'The receiving location is taken from the selected dock.'],
-    ['Data refresh', 'After a successful mutation, the table reloads from the API.'],
-  ],
 };
 
 const inboundUkrainian = {
   banner: 'API приймання',
   title: 'Приймання',
-  tableEyebrow: 'живе приймання',
   supplier: 'Постач.',
   dock: 'Рампа',
   lines: 'Рядків',
@@ -132,19 +188,12 @@ const inboundUkrainian = {
   active: 'Активні',
   all: 'Усі',
   controlTitle: 'Прийняти рядок',
-  controlEyebrow: 'живе приймання ASN',
-  activeInbound: 'Активні приймання',
-  avgProgress: 'Середній прогрес',
   selectedAsn: 'Вибране ASN',
   line: 'Рядок',
+  chooseLine: 'Виберіть рядок',
+  chooseShipment: 'Виберіть відправлення в таблиці.',
+  remaining: 'Залишилося прийняти',
+  nothingToReceive: 'У цьому відправленні більше немає товарів для приймання.',
   quantity: 'Кількість',
   receiveLine: 'Прийняти рядок',
-  checksTitle: 'Контроль приймання',
-  checksEyebrow: 'жива зміна',
-  checks: [
-    ['Контроль якості', 'Приймання надсилає стан якості PASSED.'],
-    ['Ідемпотентність', 'Кожне приймання має унікальний ключ для безпечного повтору.'],
-    ['Рампа приймання', 'Локація приймання береться з вибраної рампи.'],
-    ['Оновлення даних', 'Після успішної зміни таблиця знову завантажується з API.'],
-  ],
 };

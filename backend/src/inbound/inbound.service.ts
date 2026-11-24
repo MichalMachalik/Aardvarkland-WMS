@@ -3,8 +3,10 @@ import { ConflictException, Injectable, NotFoundException } from '@nestjs/common
 import { AuthenticatedUser } from '../access-control/types';
 import { OwnerClientRecord, OwnerScopePrismaClient, OwnerScopeService } from '../clients/owner-scope.service';
 import { normalizeOffsetPagination } from '../common';
-import { PrismaService } from '../database';
+import { lockPostgresAdvisoryTransaction, lockPostgresRowById, PrismaService, withTransactionRetry } from '../database';
 import { Parcel, Prisma, Warehouse, WarehouseLocation } from '../generated/prisma/client';
+import { stockRequestFingerprint } from '../inventory/inventory.service';
+import { assertNoBlockingStockFreeze } from '../inventory/stock-freeze.helpers';
 import { lockStockQuantIdentity } from '../inventory/stock-quant-identity.helpers';
 import {
   assertTraceabilityCapture,
@@ -14,7 +16,7 @@ import {
 } from '../traceability/traceability-policy.helpers';
 import { CreateInboundShipmentDto } from './dto/create-inbound-shipment.dto';
 import { ListInboundShipmentsQueryDto } from './dto/list-inbound-shipments-query.dto';
-import { ReceiveInboundLineDto } from './dto/receive-inbound-line.dto';
+import { MAX_RECEIVE_QUANTITY, ReceiveInboundLineDto } from './dto/receive-inbound-line.dto';
 import {
   UpdateInboundShipmentDto,
   UpdateInboundShipmentLineDto,
@@ -116,7 +118,7 @@ export class InboundService {
         expectedQuantity: line.expectedQuantity,
         receivedQuantity: line.receivedQuantity ?? 0,
         parcelId: line.parcelReference
-          ? (await this.resolveParcel(warehouse.id, line.parcelReference)).id
+          ? (await this.resolveParcel(client, warehouse.id, line.parcelReference)).id
           : null,
         metadata: toJsonInput(line.metadata),
       })),
@@ -172,29 +174,26 @@ export class InboundService {
     dto: UpdateInboundShipmentDto,
     actor: AuthenticatedUser,
   ): Promise<InboundShipmentResponse> {
-    const client = this.getClient();
     const warehouse = await this.resolveWarehouse(warehouseReference);
-    const existingShipment = await this.resolveShipment(warehouse.id, shipmentReference);
-    const data = await this.toShipmentUpdateInput(client, warehouse.id, existingShipment, dto);
 
     try {
-      const shipment =
-        Object.keys(data).length === 0
-          ? existingShipment
-          : await client.inboundShipment.update({
-              where: { id: existingShipment.id },
-              data,
-              include: inboundShipmentInclude,
-            });
+      return await withTransactionRetry(() => this.prisma.$transaction(async (tx) => {
+        const client = tx as unknown as InboundPrismaClient;
+        const candidate = await this.resolveShipmentInClient(client, warehouse.id, shipmentReference);
+        await lockPostgresRowById(client, 'inbound_shipments', candidate.id);
+        const shipment = await this.resolveShipmentInClient(client, warehouse.id, candidate.id);
+        const data = await this.toShipmentUpdateInput(client, warehouse.id, shipment, dto);
+        if (Object.keys(data).length > 0) {
+          await client.inboundShipment.update({ where: { id: shipment.id }, data, include: inboundShipmentInclude });
+        }
+        for (const line of dto.lines ?? []) {
+          await this.updateLine(client, warehouse.id, shipment.id, line);
+        }
 
-      for (const line of dto.lines ?? []) {
-        await this.updateLine(warehouse.id, shipment.id, line);
-      }
-
-      const refreshedShipment = await this.resolveShipment(warehouse.id, shipment.id);
-      await this.writeAudit(actor, warehouse.id, 'inbound_shipment.updated', refreshedShipment);
-
-      return toInboundShipmentResponse(refreshedShipment);
+        const refreshed = await this.resolveShipmentInClient(client, warehouse.id, shipment.id);
+        await this.writeAuditInClient(client, actor, warehouse.id, 'inbound_shipment.updated', refreshed);
+        return toInboundShipmentResponse(refreshed);
+      }));
     } catch (error: unknown) {
       if (hasPrismaCode(error, 'P2002')) {
         throw new ConflictException('Inbound shipment number or line number already exists');
@@ -211,16 +210,23 @@ export class InboundService {
     actor: AuthenticatedUser,
   ): Promise<InboundReceiveResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
-    const idempotentReceive = await this.findIdempotentReceive(warehouse.id, dto.idempotencyKey);
+    const key = normalizeNullableString(dto.idempotencyKey);
+    const fingerprint = stockRequestFingerprint({ ...dto, idempotencyKey: undefined });
 
-    if (idempotentReceive) {
-      return idempotentReceive;
-    }
-
-    return this.prisma.$transaction(async (tx) => {
+    return withTransactionRetry(() => this.prisma.$transaction(async (tx) => {
       const client = tx as unknown as InboundPrismaClient;
-      const shipment = await this.resolveShipmentInClient(client, warehouse.id, shipmentReference);
+      if (key) {
+        await lockPostgresAdvisoryTransaction(client, 'idempotency_key', `inbound-receive:${key}`);
+      }
+      const candidate = await this.resolveShipmentInClient(client, warehouse.id, shipmentReference);
+      await lockPostgresRowById(client, 'inbound_shipments', candidate.id);
+      const shipment = await this.resolveShipmentInClient(client, warehouse.id, candidate.id);
       const owner = await this.resolveReceiveOwner(client, warehouse.id, shipment.id, dto.ownerClientReference);
+
+      if (key) {
+        const replay = await this.findIdempotentReceive(client, shipment, key, fingerprint, dto);
+        if (replay) return replay;
+      }
 
       if (shipment.status === InboundStatus.CANCELLED || shipment.status === InboundStatus.CLOSED) {
         throw new ConflictException('Cancelled or closed inbound shipments cannot receive stock');
@@ -240,6 +246,9 @@ export class InboundService {
       }
 
       const nextReceivedQuantity = line.receivedQuantity + totalReceivedQuantity;
+      if (nextReceivedQuantity > MAX_RECEIVE_QUANTITY) {
+        throw new ConflictException('Received quantity exceeds the maximum stored quantity');
+      }
       const overReceivedQuantity = Math.max(0, nextReceivedQuantity - line.expectedQuantity);
 
       if (!isUnexpected && overReceivedQuantity > 0 && dto.allowOverReceive !== true) {
@@ -364,8 +373,11 @@ export class InboundService {
             condition: stockStatus,
             batch,
             expiry,
-            idempotencyKey: normalizeNullableString(dto.idempotencyKey),
-            metadata: mergeReceiveMetadata(dto.metadata, qualityCheck, 'RECEIVED'),
+            idempotencyKey: key,
+            metadata: {
+              ...mergeReceiveMetadata(dto.metadata, qualityCheck, 'RECEIVED'),
+              inboundReceiveFingerprint: fingerprint,
+            },
             exceptionIds,
           })
         : null;
@@ -383,11 +395,13 @@ export class InboundService {
             batch,
             expiry,
             idempotencyKey: movement
-              ? appendIdempotencySuffix(dto.idempotencyKey, 'damaged')
-              : normalizeNullableString(dto.idempotencyKey),
+              ? appendIdempotencySuffix(key ?? undefined, 'damaged')
+              : key,
             metadata: {
               ...mergeReceiveMetadata(dto.metadata, qualityCheck, 'DAMAGED'),
               damageReason: normalizeNullableString(dto.damageReason),
+              inboundReceiveFingerprint: fingerprint,
+              inboundReceiveParentMovementId: movement?.id ?? null,
             },
             exceptionIds,
           })
@@ -524,7 +538,7 @@ export class InboundService {
         qualityHeldQuantity: qualityCheck?.heldQuantity ?? 0,
         qualityCheck,
       };
-    });
+    }));
   }
 
   private async resolveReceiveOwner(
@@ -764,8 +778,8 @@ export class InboundService {
     return warehouse;
   }
 
-  private async resolveParcel(warehouseId: string, parcelReference: string): Promise<Parcel> {
-    const parcel = await this.getClient().parcel.findFirst({
+  private async resolveParcel(client: InboundPrismaClient, warehouseId: string, parcelReference: string): Promise<Parcel> {
+    const parcel = await client.parcel.findFirst({
       where: parcelReferenceWhere(warehouseId, parcelReference),
     });
 
@@ -798,13 +812,6 @@ export class InboundService {
     }
 
     return shipment;
-  }
-
-  private async resolveLine(
-    shipmentId: string,
-    lineReference: string,
-  ): Promise<InboundShipmentLineWithParcel> {
-    return this.resolveLineInClient(this.getClient(), shipmentId, lineReference);
   }
 
   private async resolveLineInClient(
@@ -921,7 +928,7 @@ export class InboundService {
   ): Promise<StockQuantRecord> {
     await lockStockQuantIdentity(client, input);
 
-    const existingQuant = await client.stockQuant.findFirst({
+    const candidate = await client.stockQuant.findFirst({
       where: {
         warehouseId: input.warehouseId,
         locationId: input.locationId,
@@ -934,10 +941,22 @@ export class InboundService {
       },
     });
 
+    if (candidate) await lockPostgresRowById(client, 'stock_quants', candidate.id);
+    const existingQuant = candidate && await client.stockQuant.findFirst({ where: { id: candidate.id } });
+    await assertNoBlockingStockFreeze(client, {
+      warehouseId: input.warehouseId,
+      locationId: input.locationId,
+      skuId: input.skuId,
+      stockQuantId: existingQuant?.id,
+      operation: 'inbound receiving',
+    });
     if (existingQuant) {
+      if (existingQuant.quantity + input.quantity > MAX_RECEIVE_QUANTITY) {
+        throw new ConflictException('Stock quantity would exceed the maximum stored quantity');
+      }
       return client.stockQuant.update({
         where: { id: existingQuant.id },
-        data: { quantity: { increment: input.quantity } },
+        data: { quantity: { increment: input.quantity }, version: { increment: 1 } },
       });
     }
 
@@ -1219,16 +1238,13 @@ export class InboundService {
   }
 
   private async findIdempotentReceive(
-    warehouseId: string,
-    rawIdempotencyKey: string | undefined,
+    client: InboundPrismaClient,
+    shipment: InboundShipmentWithLines,
+    idempotencyKey: string,
+    fingerprint: string,
+    dto: ReceiveInboundLineDto,
   ): Promise<InboundReceiveResponse | null> {
-    const idempotencyKey = normalizeNullableString(rawIdempotencyKey);
-
-    if (!idempotencyKey) {
-      return null;
-    }
-
-    const client = this.getClient();
+    const { warehouseId } = shipment;
     const movement = await client.stockMovement.findFirst({
       where: {
         warehouseId,
@@ -1241,32 +1257,38 @@ export class InboundService {
       return null;
     }
 
-    if (movement.type !== 'RECEIVE') {
+    if (movement.type !== 'RECEIVE' || movement.referenceType !== 'INBOUND_SHIPMENT' || movement.referenceId !== shipment.id) {
       throw new ConflictException(
-        'Idempotency key has already been used for another movement type',
+        'Idempotency key has already been used for another stock operation',
       );
     }
 
-    const shipmentId =
-      readStringMetadata(movement.metadata, 'inboundShipmentId') ?? movement.referenceId;
     const lineId = readStringMetadata(movement.metadata, 'inboundShipmentLineId');
+    const storedFingerprint = readStringMetadata(movement.metadata, 'inboundReceiveFingerprint');
 
-    if (!shipmentId || !lineId || !movement.stockQuantId) {
+    if (!lineId || !movement.stockQuantId) {
       throw new ConflictException('Idempotent inbound receive movement is missing references');
+    }
+    if (storedFingerprint && storedFingerprint !== fingerprint) {
+      throw new ConflictException('Idempotency key has already been used for another receipt');
     }
 
     const siblingMovements = await client.stockMovement.findMany({
       where: {
         warehouseId,
         sourceSystem: 'WMS',
-        idempotencyKey: { startsWith: `${idempotencyKey}:` },
+        referenceType: 'INBOUND_SHIPMENT',
+        referenceId: shipment.id,
+        idempotencyKey: appendIdempotencySuffix(idempotencyKey, 'damaged'),
       },
-      orderBy: { occurredAt: 'asc' },
     });
-    const movements = [movement, ...siblingMovements];
+    const movements = [movement, ...siblingMovements.filter((item) =>
+      receiveDisposition(item) === 'DAMAGED'
+      && readStringMetadata(item.metadata, 'inboundShipmentLineId') === lineId
+      && (!storedFingerprint || readStringMetadata(item.metadata, 'inboundReceiveParentMovementId') === movement.id),
+    )];
     const exceptionIds = readStringArrayMetadata(movement.metadata, 'exceptionIds');
-    const [shipment, quants, putawayTask, exceptions] = await Promise.all([
-      this.resolveShipmentInClient(client, warehouseId, shipmentId),
+    const [quants, putawayTask, exceptions] = await Promise.all([
       Promise.all(
         movements
           .map((item) => item.stockQuantId)
@@ -1291,6 +1313,13 @@ export class InboundService {
     const damagedQuantity = movements
       .filter((item) => receiveDisposition(item) === 'DAMAGED')
       .reduce((sum, item) => sum + item.quantity, 0);
+    if (!storedFingerprint && (
+      (dto.lineReference !== undefined && dto.lineReference !== line.id && dto.lineReference !== line.lineNumber)
+      || receivedQuantity !== dto.quantity
+      || damagedQuantity !== (dto.damagedQuantity ?? 0)
+    )) {
+      throw new ConflictException('Idempotency key has already been used for another receipt');
+    }
     const qualityCheck = toIdempotentReceiveQualityCheck(movements);
 
     return {
@@ -1412,6 +1441,7 @@ export class InboundService {
   }
 
   private async updateLine(
+    client: InboundPrismaClient,
     warehouseId: string,
     shipmentId: string,
     dto: UpdateInboundShipmentLineDto,
@@ -1420,8 +1450,8 @@ export class InboundService {
       throw new ConflictException('lineReference is required when updating inbound lines');
     }
 
-    const line = await this.resolveLine(shipmentId, dto.lineReference);
-    const parcelId = await this.resolveUpdateParcelId(warehouseId, dto);
+    const line = await this.resolveLineInClient(client, shipmentId, dto.lineReference);
+    const parcelId = await this.resolveUpdateParcelId(client, warehouseId, dto);
     const data: Record<string, unknown> = {
       ...(dto.sku === undefined ? {} : { sku: dto.sku.trim() }),
       ...(dto.description === undefined
@@ -1434,7 +1464,7 @@ export class InboundService {
     };
 
     if (Object.keys(data).length > 0) {
-      await this.getClient().inboundShipmentLine.update({
+      await client.inboundShipmentLine.update({
         where: { id: line.id },
         data,
         include: { parcel: true },
@@ -1443,6 +1473,7 @@ export class InboundService {
   }
 
   private async resolveUpdateParcelId(
+    client: InboundPrismaClient,
     warehouseId: string,
     dto: UpdateInboundShipmentLineDto,
   ): Promise<string | null | undefined> {
@@ -1454,7 +1485,7 @@ export class InboundService {
       return null;
     }
 
-    return (await this.resolveParcel(warehouseId, dto.parcelReference)).id;
+    return (await this.resolveParcel(client, warehouseId, dto.parcelReference)).id;
   }
 
   private async writeAudit(

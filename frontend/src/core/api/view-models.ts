@@ -58,6 +58,8 @@ function timeLabel(value: unknown, fallback = '—'): string {
 function statusInbound(value: unknown): Shipment['status'] {
   const status = stringValue(value, '').toUpperCase();
   if (['RECEIVED', 'CLOSED'].includes(status)) return 'Dokončeno';
+  if (status === 'CANCELLED') return 'Cancelled';
+  if (status === 'EXCEPTION') return 'Exception';
   if (['RECEIVING'].includes(status)) return 'Přijímá se';
   if (['EXPECTED', 'CREATED'].includes(status)) return 'Plánováno';
   return 'Na rampě';
@@ -116,21 +118,34 @@ export function mapWarehouses(payload: unknown): WarehouseView[] {
 }
 
 export function mapInboundShipments(payload: unknown): Shipment[] {
-  return array(payload).map((item, index) => {
+  return array(payload).flatMap((item) => {
     const row = record(item);
-    const lines = array(row.lines);
-    const expected = lines.reduce<number>((sum, line) => sum + numberValue(record(line).expectedQuantity), 0);
-    const received = lines.reduce<number>((sum, line) => sum + numberValue(record(line).receivedQuantity), 0);
-    const progress = expected > 0 ? Math.min(100, Math.round((received / expected) * 100)) : (statusInbound(row.status) === 'Dokončeno' ? 100 : 0);
-    return {
-      id: stringValue(row.shipmentNumber ?? row.id, `ASN-${index + 1}`),
+    const id = stringValue(row.id ?? row.shipmentNumber, '');
+    if (!id) return [];
+    const rawLines = array(row.lines).map(record);
+    const expected = rawLines.reduce((sum, line) => sum + numberValue(line.expectedQuantity), 0);
+    const received = rawLines.reduce((sum, line) => sum + numberValue(line.receivedQuantity), 0);
+    const status = statusInbound(row.status);
+    return [{
+      id,
+      number: stringValue(row.shipmentNumber, id),
       supplier: stringValue(row.supplierName ?? row.supplierReference, '—'),
-      dock: stringValue(nested(row, 'dockLocation').code, '—'),
-      status: statusInbound(row.status),
+      dock: stringValue(nested(row, 'dockLocation').code, '').trim() || null,
+      status,
+      active: typeof row.status === 'string' && ['CREATED', 'EXPECTED', 'RECEIVING', 'EXCEPTION'].includes(row.status.toUpperCase()),
       eta: timeLabel(row.expectedAt ?? row.appointmentStartAt),
-      lines: lines.length || numberValue(row.lineCount, 0),
-      progress,
-    };
+      lines: rawLines.flatMap((line) => {
+        const lineId = stringValue(line.id ?? line.lineNumber, '');
+        if (!lineId) return [];
+        return [{
+          id: lineId,
+          number: stringValue(line.lineNumber, lineId),
+          sku: stringValue(line.sku),
+          remaining: Math.max(0, numberValue(line.expectedQuantity) - numberValue(line.receivedQuantity)),
+        }];
+      }),
+      progress: expected > 0 ? Math.min(100, Math.round((received / expected) * 100)) : (status === 'Dokončeno' ? 100 : 0),
+    }];
   });
 }
 

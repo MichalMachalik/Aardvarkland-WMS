@@ -85,6 +85,33 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.equal(saved.quantity, 3);
   });
 
+  await scenario('inbound shipment changes roll back when any line is invalid', async () => {
+    const { sku } = await createSku('INBOUND');
+    const shipment = await own('POST', '/inbound-shipments', {
+      shipmentNumber: `ASN-UPDATE-${suffix}`,
+      supplierName: 'Initial supplier',
+      lines: [
+        { lineNumber: '10', sku: sku.code, expectedQuantity: 2 },
+        { lineNumber: '20', sku: sku.code, expectedQuantity: 3 },
+      ],
+    });
+    const path = `/inbound-shipments/${shipment.id}`;
+    const changes = {
+      supplierName: 'Updated supplier',
+      lines: [
+        { lineReference: '10', expectedQuantity: 4 },
+        { lineReference: '20', expectedQuantity: 5 },
+      ],
+    };
+    await own('PATCH', path, { ...changes, lines: [changes.lines[0], { lineReference: 'missing', expectedQuantity: 6 }] }, 404);
+    const unchanged = await own('GET', path);
+    assert.equal(unchanged.supplierName, 'Initial supplier');
+    assert.deepEqual(unchanged.lines.map(line => line.expectedQuantity), [2, 3]);
+    const saved = await own('PATCH', path, changes);
+    assert.equal(saved.supplierName, 'Updated supplier');
+    assert.deepEqual(saved.lines.map(line => line.expectedQuantity), [4, 5]);
+  });
+
   await scenario('parcels, tracking, operational exceptions and notifications can be updated', async () => {
     const parcelBody = { trackingNumber: `PARCEL-${suffix}`, currentLocationReference: 'A-01-01' };
     const parcel = await own('POST', '/parcels', parcelBody);

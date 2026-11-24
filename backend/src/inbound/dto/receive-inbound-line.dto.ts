@@ -1,4 +1,4 @@
-import { Transform, Type } from 'class-transformer';
+import { Transform } from 'class-transformer';
 import {
   IsBoolean,
   IsDateString,
@@ -8,10 +8,17 @@ import {
   IsArray,
   IsOptional,
   IsString,
+  Max,
   MaxLength,
   Min,
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+
+export const MAX_RECEIVE_QUANTITY = 2_147_483_647;
+
+function transformReceiptQuantity(value: unknown): unknown {
+  return typeof value === 'string' && /^\d+$/.test(value.trim()) ? Number(value) : value;
+}
 
 export class ReceiveInboundLineDto {
   @ApiPropertyOptional({
@@ -38,20 +45,24 @@ export class ReceiveInboundLineDto {
   @MaxLength(240)
   description?: string;
 
-  @ApiProperty({ description: 'Good/available quantity being received.', example: 12 })
-  @Type(() => Number)
+  @ApiProperty({ description: 'Good/available quantity being received.', example: 12, minimum: 0, maximum: MAX_RECEIVE_QUANTITY })
+  @Transform(({ value }: { value: unknown }) => transformReceiptQuantity(value))
   @IsInt()
   @Min(0)
+  @Max(MAX_RECEIVE_QUANTITY)
   quantity!: number;
 
   @ApiPropertyOptional({
     description: 'Damaged quantity received into non-available stock.',
     example: 1,
+    minimum: 0,
+    maximum: MAX_RECEIVE_QUANTITY,
   })
   @IsOptional()
-  @Type(() => Number)
+  @Transform(({ value }: { value: unknown }) => transformReceiptQuantity(value))
   @IsInt()
   @Min(0)
+  @Max(MAX_RECEIVE_QUANTITY)
   damagedQuantity?: number;
 
   @ApiPropertyOptional({ enum: ['DAMAGED', 'QUARANTINE'], example: 'DAMAGED' })

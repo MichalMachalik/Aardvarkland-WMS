@@ -19758,12 +19758,16 @@
           "quantity": {
             "type": "number",
             "description": "Good/available quantity being received.",
-            "example": 12
+            "example": 12,
+            "minimum": 0,
+            "maximum": 2147483647
           },
           "damagedQuantity": {
             "type": "number",
             "description": "Damaged quantity received into non-available stock.",
-            "example": 1
+            "example": 1,
+            "minimum": 0,
+            "maximum": 2147483647
           },
           "damagedStockStatus": {
             "type": "string",
