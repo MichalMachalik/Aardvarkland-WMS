@@ -24,7 +24,12 @@ export function RfScannerInput({
   const keyTimes = useRef<number[]>([]);
 
   useEffect(() => {
-    inputRef.current?.focus();
+    const input = inputRef.current;
+    if (!input || disabled) return;
+    const { activeElement, body } = input.ownerDocument;
+    if (activeElement === body || activeElement === input || input.form?.contains(activeElement)) {
+      input.focus({ preventScroll: true });
+    }
   }, [disabled, inputProps.placeholder]);
 
   useEffect(() => () => clearIdleTimer(), []);

@@ -101,19 +101,36 @@ for (const [name, role] of Object.entries(roles)) {
 }
 
 test('phone navigation groups secondary pages and restores focus on Escape', async ({ page }) => {
-  await login(page, roles.worker);
-  await page.setViewportSize({ width: 320, height: 750 });
+  const isQueue = url => new URL(url).pathname.endsWith('/rf/queue');
+  let releaseQueue;
+  const pendingQueue = new Promise(resolve => { releaseQueue = resolve; });
+  await page.route(url => isQueue(url.href), async route => {
+    await pendingQueue;
+    await route.continue();
+  }, { times: 1 });
+  const requested = page.waitForRequest(request => isQueue(request.url()));
   const nav = mobileNav(page);
-  await expect(nav.getByRole('button', { name: 'Skenování' })).toBeVisible();
   const more = nav.getByRole('button', { name: 'Další' });
-  await more.click();
   const support = nav.getByRole('region', { name: 'PODPORA' });
-  await expect(support.getByRole('button', { name: 'Zásoby' })).toBeFocused();
+  const stock = support.getByRole('button', { name: 'Zásoby' });
+  try {
+    await login(page, roles.worker);
+    await requested;
+    await page.setViewportSize({ width: 320, height: 750 });
+    await expect(nav.getByRole('button', { name: 'Skenování' })).toBeVisible();
+    await more.click();
+    await expect(stock).toBeFocused();
+  } finally {
+    releaseQueue();
+  }
+  await expect(page.getByTestId('rf-scan-input')).toBeEnabled();
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  await expect(stock).toBeFocused();
   await page.keyboard.press('Escape');
   await expect(support).toHaveCount(0);
   await expect(more).toBeFocused();
   await more.click();
-  await support.getByRole('button', { name: 'Zásoby' }).click();
+  await stock.click();
   await expect(page).toHaveURL(/#\/inventory$/);
   await expect(support).toHaveCount(0);
   const stockTable = page.locator('.inventory-minimal-page .data-table');
@@ -454,6 +471,7 @@ test('cycle counts isolate plans, hide the RF quantity and write only approved c
     await input.fill('A-01-01');
     await confirm.click();
     await expect(expected).toHaveText(first.code);
+    await expect(input).toBeFocused();
     await input.fill(first.code);
     await confirm.click();
     await expect(workerPage.locator('.rf-quantity-controls')).toBeVisible();
