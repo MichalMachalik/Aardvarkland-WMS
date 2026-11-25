@@ -330,6 +330,9 @@ export class WarehouseTasksService {
       if (task.type === WarehouseTaskType.PUTAWAY) {
         throw new ConflictException('Use putaway confirmation to complete this task and move stock');
       }
+      if (task.type === WarehouseTaskType.REPLENISH) {
+        throw new ConflictException('Use replenishment confirmation to complete this task and move stock');
+      }
       assertValidTaskQuantity(task.type, body.quantity);
 
       const fromLocationId = body.fromLocationReference

@@ -3,10 +3,12 @@ import { ConflictException, Injectable, NotFoundException } from '@nestjs/common
 import { AuthenticatedUser } from '../access-control/types';
 import { normalizeOffsetPagination } from '../common';
 import { lockPostgresRowById, PrismaService, withTransactionRetry } from '../database';
+import { Prisma } from '../generated/prisma/client';
 import {
   assertNoBlockingStockFreeze,
   findBlockingStockFreeze,
 } from '../inventory/stock-freeze.helpers';
+import { lockStockQuantIdentity } from '../inventory/stock-quant-identity.helpers';
 import { calculateReplenishmentQuantity, getAvailableQuantity } from './replenishment.helpers';
 import { ConfirmReplenishmentDto } from './dto/confirm-replenishment.dto';
 import { CreateReplenishmentRuleDto } from './dto/create-replenishment-rule.dto';
@@ -45,42 +47,48 @@ export class ReplenishmentService {
     const sku = await this.resolveSku(dto.sku);
     const pickLocation = await this.resolveLocation(warehouse.id, dto.pickLocationReference);
 
-    if (dto.maxQuantity < dto.minQuantity || dto.targetQuantity < dto.minQuantity) {
-      throw new ConflictException('Replenishment max/target quantities must be >= min quantity');
+    if (dto.targetQuantity < dto.minQuantity || dto.targetQuantity > dto.maxQuantity) {
+      throw new ConflictException('Replenishment target must be between the minimum and maximum quantities');
     }
 
     const code = normalizeCode(dto.code ?? `${sku.code}-${pickLocation.code}-MINMAX`);
-    const rule = await this.client.replenishmentRule.create({
-      data: {
-        warehouseId: warehouse.id,
-        code,
-        status: ReplenishmentRuleStatus.ACTIVE,
-        strategy: dto.strategy ?? ReplenishmentStrategy.MIN_MAX,
-        skuId: sku.id,
-        pickLocationId: pickLocation.id,
-        sourceZone: normalizeNullableString(dto.sourceZone)?.toUpperCase() ?? null,
-        minQuantity: dto.minQuantity,
-        maxQuantity: dto.maxQuantity,
-        targetQuantity: dto.targetQuantity,
-        priority: dto.priority ?? 100,
-        metadata: dto.metadata ?? undefined,
-      },
-    });
+    try {
+      return await this.transaction(async (tx) => {
+        const rule = await tx.replenishmentRule.create({
+          data: {
+            warehouseId: warehouse.id,
+            code,
+            status: ReplenishmentRuleStatus.ACTIVE,
+            strategy: dto.strategy ?? ReplenishmentStrategy.MIN_MAX,
+            skuId: sku.id,
+            pickLocationId: pickLocation.id,
+            sourceZone: normalizeNullableString(dto.sourceZone)?.toUpperCase() ?? null,
+            minQuantity: dto.minQuantity,
+            maxQuantity: dto.maxQuantity,
+            targetQuantity: dto.targetQuantity,
+            priority: dto.priority ?? 100,
+            metadata: dto.metadata ?? undefined,
+          },
+        });
 
-    await this.writeAudit(
-      actor,
-      warehouse.id,
-      'replenishment.rule_created',
-      'replenishment_rule',
-      rule.id,
-      {
-        code: rule.code,
-        skuId: sku.id,
-        pickLocationId: pickLocation.id,
-      },
-    );
-
-    return toRuleResponse(rule);
+        await tx.auditLog.create({
+          data: {
+            actorUserId: actor.id,
+            warehouseId: warehouse.id,
+            action: 'replenishment.rule_created',
+            resourceType: 'replenishment_rule',
+            resourceId: rule.id,
+            metadata: { code: rule.code, skuId: sku.id, pickLocationId: pickLocation.id },
+          },
+        });
+        return toRuleResponse(rule);
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        throw new ConflictException('A replenishment rule with this code already exists in the warehouse');
+      }
+      throw error;
+    }
   }
 
   async evaluate(
@@ -95,12 +103,14 @@ export class ReplenishmentService {
         where: {
           warehouseId: warehouse.id,
           status: ReplenishmentRuleStatus.ACTIVE,
-          ...(dto.ruleReference
-            ? { OR: [{ id: dto.ruleReference }, { code: normalizeCode(dto.ruleReference) }] }
-            : {}),
+          ...(dto.ruleReference ? referenceWhere(dto.ruleReference) : {}),
         },
         orderBy: [{ priority: 'asc' }, { code: 'asc' }],
       });
+
+      if (dto.ruleReference && rules.length === 0) {
+        throw new NotFoundException('Active replenishment rule was not found');
+      }
 
       let demandsCreated = 0;
       let tasksCreated = 0;
@@ -108,6 +118,7 @@ export class ReplenishmentService {
       const demands: ReplenishmentDemandResponse[] = [];
 
       for (const rule of rules) {
+        await lockPostgresRowById(tx, 'replenishment_rules', rule.id);
         const openDemand = await tx.replenishmentDemand.findFirst({
           where: {
             ruleId: rule.id,
@@ -118,12 +129,28 @@ export class ReplenishmentService {
         });
 
         if (openDemand) {
-          skippedRules.push({ ruleId: rule.id, reason: 'OPEN_DEMAND_EXISTS' });
-          continue;
+          const previousTask = openDemand.warehouseTaskId
+            ? await tx.warehouseTask.findFirst({
+                where: { id: openDemand.warehouseTaskId, warehouseId: warehouse.id },
+              })
+            : null;
+          if (previousTask?.status !== 'CANCELLED' && previousTask?.status !== 'FAILED') {
+            skippedRules.push({ ruleId: rule.id, reason: 'OPEN_DEMAND_EXISTS' });
+            continue;
+          }
+          await tx.replenishmentDemand.update({
+            where: { id: openDemand.id },
+            data: { status: ReplenishmentDemandStatus.CANCELLED },
+          });
         }
 
         const pickQuants = await tx.stockQuant.findMany({
-          where: { warehouseId: warehouse.id, skuId: rule.skuId, locationId: rule.pickLocationId },
+          where: {
+            warehouseId: warehouse.id,
+            skuId: rule.skuId,
+            locationId: rule.pickLocationId,
+            status: 'AVAILABLE',
+          },
         });
         const availablePickQuantity = pickQuants.reduce(
           (sum, quant) => sum + getAvailableQuantity(quant.quantity, quant.reservedQuantity),
@@ -176,6 +203,7 @@ export class ReplenishmentService {
         const task = await tx.warehouseTask.create({
           data: {
             warehouseId: warehouse.id,
+            ownerClientId: sourceQuant.ownerClientId,
             type: 'REPLENISH',
             status: 'OPEN',
             skuId: rule.skuId,
@@ -266,33 +294,54 @@ export class ReplenishmentService {
     actor: AuthenticatedUser,
   ): Promise<ReplenishmentConfirmationResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
+    if (!isUuid(taskReference)) {
+      throw new NotFoundException('Replenishment demand was not found');
+    }
 
     return this.transaction(async (tx: ReplenishmentTransactionClient) => {
-      const demand = await tx.replenishmentDemand.findFirst({
+      const candidate = await tx.replenishmentDemand.findFirst({
         where: {
           warehouseId: warehouse.id,
           OR: [{ id: taskReference }, { warehouseTaskId: taskReference }],
         },
       });
 
-      if (!demand) {
+      if (!candidate) {
         throw new NotFoundException('Replenishment demand was not found');
       }
 
-      if (demand.status === ReplenishmentDemandStatus.COMPLETED) {
-        throw new ConflictException('Replenishment demand is already completed');
+      if (!candidate.warehouseTaskId) {
+        throw new ConflictException('Replenishment demand is missing its task');
+      }
+      await lockPostgresRowById(tx, 'warehouse_tasks', candidate.warehouseTaskId);
+
+      const demand = await tx.replenishmentDemand.findFirst({
+        where: { id: candidate.id, warehouseId: warehouse.id },
+      });
+      const task = await tx.warehouseTask.findFirst({
+        where: { id: candidate.warehouseTaskId, warehouseId: warehouse.id },
+      });
+      if (!demand || !task) {
+        throw new NotFoundException('Replenishment demand or task was not found');
+      }
+      if (demand.status !== ReplenishmentDemandStatus.TASK_CREATED ||
+          task.type !== 'REPLENISH' || !['OPEN', 'ASSIGNED', 'IN_PROGRESS'].includes(task.status)) {
+        throw new ConflictException('Replenishment task cannot be confirmed in its current state');
+      }
+      if (!demand.stockQuantId || !demand.sourceLocationId) {
+        throw new ConflictException('Replenishment demand is missing source stock');
       }
 
-      if (!demand.stockQuantId || !demand.sourceLocationId || !demand.warehouseTaskId) {
-        throw new ConflictException('Replenishment demand is missing source stock or task context');
-      }
-
-      await lockPostgresRowById(tx, 'warehouse_tasks', demand.warehouseTaskId);
       await lockPostgresRowById(tx, 'stock_quants', demand.stockQuantId);
-      const sourceQuant = await tx.stockQuant.findFirst({ where: { id: demand.stockQuantId } });
+      const sourceQuant = await tx.stockQuant.findFirst({ where: { id: demand.stockQuantId, warehouseId: warehouse.id } });
 
       if (!sourceQuant) {
         throw new NotFoundException('Source stock quant was not found');
+      }
+      if (sourceQuant.skuId !== demand.skuId || sourceQuant.locationId !== demand.sourceLocationId ||
+          sourceQuant.status !== 'AVAILABLE' || sourceQuant.handlingUnitId ||
+          sourceQuant.locationId === demand.pickLocationId) {
+        throw new ConflictException('Source stock is no longer eligible for this replenishment task');
       }
 
       await assertNoBlockingStockFreeze(tx, {
@@ -318,6 +367,7 @@ export class ReplenishmentService {
 
       if (
         movedQuantity <= 0 ||
+        movedQuantity > demand.requiredQuantity ||
         movedQuantity > getAvailableQuantity(sourceQuant.quantity, sourceQuant.reservedQuantity)
       ) {
         throw new ConflictException('Invalid replenishment move quantity');
@@ -327,41 +377,40 @@ export class ReplenishmentService {
         where: { id: sourceQuant.id },
         data: { quantity: { decrement: movedQuantity }, version: { increment: 1 } },
       });
-      const destinationQuant = await tx.stockQuant.findFirst({
-        where: {
-          warehouseId: warehouse.id,
-          skuId: demand.skuId,
-          locationId: demand.pickLocationId,
-          status: 'AVAILABLE',
-          handlingUnitId: null,
-        },
-      });
-
-      if (destinationQuant) {
-        await tx.stockQuant.update({
-          where: { id: destinationQuant.id },
-          data: { quantity: { increment: movedQuantity }, version: { increment: 1 } },
-        });
-      } else {
-        await tx.stockQuant.create({
-          data: {
-            warehouseId: warehouse.id,
-            skuId: demand.skuId,
-            locationId: demand.pickLocationId,
-            quantity: movedQuantity,
-            reservedQuantity: 0,
-            status: 'AVAILABLE',
-            metadata: { source: 'replenishment', demandId: demand.id },
-          },
-        });
-      }
+      const destinationIdentity = {
+        warehouseId: warehouse.id,
+        skuId: demand.skuId,
+        locationId: demand.pickLocationId,
+        status: 'AVAILABLE',
+        ownerClientId: sourceQuant.ownerClientId,
+        lotId: sourceQuant.lotId,
+        batch: sourceQuant.batch,
+        handlingUnitId: null,
+        expiryDate: sourceQuant.expiryDate,
+      };
+      await lockStockQuantIdentity(tx, { ...destinationIdentity, expiry: sourceQuant.expiryDate });
+      const existing = await tx.stockQuant.findFirst({ where: destinationIdentity });
+      const destinationQuant = existing
+        ? await tx.stockQuant.update({
+            where: { id: existing.id },
+            data: { quantity: { increment: movedQuantity }, version: { increment: 1 } },
+          })
+        : await tx.stockQuant.create({
+            data: {
+              ...destinationIdentity,
+              quantity: movedQuantity,
+              reservedQuantity: 0,
+              metadata: { source: 'replenishment', demandId: demand.id },
+            },
+          });
 
       const movement = await tx.stockMovement.create({
         data: {
           warehouseId: warehouse.id,
+          ownerClientId: sourceQuant.ownerClientId,
           skuId: demand.skuId,
-          stockQuantId: sourceQuant.id,
-          taskId: demand.warehouseTaskId,
+          stockQuantId: destinationQuant.id,
+          taskId: task.id,
           actorUserId: actor.id,
           type: 'MOVE',
           quantity: movedQuantity,
@@ -372,13 +421,19 @@ export class ReplenishmentService {
           metadata: {
             source: 'replenishment',
             demandId: demand.id,
+            sourceStockQuantId: sourceQuant.id,
             confirmMetadata: dto.metadata ?? null,
           },
         },
       });
       await tx.warehouseTask.update({
-        where: { id: demand.warehouseTaskId },
-        data: { status: 'DONE', completedAt: new Date(), version: { increment: 1 } },
+        where: { id: task.id },
+        data: {
+          status: 'DONE',
+          quantity: movedQuantity,
+          completedAt: new Date(),
+          version: { increment: 1 },
+        },
       });
       const updatedDemand = await tx.replenishmentDemand.update({
         where: { id: demand.id },
@@ -422,6 +477,7 @@ export class ReplenishmentService {
         warehouseId,
         skuId: rule.skuId,
         status: 'AVAILABLE',
+        handlingUnitId: null,
         locationId: { not: rule.pickLocationId },
         ...(rule.sourceZone ? { location: { is: { zone: rule.sourceZone } } } : {}),
       },
@@ -438,7 +494,7 @@ export class ReplenishmentService {
   }
 
   private async resolveWarehouse(reference: string): Promise<WarehouseRecord> {
-    const warehouse = await this.client.warehouse.findFirst({ where: warehouseWhere(reference) });
+    const warehouse = await this.client.warehouse.findFirst({ where: referenceWhere(reference) });
 
     if (!warehouse) {
       throw new NotFoundException('Warehouse was not found');
@@ -448,9 +504,14 @@ export class ReplenishmentService {
   }
 
   private async resolveSku(reference: string): Promise<SkuRecord> {
+    const normalized = reference.trim();
     const sku = await this.client.sku.findFirst({
       where: {
-        OR: [{ id: reference }, { code: normalizeCode(reference) }, { barcode: reference.trim() }],
+        OR: [
+          ...(isUuid(normalized) ? [{ id: normalized }] : []),
+          { code: normalizeCode(normalized) },
+          { barcode: normalized },
+        ],
       },
     });
 
@@ -462,13 +523,14 @@ export class ReplenishmentService {
   }
 
   private async resolveLocation(warehouseId: string, reference: string): Promise<LocationRecord> {
+    const normalized = reference.trim();
     const location = await this.client.warehouseLocation.findFirst({
       where: {
         warehouseId,
         OR: [
-          { id: reference },
-          { code: normalizeCode(reference) },
-          { barcode: normalizeCode(reference) },
+          ...(isUuid(normalized) ? [{ id: normalized }] : []),
+          { code: normalizeCode(normalized) },
+          { barcode: normalizeCode(normalized) },
         ],
       },
     });
@@ -479,20 +541,6 @@ export class ReplenishmentService {
 
     return location;
   }
-
-  private async writeAudit(
-    actor: AuthenticatedUser,
-    warehouseId: string,
-    action: string,
-    resourceType: string,
-    resourceId: string,
-    metadata: Record<string, unknown>,
-  ): Promise<void> {
-    await this.client.auditLog.create({
-      data: { actorUserId: actor.id, warehouseId, action, resourceType, resourceId, metadata },
-    });
-  }
-
 
   private transaction<T>(
     fn: (client: ReplenishmentTransactionClient) => Promise<T>,
@@ -541,10 +589,11 @@ function toDemandResponse(demand: ReplenishmentDemandRecord): ReplenishmentDeman
   };
 }
 
-function warehouseWhere(reference: string): Record<string, unknown> {
-  return isUuid(reference)
-    ? { OR: [{ id: reference }, { code: normalizeCode(reference) }] }
-    : { code: normalizeCode(reference) };
+function referenceWhere(reference: string): Record<string, unknown> {
+  const normalized = reference.trim();
+  return isUuid(normalized)
+    ? { OR: [{ id: normalized }, { code: normalizeCode(normalized) }] }
+    : { code: normalizeCode(normalized) };
 }
 
 function normalizeCode(value: string): string {
@@ -601,6 +650,7 @@ interface ReplenishmentTransactionClient {
   };
   warehouseTask: {
     create(args: Record<string, unknown>): Promise<{ id: string }>;
+    findFirst(args: Record<string, unknown>): Promise<{ id: string; status: string; type: string } | null>;
     update(args: Record<string, unknown>): Promise<unknown>;
   };
   stockMovement: { create(args: Record<string, unknown>): Promise<{ id: string }> };
@@ -631,6 +681,11 @@ interface StockQuantRecord {
   quantity: number;
   reservedQuantity: number;
   status: string;
+  ownerClientId: string | null;
+  lotId: string | null;
+  batch: string | null;
+  expiryDate: Date | null;
+  handlingUnitId: string | null;
 }
 
 interface ReplenishmentRuleRecord {

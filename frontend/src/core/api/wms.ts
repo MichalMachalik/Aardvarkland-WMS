@@ -29,6 +29,7 @@ export const endpoints = {
   putawaySuggest: (warehouseId: string) => `/warehouses/${warehouseId}/putaway/suggest`,
   putawayTasks: (warehouseId: string) => `/warehouses/${warehouseId}/putaway/tasks`,
   putawayConfirmTask: (warehouseId: string, taskId: string) => `/warehouses/${warehouseId}/putaway/tasks/${taskId}/confirm`,
+  replenishmentConfirmTask: (warehouseId: string, taskId: string) => `/warehouses/${warehouseId}/replenishment/tasks/${taskId}/confirm`,
   returns: (warehouseId: string) => `/warehouses/${warehouseId}/returns`,
   returnLineReceive: (warehouseId: string, returnId: string, lineId: string) => `/warehouses/${warehouseId}/returns/${returnId}/lines/${lineId}/receive`,
   returnLineInspect: (warehouseId: string, returnId: string, lineId: string) => `/warehouses/${warehouseId}/returns/${returnId}/lines/${lineId}/inspect`,
@@ -176,6 +177,9 @@ export function createPutawayTask<T>(warehouseId: string, body: MutationBody) { 
 export function confirmPutawayTask<T>(warehouseId: string, taskId: string, body: MutationBody) {
   const idempotencyKey = String(body.idempotencyKey ?? `putaway-confirm-${taskId}`);
   return post<T>(endpoints.putawayConfirmTask(warehouseId, taskId), { ...body, idempotencyKey }, idempotencyKey);
+}
+export function confirmReplenishmentTask<T>(warehouseId: string, taskId: string) {
+  return post<T>(endpoints.replenishmentConfirmTask(warehouseId, taskId), {}, `replenishment-confirm-${taskId}`);
 }
 export function listReturns<T>(warehouseId: string, options?: ReadOptions) { return get<T>(endpoints.returns(warehouseId), undefined, options); }
 export function createReturn<T>(warehouseId: string, body: MutationBody) { return post<T>(endpoints.returns(warehouseId), body, `return-${String(body.rmaNumber ?? createWmsIdempotencyKey('return'))}`); }

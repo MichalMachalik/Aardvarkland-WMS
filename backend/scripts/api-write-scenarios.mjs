@@ -218,6 +218,75 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.equal((await own('GET', `/tasks/${next.task.id}`)).status, 'OPEN');
   });
 
+  await scenario('replenishment issues one demand and preserves stock identities during confirmation', async () => {
+    const { sku } = await createSku('REPLENISH');
+    const zone = `REPL-${suffix}`;
+    const bulk = await own('POST', '/locations', {
+      code: `BULK-${suffix}`, zone, name: 'Replenishment bulk stock', type: 'STORAGE', parentReference: 'A-01',
+    });
+    const face = await own('POST', '/locations', {
+      code: `FACE-${suffix}`, name: 'Replenishment pick face', type: 'PICKING', parentReference: 'A-01',
+    });
+    const receive = (locationReference, batch, quantity) => own('POST', '/inventory/quants/receive', {
+      skuReference: sku.code, locationReference, batch, quantity,
+    });
+    const { quant: source } = await receive(bulk.code, 'BULK-BATCH', 16);
+    const { quant: existing } = await receive(face.code, 'OTHER-BATCH', 2);
+    const ruleBody = {
+      code: zone, sku: sku.code.toLowerCase(), pickLocationReference: face.code,
+      sourceZone: zone.toLowerCase(), minQuantity: 4, maxQuantity: 10, targetQuantity: 8,
+    };
+    await own('POST', '/replenishment/rules', { ...ruleBody, targetQuantity: 11 }, 409);
+    await own('POST', '/replenishment/rules', { ...ruleBody, sku: `MISSING-${suffix}` }, 404);
+    const rule = await own('POST', '/replenishment/rules', ruleBody);
+    assert.equal(rule.skuId, sku.id);
+    assert.equal(rule.pickLocationId, face.id);
+    await own('POST', '/replenishment/rules', ruleBody, 409);
+    const evaluate = (ruleReference = rule.code) => own('POST', '/replenishment/evaluate', { ruleReference });
+    await own('POST', '/replenishment/evaluate', { ruleReference: `MISSING-${suffix}` }, 404);
+
+    const evaluations = await Promise.all([evaluate(), evaluate(rule.id)]);
+    const demands = evaluations.flatMap(result => result.demands);
+    assert.equal(demands.length, 1);
+    const [cancelled] = demands;
+    await own('POST', `/tasks/${cancelled.warehouseTaskId}/cancel`, { reason: 'Replan test demand' });
+    await own('POST', `/replenishment/tasks/${cancelled.id}/confirm`, {}, 409);
+    const { demands: replacements } = await evaluate();
+    assert.equal(replacements.length, 1);
+    const [demand] = replacements;
+    assert.notEqual(demand.id, cancelled.id);
+    assert.equal(demand.availablePickQuantity, 2);
+    assert.equal(demand.requiredQuantity, 6);
+    assert.equal(demand.stockQuantId, source.id);
+    const taskPath = `/tasks/${demand.warehouseTaskId}`;
+    await own('POST', taskPath + '/start', {});
+    await own('POST', taskPath + '/confirm', {}, 409);
+    const confirm = `/replenishment/tasks/${demand.warehouseTaskId}/confirm`;
+    await asWorker('POST', warehouse + confirm, {}, 403);
+    await own('POST', confirm, { quantity: 7 }, 409);
+    await own('POST', '/replenishment/tasks/unknown/confirm', {}, 404);
+
+    const confirmations = await Promise.all([
+      own('POST', confirm, {}, [201, 409]),
+      own('POST', `/replenishment/tasks/${demand.id}/confirm`, {}, [201, 409]),
+    ]);
+    const recorded = confirmations.filter(result => result.movementId);
+    assert.equal(recorded.length, 1);
+    assert.equal(recorded[0].movedQuantity, 6);
+    assert.equal(recorded[0].demand.status, 'COMPLETED');
+    const savedTask = await own('GET', taskPath);
+    assert.equal(savedTask.status, 'DONE');
+    assert.equal((await own('GET', `/inventory/quants/${source.id}`)).quantity, 10);
+    assert.equal((await own('GET', `/inventory/quants/${existing.id}`)).quantity, 2);
+    const movements = await prisma.stockMovement.findMany({ where: { taskId: savedTask.id } });
+    assert.equal(movements.length, 1);
+    const target = await own('GET', `/inventory/quants/${movements[0].stockQuantId}`);
+    assert.equal(target.quantity, 6);
+    assert.equal(target.batch, source.batch);
+    assert.equal(target.location.id, face.id);
+    assert.equal((await evaluate()).demandsCreated, 0);
+  });
+
   await scenario('inbound shipment changes roll back when any line is invalid', async () => {
     const { sku } = await createSku('INBOUND');
     const shipment = await own('POST', '/inbound-shipments', {

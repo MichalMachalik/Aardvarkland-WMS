@@ -12,7 +12,10 @@ import { SegmentedControl } from '../../components/ui/SegmentedControl';
 import { useWorkspace, type Language } from '../../core/workspace/workspace';
 import { useApiMutation } from '../../core/api/useApiMutation';
 import { useApiResource } from '../../core/api/useApiResource';
-import { claimNextWarehouseTask, confirmPickTask, confirmPutawayTask, confirmWarehouseTask, listTasks, startWarehouseTask } from '../../core/api/wms';
+import {
+  claimNextWarehouseTask, confirmPickTask, confirmPutawayTask, confirmReplenishmentTask,
+  confirmWarehouseTask, listTasks, startWarehouseTask,
+} from '../../core/api/wms';
 import { mapWarehouseTasks } from '../../core/api/view-models';
 import type { WarehouseTask } from '../../core/types/wms';
 
@@ -36,7 +39,7 @@ function taskTypeLabel(type: WarehouseTask['type'], language: Language) {
 }
 
 export function TasksPage() {
-  const { warehouseId, language } = useWorkspace();
+  const { warehouseId, language, can } = useWorkspace();
   const text = pickLanguage(language, { cs: czech, en: english, ua: ukrainian });
   const resource = useApiResource({ fallback: emptyTasks, productionFallback: emptyTasks, loader: () => listTasks<unknown[]>(warehouseId), map: mapWarehouseTasks, dependencies: [warehouseId] });
   const mutation = useApiMutation();
@@ -51,7 +54,8 @@ export function TasksPage() {
   }, [filter, sourceRows]);
   const selected = rows.find((task) => task.id === selectedId) ?? rows[0];
   const canStart = selected && ['OPEN', 'ASSIGNED', 'BLOCKED'].includes(selected.apiStatus ?? '');
-  const canConfirm = selected?.apiStatus === 'IN_PROGRESS';
+  const canConfirm = selected?.apiStatus === 'IN_PROGRESS'
+    && (selected.type !== 'Replenishment' || can('replenishment.manage'));
 
   const columns: Column<WarehouseTask>[] = [
     { key: 'select', label: '', render: (row) => <input type="radio" name="task" data-e2e-row="task" data-e2e-value={row.id} checked={selected?.id === row.id} onChange={() => setSelectedId(row.id)} /> },
@@ -77,6 +81,7 @@ export function TasksPage() {
   const startSelected = () => selected && void mutation.run(text.actions.start, () => startWarehouseTask(warehouseId, selected.id)).then(refreshOnSuccess);
   const confirmSelected = () => selected && void mutation.run(text.actions.confirm, () => {
     if (selected.type === 'Putaway') return confirmPutawayTask(warehouseId, selected.id, {});
+    if (selected.type === 'Replenishment') return confirmReplenishmentTask(warehouseId, selected.id);
     if (selected.type === 'Pick') return confirmPickTask(warehouseId, selected.id, {});
     return confirmWarehouseTask(warehouseId, selected.id);
   }).then(refreshOnSuccess);
