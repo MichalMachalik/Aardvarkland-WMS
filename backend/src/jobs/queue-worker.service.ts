@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 
+import { captureDailyStorageOccupancy } from '../clients/storage-occupancy';
 import { PrismaService } from '../database';
 import { RuntimeMetricsService } from '../observability';
 import { OutboxService } from '../outbox';
@@ -31,6 +32,7 @@ export class QueueWorkerService {
   private heartbeatTableReady = false;
   private lastRetentionCleanupAt = 0;
   private lastAlertDeliveryAt = 0;
+  private lastStorageCaptureAt = 0;
 
   constructor(
     private readonly outbox: OutboxService,
@@ -92,6 +94,7 @@ export class QueueWorkerService {
     try {
       while (this.running) {
         cycles += 1;
+        if (!input.dryRun) await this.captureStorageIfDue();
         try {
           const result = await this.runOnce(input);
           this.logger.log(
@@ -118,6 +121,17 @@ export class QueueWorkerService {
 
   stop(): void {
     this.running = false;
+  }
+
+  private async captureStorageIfDue(): Promise<void> {
+    const now = Date.now();
+    if (this.lastStorageCaptureAt && now - this.lastStorageCaptureAt < 60_000) return;
+    this.lastStorageCaptureAt = now;
+    try {
+      await captureDailyStorageOccupancy(this.prisma);
+    } catch (error: unknown) {
+      this.logger.error(`Storage occupancy capture failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   private async recordWorkerHeartbeat(stage: string, metadata: Record<string, unknown> = {}): Promise<void> {

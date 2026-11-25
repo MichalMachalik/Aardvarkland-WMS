@@ -1,6 +1,6 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
-import { IsArray, IsBoolean, IsDateString, IsIn, IsInt, IsObject, IsOptional, IsString, Max, MaxLength, Min } from 'class-validator';
+import { IsArray, IsBoolean, IsDateString, IsIn, IsInt, IsObject, IsOptional, IsString, Matches, Max, MaxLength, Min } from 'class-validator';
 
 import { BillingEventStatus } from '../clients.types';
 
@@ -19,6 +19,12 @@ export class CreateBillingInvoiceDto {
   @MaxLength(120)
   invoiceNumber?: string;
 
+  @ApiPropertyOptional({ example: 'CZK', description: 'Select billable events in this currency for the invoice.' })
+  @IsOptional()
+  @IsString()
+  @Matches(/^[A-Za-z]{3}$/)
+  currency?: string;
+
   @ApiPropertyOptional({ enum: BillingEventStatus, isArray: true, default: [BillingEventStatus.BILLABLE] })
   @IsOptional()
   @IsArray()
@@ -36,7 +42,6 @@ export class CreateBillingInvoiceDto {
 
   @ApiPropertyOptional({ example: false })
   @IsOptional()
-  @Type(() => Boolean)
   @IsBoolean()
   finalize?: boolean;
 

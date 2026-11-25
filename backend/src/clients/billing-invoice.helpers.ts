@@ -82,33 +82,6 @@ export interface InvoiceNumberSequenceState {
   nextNumber: number;
 }
 
-export interface StorageBillingStockSnapshot {
-  stockQuantId: string;
-  skuCode: string;
-  quantity: number;
-  ownedFrom: Date | string;
-  ownedTo?: Date | string | null;
-  locationCode?: string | null;
-}
-
-export interface StorageBillingEventDraft {
-  eventType: 'STORAGE_DAY';
-  quantity: number;
-  unitPriceMinor: number;
-  amountMinor: number;
-  vatRateBps: number | null;
-  netAmountMinor: number;
-  taxAmountMinor: number;
-  grossAmountMinor: number;
-  currency: string;
-  reference: string;
-  resourceType: 'STOCK_QUANT';
-  resourceId: string;
-  description: string;
-  occurredAt: Date;
-  metadata: Record<string, unknown>;
-}
-
 export function normalizeBillingPeriod(input: {
   periodStart: Date | string;
   periodEnd: Date | string;
@@ -377,79 +350,6 @@ export function exportCreditNoteCsv(input: {
   return [header, ...rows].map((row) => row.map(csvEscape).join(',')).join('\n');
 }
 
-export function buildStorageDayBillingEvents(input: {
-  clientCode: string;
-  warehouseId: string;
-  currency: string;
-  periodStart: Date | string;
-  periodEnd: Date | string;
-  unitPriceMinorPerUnitDay: number;
-  snapshots: StorageBillingStockSnapshot[];
-}): StorageBillingEventDraft[] {
-  const period = normalizeBillingPeriod({
-    periodStart: input.periodStart,
-    periodEnd: input.periodEnd,
-  });
-  const unitPriceMinor = Math.max(0, Math.trunc(input.unitPriceMinorPerUnitDay));
-  return input.snapshots
-    .map((snapshot) => {
-      const quantity = Math.max(0, Math.trunc(snapshot.quantity));
-      const chargeableDays = calculateChargeableDays({
-        periodStart: period.periodStart,
-        periodEnd: period.periodEnd,
-        ownedFrom: snapshot.ownedFrom,
-        ownedTo: snapshot.ownedTo,
-      });
-      const billedUnits = quantity * chargeableDays;
-      const amountMinor = billedUnits * unitPriceMinor;
-      const tax = calculateTaxAmounts(amountMinor);
-      return {
-        eventType: 'STORAGE_DAY' as const,
-        quantity: billedUnits,
-        unitPriceMinor,
-        amountMinor,
-        ...tax,
-        currency: input.currency,
-        reference: makeStorageBillingReference({
-          clientCode: input.clientCode,
-          warehouseId: input.warehouseId,
-          stockQuantId: snapshot.stockQuantId,
-          periodStart: period.periodStart,
-          periodEnd: period.periodEnd,
-        }),
-        resourceType: 'STOCK_QUANT' as const,
-        resourceId: snapshot.stockQuantId,
-        description: `Storage days for ${snapshot.skuCode}`,
-        occurredAt: period.periodEnd,
-        metadata: {
-          skuCode: snapshot.skuCode,
-          locationCode: snapshot.locationCode ?? null,
-          stockQuantity: quantity,
-          chargeableDays,
-          periodStart: period.periodStart.toISOString(),
-          periodEnd: period.periodEnd.toISOString(),
-        },
-      };
-    })
-    .filter((event) => event.quantity > 0 && event.amountMinor > 0);
-}
-
-export function calculateChargeableDays(input: {
-  periodStart: Date | string;
-  periodEnd: Date | string;
-  ownedFrom: Date | string;
-  ownedTo?: Date | string | null;
-}): number {
-  const periodStart = startOfUtcDay(new Date(input.periodStart));
-  const periodEnd = startOfUtcDay(new Date(input.periodEnd));
-  const ownedFrom = startOfUtcDay(new Date(input.ownedFrom));
-  const ownedTo = input.ownedTo ? startOfUtcDay(new Date(input.ownedTo)) : periodEnd;
-  const from = ownedFrom > periodStart ? ownedFrom : periodStart;
-  const to = ownedTo < periodEnd ? ownedTo : periodEnd;
-  if (to <= from) return 0;
-  return Math.ceil((to.getTime() - from.getTime()) / MS_PER_DAY);
-}
-
 export function invoiceEventStatusFilter(statuses?: string[] | null): string[] {
   const allowed = new Set(Object.values(BillingEventStatus));
   const normalized = (statuses ?? [BillingEventStatus.BILLABLE])
@@ -539,23 +439,6 @@ export function buildInvoiceVoidReinvoicePlan(lines: Array<{ billingEventId?: st
 function normalizeVatRateBps(value: number | null | undefined): number | null {
   if (value === null || value === undefined) return null;
   return Math.min(10_000, Math.max(0, Math.trunc(value)));
-}
-
-function makeStorageBillingReference(input: {
-  clientCode: string;
-  warehouseId: string;
-  stockQuantId: string;
-  periodStart: Date;
-  periodEnd: Date;
-}): string {
-  const seed = [
-    input.clientCode,
-    input.warehouseId,
-    input.stockQuantId,
-    yyyymmdd(input.periodStart),
-    yyyymmdd(input.periodEnd),
-  ].join(':');
-  return `STOR-${normalizeInvoiceToken(input.clientCode)}-${yyyymmdd(input.periodStart)}-${shortHash(seed)}`;
 }
 
 function normalizeInvoiceToken(value: string): string {

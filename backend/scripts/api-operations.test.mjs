@@ -31,6 +31,7 @@ test('OpenAPI operations on a disposable PostgreSQL database', { timeout: 180000
   });
   const { createWmsApp } = await import('../dist/bootstrap.js');
   const { PrismaService } = await import('../dist/database/prisma.service.js');
+  const { QueueWorkerService } = await import('../dist/jobs/queue-worker.service.js');
   const app = await createWmsApp({ enableSwagger: false });
   suite.after(() => app.close());
   app.useLogger(['error', 'warn']);
@@ -202,6 +203,10 @@ test('OpenAPI operations on a disposable PostgreSQL database', { timeout: 180000
     request,
     login,
     prisma: app.get(PrismaService),
+    runQueueCycle: () => app.get(QueueWorkerService).runLoop({
+      stopAfterCycles: 1,
+      eventType: 'STORAGE_OCCUPANCY_FIXTURE',
+    }),
   });
 
   await suite.test('the OpenAPI operation inventory is fully accounted for', () => {

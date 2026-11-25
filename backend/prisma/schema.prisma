@@ -627,6 +627,7 @@ model WmsClient {
   ownedWarehouseOrderTasks WarehouseOrderTask[]       @relation("WarehouseOrderTaskOwnerClient")
   periodCloses             BillingPeriodClose[]
   storageSnapshots         StorageOccupancySnapshot[]
+  storageCaptures          StorageOccupancyCapture[]
   invoiceSequences         InvoiceNumberSequence[]
   rateCards                ClientRateCard[]
   userAccess               UserClientAccess[]
@@ -782,6 +783,18 @@ model StorageOccupancySnapshot {
   @@unique([warehouseId, clientId, skuId, locationId, stockQuantId, snapshotDate])
   @@index([warehouseId, clientId, snapshotDate])
   @@map("storage_occupancy_snapshots")
+}
+
+model StorageOccupancyCapture {
+  warehouseId String    @map("warehouse_id") @db.Uuid
+  clientId    String    @map("client_id") @db.Uuid
+  snapshotDate DateTime @map("snapshot_date") @db.Date
+  capturedAt   DateTime @default(now()) @map("captured_at") @db.Timestamptz(3)
+  warehouse    Warehouse @relation(fields: [warehouseId], references: [id], onDelete: Cascade)
+  client       WmsClient @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@id([warehouseId, clientId, snapshotDate])
+  @@map("storage_occupancy_captures")
 }
 
 model BillingPeriodClose {
@@ -985,6 +998,7 @@ model Warehouse {
   rateCards               ClientRateCard[]
   invoiceSequences        InvoiceNumberSequence[]
   storageSnapshots        StorageOccupancySnapshot[]
+  storageCaptures         StorageOccupancyCapture[]
   periodCloses            BillingPeriodClose[]
   auditLogs               AuditLog[]
   createdAt               DateTime                   @default(now()) @map("created_at")

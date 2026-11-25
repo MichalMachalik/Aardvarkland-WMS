@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 
 const warehouse = '/api/warehouses/MAIN';
 
-export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, bind, request, login, prisma }) {
+export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, bind, request, login, prisma, runQueueCycle }) {
   const suffix = randomUUID().slice(0, 8).toUpperCase();
   const own = (method, path, ...args) => asAdmin(method, warehouse + path, ...args);
   let scenarios = 0;
@@ -1165,6 +1165,100 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.equal(await owner(), other.id);
     assert.deepEqual(await own('GET', linkPath), []);
     assert.equal((await own('GET', otherLink))[0].id, link.id);
+  });
+
+  await scenario('storage billing uses daily captures and bills overlapping periods once', async () => {
+    const { sku } = await createSku('STORAGE-FEE');
+    const client = await asAdmin('POST', '/api/clients', { code: `STORAGE-${suffix}`, name: 'Storage fee fixture' });
+    const empty = await asAdmin('POST', '/api/clients', { code: `STORAGE-EMPTY-${suffix}`, name: 'Empty storage fixture' });
+    const path = `/clients/${client.code}`;
+    const { warehouseId } = await own('POST', path + '/attach', {});
+    await own('POST', `/clients/${empty.code}/attach`, {});
+    const { quant } = await own('POST', '/inventory/quants/receive', {
+      skuReference: sku.code, locationReference: 'A-01-01', quantity: 9, ownerClientReference: client.code,
+    });
+    const utcDay = offset => {
+      const date = new Date();
+      date.setUTCHours(0, 0, 0, 0);
+      date.setUTCDate(date.getUTCDate() + offset);
+      return date;
+    };
+    const days = [-3, -2, -1, 0, 1].map(utcDay);
+    const [first, second, third, today, tomorrow] = days;
+    const scope = { warehouseId, clientId: client.id };
+    const generate = path + '/billing-events/storage-days/generate';
+    const period = (start, end, input = {}) => ({ periodStart: start.toISOString(), periodEnd: end.toISOString(), ...input });
+    await own('POST', generate, period(first, third, { unitPriceMinorPerUnitDay: 5 }), 409);
+    await own('POST', generate, period(today, tomorrow, { unitPriceMinorPerUnitDay: 5 }), 400);
+
+    await runQueueCycle();
+    const capturedToday = await prisma.storageOccupancyCapture.findFirstOrThrow({ where: { ...scope, snapshotDate: today } });
+    assert.ok(capturedToday.capturedAt >= today);
+    assert.equal((await prisma.storageOccupancySnapshot.findFirstOrThrow({
+      where: { ...scope, snapshotDate: today, stockQuantId: quant.id },
+    })).quantity, 9);
+    assert.equal(await prisma.storageOccupancyCapture.count({ where: { warehouseId, clientId: empty.id, snapshotDate: today } }), 1);
+    await prisma.stockQuant.update({ where: { id: quant.id }, data: { quantity: 14 } });
+    const { captureDailyStorageOccupancy } = await import('../dist/clients/storage-occupancy.js');
+    await Promise.all([captureDailyStorageOccupancy(prisma), captureDailyStorageOccupancy(prisma)]);
+    const recaptured = await prisma.storageOccupancySnapshot.findMany({
+      where: { ...scope, snapshotDate: today, stockQuantId: quant.id },
+    });
+    assert.deepEqual(recaptured.map(snapshot => snapshot.quantity), [9]);
+
+    await prisma.storageOccupancyCapture.createMany({
+      data: [first, second, third].map(snapshotDate => ({ ...scope, snapshotDate })),
+    });
+    await prisma.storageOccupancySnapshot.createMany({
+      data: [[first, 3], [second, 6]].map(([snapshotDate, quantity]) => ({
+        ...scope, snapshotDate, quantity, skuId: sku.id, locationId: quant.locationId, stockQuantId: quant.id,
+        metadata: { skuCode: sku.code },
+      })),
+    });
+    await own('POST', path + '/rate-cards', {
+      name: 'First daily rate', currency: 'CZK', validFrom: first, validTo: second,
+      rates: [{ eventType: 'STORAGE_DAY', unit: 'UNIT_DAY', unitPriceMinor: 5 }],
+    });
+    await own('POST', path + '/rate-cards', {
+      name: 'Second daily rate', currency: 'EUR', validFrom: second,
+      rates: [{ eventType: 'STORAGE_DAY', unit: 'UNIT_DAY', unitPriceMinor: 8 }],
+    });
+    const preview = await own('POST', generate, period(first, third, { dryRun: true }));
+    assert.equal(preview.created, 0);
+    assert.deepEqual(preview.events.map(event => [event.quantity, event.amountMinor, event.currency, event.occurredAt]),
+      [[3, 15, 'CZK', first.toISOString()], [6, 48, 'EUR', second.toISOString()]]);
+    const storageEvents = () => prisma.billingEvent.findMany({ where: { ...scope, eventType: 'STORAGE_DAY' } });
+    assert.deepEqual(await storageEvents(), []);
+    const generated = await Promise.all([
+      own('POST', generate, period(first, third)),
+      own('POST', generate, period(first, today)),
+    ]);
+    assert.equal(generated.reduce((sum, result) => sum + result.created, 0), 2);
+    assert.equal(await prisma.outboxEvent.count({ where: { aggregateId: client.id, type: 'STORAGE_DAY_BILLING_GENERATED' } }), 1);
+    const saved = await storageEvents();
+    assert.equal(saved.length, 2);
+    const invoices = path + '/billing-invoices';
+    await own('POST', invoices, period(first, third), 409);
+    await own('POST', invoices, period(first, third, { currency: 'CZK', finalize: 'false' }), 400);
+    const [czk, eur] = await Promise.all([
+      own('POST', invoices, period(first, third, { currency: 'czk' })),
+      own('POST', invoices, period(first, third, { currency: 'EUR' })),
+    ]);
+    assert.deepEqual([czk.currency, czk.subtotalMinor, eur.currency, eur.subtotalMinor], ['CZK', 15, 'EUR', 48]);
+    assert.notEqual(czk.invoiceNumber, eur.invoiceNumber);
+    await own('POST', `${invoices}/${eur.id}/finalize`, {});
+    const replay = await own('POST', generate, period(second, today, { unitPriceMinorPerUnitDay: 99, currency: 'CZK' }));
+    assert.equal(replay.created, 0);
+    assert.deepEqual(replay.events.map(event => [event.quantity, event.amountMinor, event.currency, event.status]), [
+      [6, 48, 'EUR', 'INVOICED'],
+    ]);
+
+    await own('POST', path + '/billing-events', {
+      eventType: 'STORAGE_DAY', status: 'BILLABLE', reference: `STOR-LEGACY-${suffix}`, quantity: 1, unitPriceMinor: 5,
+      occurredAt: today, metadata: period(third, today),
+    });
+    await own('POST', generate, period(third, today), 409);
+    assert.equal((await storageEvents()).length, 3);
   });
 
   await scenario('parcels, tracking, operational exceptions and notifications can be updated', async () => {

@@ -19,6 +19,19 @@ npm run build
 - API prefix: `/api`
 - Health endpoint: `/api/health`
 
+## Storage-day billing
+
+Keep the queue worker running to capture stock for configured clients in each
+warehouse on its first successful check each UTC day. A successful capture also
+records clients with empty stock.
+Billing uses the recorded quantity and the rate for each recorded day. The
+period includes its start date and excludes its end date. A repeated or
+overlapping request keeps the original charges for days already generated.
+Periods with missing captures or charges from overlapping legacy periods need
+review before generation.
+Set the invoice currency when billable events for a period use multiple
+currencies.
+
 ## Hardening
 
 Production/staging runtime validates and uses these backend hardening settings:

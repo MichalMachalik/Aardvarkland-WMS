@@ -4767,7 +4767,7 @@
         },
         "responses": {
           "200": {
-            "description": "Generate storage-day billing events from client-owned stock quants."
+            "description": "Generate storage-day charges from recorded daily occupancy for a completed UTC period."
           }
         },
         "security": [
@@ -17038,6 +17038,11 @@
           "invoiceNumber": {
             "type": "string",
             "example": "INV-CLIENT_A-202605"
+          },
+          "currency": {
+            "type": "string",
+            "example": "CZK",
+            "description": "Select billable events in this currency for the invoice."
           },
           "eventStatuses": {
             "type": "array",

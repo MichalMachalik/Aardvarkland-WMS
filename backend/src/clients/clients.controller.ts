@@ -153,7 +153,7 @@ export class ClientsController {
   }
 
   @RequireWarehousePermissions('billing.manage')
-  @ApiOkResponse({ description: 'Generate storage-day billing events from client-owned stock quants.' })
+  @ApiOkResponse({ description: 'Generate storage-day charges from recorded daily occupancy for a completed UTC period.' })
   @Post('warehouses/:warehouseId/clients/:clientReference/billing-events/storage-days/generate')
   generateStorageDayBilling(
     @Param('warehouseId') warehouseId: string,

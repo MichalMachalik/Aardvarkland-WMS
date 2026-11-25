@@ -5,6 +5,7 @@ import { makePageEnvelope, normalizeOffsetPagination, PageEnvelope } from '../co
 import {
   lockPostgresAdvisoryTransaction, lockPostgresRowById, lockPostgresRowsById, PrismaService, withTransactionRetry,
 } from '../database';
+import { Prisma } from '../generated/prisma/client';
 import { AttachClientWarehouseDto } from './dto/attach-client-warehouse.dto';
 import { ListBillingCreditNotesQueryDto } from './dto/list-billing-credit-notes-query.dto';
 import { FinalizeBillingCreditNoteDto } from './dto/finalize-billing-credit-note.dto';
@@ -31,7 +32,6 @@ import {
   buildCreditNoteLines,
   buildInvoiceLines,
   buildInvoiceVoidReinvoicePlan,
-  buildStorageDayBillingEvents,
   exportCreditNoteCsv,
   exportInvoiceCsv,
   invoiceEventStatusFilter,
@@ -57,7 +57,6 @@ import {
 import {
   BillingEventResponse,
   BillingEventStatus,
-  BillingEventType,
   BillingCreditNoteExportResponse,
   BillingCreditNotePdfExportResponse,
   BillingCreditNoteLineResponse,
@@ -633,130 +632,122 @@ export class ClientsService {
     const warehouse = await this.resolveWarehouse(warehouseReference);
     const client = await this.resolveClient(clientReference);
     const period = readBillingPeriod(dto);
-    const stockLinks = await this.client.clientResourceLink.findMany({
-      where: { warehouseId: warehouse.id, clientId: client.id, resourceType: 'STOCK_QUANT' },
-      orderBy: [{ createdAt: 'asc' }],
-    });
-    const stockQuantIds = Array.from(new Set(stockLinks.map((link) => link.resourceId)));
-    if (stockQuantIds.length === 0) return { created: 0, skippedZeroQuantity: 0, events: [] };
-
-    const quants = await this.client.stockQuant.findMany({
-      where: { warehouseId: warehouse.id, id: { in: stockQuantIds }, quantity: { gt: 0 } },
-      include: { sku: true, location: true },
-      orderBy: [{ createdAt: 'asc' }],
-    });
-    const activeStorageRate = dto.unitPriceMinorPerUnitDay === undefined
-      ? await this.resolveActiveClientRate(warehouse.id, client.id, 'STORAGE_DAY', period.periodStart)
-      : null;
-    const unitPriceMinorPerUnitDay = dto.unitPriceMinorPerUnitDay ?? activeStorageRate?.unitPriceMinor;
-    if (unitPriceMinorPerUnitDay === undefined) {
-      throw new ConflictException('unitPriceMinorPerUnitDay is required when no active STORAGE_DAY rate card exists.');
+    if (period.periodEnd > new Date()) {
+      throw new BadRequestException('Storage billing requires a completed UTC billing period.');
     }
-    const drafts = buildStorageDayBillingEvents({
-      clientCode: client.code,
-      warehouseId: warehouse.id,
-      currency: normalizeCurrency(dto.currency, activeStorageRate?.currency ?? client.billingCurrency),
-      periodStart: period.periodStart,
-      periodEnd: period.periodEnd,
-      unitPriceMinorPerUnitDay,
-      snapshots: quants.map((quant) => ({
-        stockQuantId: quant.id,
-        skuCode: quant.sku?.code ?? quant.skuId,
-        locationCode: quant.location?.code ?? null,
-        quantity: quant.quantity,
-        ownedFrom: quant.createdAt,
-      })),
+    const scope = { warehouseId: warehouse.id, clientId: client.id };
+    const legacyEvents = await this.prisma.billingEvent.findMany({
+      where: { ...scope, eventType: 'STORAGE_DAY', status: { not: 'VOIDED' }, reference: { startsWith: 'STOR-' } },
+      select: { reference: true, metadata: true },
     });
+    for (const event of legacyEvents) {
+      const metadata = toRecord(event.metadata);
+      const from = typeof metadata['periodStart'] === 'string' ? Date.parse(metadata['periodStart']) : NaN;
+      const to = typeof metadata['periodEnd'] === 'string' ? Date.parse(metadata['periodEnd']) : NaN;
+      if (!(from < to) || (from < +period.periodEnd && to > +period.periodStart)) {
+        throw new ConflictException(`Review the earlier storage billing event ${event.reference} before generating new charges.`);
+      }
+    }
 
-    if (dto.dryRun) {
+    const dates = { gte: period.periodStart, lt: period.periodEnd };
+    const captures = await this.prisma.storageOccupancyCapture.count({ where: { ...scope, snapshotDate: dates } });
+    if (captures !== period.days) {
+      throw new ConflictException(`Storage occupancy is available for ${captures} of ${period.days} UTC days in this period.`);
+    }
+    const snapshots = await this.prisma.storageOccupancySnapshot.findMany({
+      where: { ...scope, snapshotDate: dates, stockQuantId: { not: null } },
+      orderBy: [{ snapshotDate: 'asc' }, { id: 'asc' }],
+    });
+    const references = snapshots.map(snapshot => storageDayReference(snapshot.id));
+    const eventScope = { ...scope, reference: { in: references } };
+    const existingEvents = await this.prisma.billingEvent.findMany({ where: eventScope });
+    const existingReferences = new Set(existingEvents.map(event => event.reference));
+    const drafts: StorageBillingDraft[] = [];
+    const ratesByDay = new Map<number, { unitPriceMinor: number; currency: string }>();
+    let skippedZeroQuantity = 0;
+    for (const snapshot of snapshots) {
+      if (!snapshot.stockQuantId || snapshot.quantity <= 0) {
+        skippedZeroQuantity++;
+        continue;
+      }
+      const reference = storageDayReference(snapshot.id);
+      if (existingReferences.has(reference)) continue;
+      const date = snapshot.snapshotDate;
+      let rate = ratesByDay.get(+date);
+      if (!rate) {
+        const active = dto.unitPriceMinorPerUnitDay == null
+          ? await this.resolveActiveClientRate(warehouse.id, client.id, 'STORAGE_DAY', date)
+          : null;
+        const unitPriceMinor = dto.unitPriceMinorPerUnitDay ?? active?.unitPriceMinor;
+        if (unitPriceMinor === undefined) {
+          throw new ConflictException(`A STORAGE_DAY rate is required for ${date.toISOString().slice(0, 10)}.`);
+        }
+        rate = { unitPriceMinor, currency: normalizeCurrency(dto.currency, active?.currency ?? client.billingCurrency) };
+        ratesByDay.set(+date, rate);
+      }
+      const amountMinor = snapshot.quantity * rate.unitPriceMinor;
+      if (!amountMinor) continue;
+      if (amountMinor > 2_147_483_647) throw new BadRequestException('A daily storage charge exceeds the supported amount.');
+      const metadata = toRecord(snapshot.metadata);
+      const skuCode = typeof metadata['skuCode'] === 'string' ? metadata['skuCode'] : snapshot.skuId;
+      drafts.push({
+        ...scope,
+        ...rate,
+        reference,
+        eventType: 'STORAGE_DAY',
+        status: 'BILLABLE',
+        resourceType: 'STOCK_QUANT',
+        resourceId: snapshot.stockQuantId,
+        description: skuCode ? `Storage day for ${skuCode}` : 'Storage day',
+        quantity: snapshot.quantity,
+        amountMinor,
+        occurredAt: date,
+        metadata: { skuCode, snapshotDate: date.toISOString(), storageOccupancySnapshotId: snapshot.id },
+      });
+    }
+    if (dto.dryRun || !drafts.length) {
       return {
         created: 0,
-        skippedZeroQuantity: quants.length - drafts.length,
-        events: drafts.map((event, index): BillingEventResponse => ({
-          id: `dry-run-storage-${index + 1}`,
-          clientId: client.id,
-          warehouseId: warehouse.id,
-          eventType: event.eventType,
-          status: BillingEventStatus.BILLABLE,
-          reference: event.reference,
-          resourceType: event.resourceType,
-          resourceId: event.resourceId,
-          description: event.description,
-          quantity: event.quantity,
-          unitPriceMinor: event.unitPriceMinor,
-          amountMinor: event.amountMinor,
-          currency: event.currency,
-          occurredAt: event.occurredAt,
-          invoicedAt: null,
-          voidedAt: null,
-          metadata: event.metadata,
-        })),
+        skippedZeroQuantity,
+        events: [
+          ...existingEvents.map(toBillingEventResponse),
+          ...drafts.map(draft => toBillingEventResponse({
+            ...draft,
+            id: `dry-run-${draft.reference}`,
+            invoicedAt: null,
+            voidedAt: null,
+          })),
+        ].sort((left, right) => +left.occurredAt - +right.occurredAt || left.reference.localeCompare(right.reference)),
       };
     }
-
-    const events = await this.transaction(async (tx) => {
-      const created: BillingEventRecord[] = [];
-      for (const draft of drafts) {
-        const existing = await this.findBillingEventForWrite(tx, warehouse.id, client.id, draft.reference);
-        if (existing && this.billingEventHasInvoice(existing)) {
-          created.push(existing);
-          continue;
-        }
-        const event = await tx.billingEvent.upsert({
-          where: { clientId_reference: { clientId: client.id, reference: draft.reference } },
-          update: {
-            status: BillingEventStatus.BILLABLE,
-            quantity: draft.quantity,
-            unitPriceMinor: draft.unitPriceMinor,
-            amountMinor: draft.amountMinor,
-            currency: draft.currency,
-            description: draft.description,
-            occurredAt: draft.occurredAt,
-            metadata: draft.metadata,
-          },
-          create: {
-            clientId: client.id,
+    return withTransactionRetry(() => this.prisma.$transaction(async tx => {
+      const { count: created } = await tx.billingEvent.createMany({ data: drafts, skipDuplicates: true });
+      if (created) {
+        await tx.auditLog.create({
+          data: {
+            actorUserId: actor.id,
             warehouseId: warehouse.id,
-            eventType: BillingEventType.STORAGE_DAY,
-            status: BillingEventStatus.BILLABLE,
-            reference: draft.reference,
-            resourceType: draft.resourceType,
-            resourceId: draft.resourceId,
-            description: draft.description,
-            quantity: draft.quantity,
-            unitPriceMinor: draft.unitPriceMinor,
-            amountMinor: draft.amountMinor,
-            currency: draft.currency,
-            occurredAt: draft.occurredAt,
-            metadata: draft.metadata,
+            action: 'billing.storage_days_generated',
+            resourceType: 'wms_client',
+            resourceId: client.id,
+            metadata: { created, periodStart: period.periodStart.toISOString(), periodEnd: period.periodEnd.toISOString() },
           },
         });
-        created.push(event);
+        await tx.outboxEvent.create({
+          data: {
+            type: 'STORAGE_DAY_BILLING_GENERATED',
+            aggregateType: 'wms_client',
+            aggregateId: client.id,
+            payload: { ...scope, created },
+          },
+        });
       }
-      await tx.auditLog.create({
-        data: {
-          actorUserId: actor.id,
-          warehouseId: warehouse.id,
-          action: 'billing.storage_days_generated',
-          resourceType: 'wms_client',
-          resourceId: client.id,
-          metadata: { created: created.length, periodStart: period.periodStart, periodEnd: period.periodEnd },
-        },
+      const events = await tx.billingEvent.findMany({
+        where: eventScope,
+        orderBy: [{ occurredAt: 'asc' }, { reference: 'asc' }],
       });
-      await tx.outboxEvent.create({
-        data: {
-          type: 'STORAGE_DAY_BILLING_GENERATED',
-          aggregateType: 'wms_client',
-          aggregateId: client.id,
-          payload: { warehouseId: warehouse.id, clientId: client.id, created: created.length },
-          status: 'PENDING',
-          availableAt: new Date(),
-        },
-      });
-      return created;
-    });
-
-    return { created: events.length, skippedZeroQuantity: quants.length - drafts.length, events: events.map(toBillingEventResponse) };
+      return { created, skippedZeroQuantity, events: events.map(toBillingEventResponse) };
+    }));
   }
 
   async listBillingInvoices(
@@ -797,11 +788,13 @@ export class ClientsService {
     const client = await this.resolveClient(clientReference);
     const period = readBillingPeriod(dto);
     const eventStatuses = invoiceEventStatusFilter(dto.eventStatuses);
+    const currency = dto.currency ? normalizeCurrency(dto.currency) : undefined;
     const eligibleEvents = {
       warehouseId: warehouse.id,
       clientId: client.id,
       status: { in: eventStatuses },
       occurredAt: { gte: period.periodStart, lt: period.periodEnd },
+      ...(currency ? { currency } : {}),
       invoiceLine: null,
     };
     const requestedInvoiceNumber = dto.invoiceNumber?.trim().toUpperCase() || null;
@@ -815,9 +808,16 @@ export class ClientsService {
         orderBy: [{ occurredAt: 'asc' }, { reference: 'asc' }],
       });
       if (!events.length) throw new ConflictException('No billable events were found for this invoice period.');
+      if (new Set(events.map(event => event.currency)).size > 1) {
+        throw new ConflictException('Billable events use multiple currencies. Select a currency for the invoice.');
+      }
       const lines = buildInvoiceLines(events.map(event => ({ ...event, vatRateBps: dto.vatRateBps ?? null })));
       const summary = summarizeInvoiceLines(lines);
+      await lockPostgresAdvisoryTransaction(tx, 'idempotency_key', `billing-invoice-number:${client.id}`);
       const invoiceNumber = requestedInvoiceNumber ?? (await this.allocateInvoiceNumber(tx, warehouse.id, client.id, client.code, period.periodStart));
+      if (requestedInvoiceNumber && await tx.billingInvoice.findFirst({ where: { clientId: client.id, invoiceNumber } })) {
+        throw new ConflictException('Invoice number is already in use.');
+      }
       const created = await tx.billingInvoice.create({
         data: {
           clientId: client.id,
@@ -1449,18 +1449,24 @@ export class ClientsService {
       select: { id: true, nextNumber: true, prefix: true, year: true },
     });
 
-    if (!existing) {
-      await tx.invoiceNumberSequence.create({
-        data: { warehouseId, clientId, year, prefix, nextNumber: 2 },
-      });
-      return makeSequentialInvoiceNumber({ prefix, year, nextNumber: 1 });
+    let nextNumber = existing?.nextNumber ?? 1;
+    let invoiceNumber = makeSequentialInvoiceNumber({ prefix, year, nextNumber });
+    while (await tx.billingInvoice.findFirst({ where: { clientId, invoiceNumber }, select: { id: true } })) {
+      nextNumber += 1;
+      invoiceNumber = makeSequentialInvoiceNumber({ prefix, year, nextNumber });
     }
 
-    await tx.invoiceNumberSequence.update({
-      where: { id: existing.id },
-      data: { nextNumber: { increment: 1 } },
-    });
-    return makeSequentialInvoiceNumber({ prefix: existing.prefix, year: existing.year, nextNumber: existing.nextNumber });
+    if (existing) {
+      await tx.invoiceNumberSequence.update({
+        where: { id: existing.id },
+        data: { nextNumber: nextNumber + 1 },
+      });
+    } else {
+      await tx.invoiceNumberSequence.create({
+        data: { warehouseId, clientId, year, prefix, nextNumber: nextNumber + 1 },
+      });
+    }
+    return invoiceNumber;
   }
 
   private async writeAudit(
@@ -1495,6 +1501,10 @@ function readBillingPeriod(input: { periodStart: string; periodEnd: string }) {
     if (!(error instanceof Error)) throw error;
     throw new BadRequestException(error.message);
   }
+}
+
+function storageDayReference(snapshotId: string): string {
+  return `STORAGE-DAY-${snapshotId.toUpperCase()}`;
 }
 
 function toClientResponse(client: WmsClientRecord): WmsClientResponse {
@@ -1748,7 +1758,6 @@ interface ClientsTransactionClient {
   userClientAccess: { upsert(args: Record<string, unknown>): Promise<UserClientAccessRecord> };
   clientResourceLink: { findMany(args: Record<string, unknown>): Promise<ClientResourceLinkRecord[]>; upsert(args: Record<string, unknown>): Promise<ClientResourceLinkRecord> };
   sku: { findFirst(args: Record<string, unknown>): Promise<{ id: string } | null> };
-  stockQuant: { findMany(args: Record<string, unknown>): Promise<StockQuantBillingRecord[]> };
   billingEvent: { count(args: Record<string, unknown>): Promise<number>; findFirst(args: Record<string, unknown>): Promise<BillingEventRecord | null>; findMany(args: Record<string, unknown>): Promise<BillingEventRecord[]>; update(args: Record<string, unknown>): Promise<BillingEventRecord>; updateMany(args: Record<string, unknown>): Promise<unknown>; upsert(args: Record<string, unknown>): Promise<BillingEventRecord> };
   invoiceNumberSequence: { findFirst(args: Record<string, unknown>): Promise<InvoiceNumberSequenceRecord | null>; create(args: Record<string, unknown>): Promise<InvoiceNumberSequenceRecord>; update(args: Record<string, unknown>): Promise<InvoiceNumberSequenceRecord> };
   billingInvoice: { count(args: Record<string, unknown>): Promise<number>; create(args: Record<string, unknown>): Promise<BillingInvoiceRecord & { lines?: BillingInvoiceLineRecord[]; _count?: { lines: number } }>; findFirst(args: Record<string, unknown>): Promise<(BillingInvoiceRecord & { lines?: BillingInvoiceLineRecord[]; _count?: { lines: number } }) | null>; findMany(args: Record<string, unknown>): Promise<Array<BillingInvoiceRecord & { _count?: { lines: number } }>>; update(args: Record<string, unknown>): Promise<BillingInvoiceRecord & { lines?: BillingInvoiceLineRecord[]; _count?: { lines: number } }> };
@@ -1768,7 +1777,12 @@ interface ClientRateRecord { id: string; rateCardId: string; eventType: string; 
 interface UserClientAccessRecord { id: string; userId: string; clientId: string; warehouseId: string | null; isActive: boolean; metadata: unknown }
 interface BillingEventRecord { id: string; clientId: string; warehouseId: string; eventType: string; status: string; reference: string; resourceType: string | null; resourceId: string | null; description: string | null; quantity: number; unitPriceMinor: number; amountMinor: number; currency: string; occurredAt: Date; invoicedAt: Date | null; voidedAt: Date | null; metadata: unknown; invoiceLine?: { id: string } | null }
 
-interface StockQuantBillingRecord { id: string; warehouseId: string; skuId: string; quantity: number; createdAt: Date; sku?: { code: string } | null; location?: { code: string } | null }
+type StorageBillingDraft = Omit<BillingEventRecord, 'id' | 'invoicedAt' | 'voidedAt' | 'metadata' | 'eventType' | 'status'> & {
+  eventType: 'STORAGE_DAY';
+  status: 'BILLABLE';
+  metadata: Prisma.InputJsonObject;
+};
+
 interface BillingInvoiceRecord { id: string; clientId: string; warehouseId: string; invoiceNumber: string; status: string; periodStart: Date; periodEnd: Date; currency: string; subtotalMinor?: number; taxTotalMinor?: number; totalAmountMinor: number; finalizedAt: Date | null; voidedAt: Date | null; metadata: unknown; createdAt: Date; updatedAt: Date }
 interface BillingInvoiceLineRecord { id: string; invoiceId: string; billingEventId: string | null; lineNumber: number; eventType: string; description: string; quantity: number; amountMinor: number; vatRateBps?: number | null; netAmountMinor?: number; taxAmountMinor?: number; grossAmountMinor?: number; currency: string; metadata: unknown }
 interface BillingCreditNoteRecord { id: string; clientId: string; warehouseId: string; invoiceId: string; creditNoteNumber: string; status: string; reasonCode: string | null; reason: string | null; currency: string; subtotalMinor?: number; taxTotalMinor?: number; totalAmountMinor: number; finalizedAt: Date | null; voidedAt: Date | null; metadata: unknown; createdAt: Date; updatedAt: Date }
