@@ -4,6 +4,7 @@ import { AuthenticatedUser } from '../access-control/types';
 import { normalizeOffsetPagination } from '../common';
 import { OwnerClientRecord, OwnerScopePrismaClient, OwnerScopeService } from '../clients/owner-scope.service';
 import { lockPostgresAdvisoryTransaction, lockPostgresRowById, PrismaService, withTransactionRetry } from '../database';
+import { Prisma } from '../generated/prisma/client';
 import { LabelsService } from '../labels/labels.service';
 import { AddShipmentPackageDto } from './dto/add-shipment-package.dto';
 import { CreatePackingStationDto } from './dto/create-packing-station.dto';
@@ -51,33 +52,28 @@ export class ShippingService {
     actor: AuthenticatedUser,
   ): Promise<PackingStationResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
-    const location = dto.locationReference
-      ? await this.resolveLocation(warehouse.id, dto.locationReference)
-      : null;
-    const station = await this.client.packingStation.create({
-      data: {
-        warehouseId: warehouse.id,
-        code: normalizeCode(dto.code),
-        name: dto.name.trim(),
-        locationId: location?.id ?? null,
-        status: PackingStationStatus.ACTIVE,
-        metadata: dto.metadata ?? undefined,
-      },
-    });
-
-
-    await this.writeAudit(
-      actor,
-      warehouse.id,
-      'packing.station_created',
-      'packing_station',
-      station.id,
-      {
-        code: station.code,
-      },
-    );
-
-    return toStationResponse(station);
+    const code = normalizeCode(dto.code);
+    const name = dto.name.trim();
+    if (!code || !name) throw new BadRequestException('Packing station code and name must not be blank');
+    try {
+      return await this.transaction(async tx => {
+        const location = dto.locationReference ? await this.resolveLocation(warehouse.id, dto.locationReference, tx) : null;
+        const station = await tx.packingStation.create({
+          data: {
+            warehouseId: warehouse.id, code, name, locationId: location?.id ?? null,
+            status: PackingStationStatus.ACTIVE, metadata: dto.metadata ?? undefined,
+          },
+        });
+        await this.writeAudit(actor, warehouse.id, 'packing.station_created', 'packing_station', station.id,
+          { code: station.code }, tx);
+        return toStationResponse(station);
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        throw new ConflictException('A packing station with this code already exists in the warehouse');
+      }
+      throw error;
+    }
   }
 
   async listShipments(
@@ -698,8 +694,10 @@ export class ShippingService {
     return warehouse;
   }
 
-  private async resolveLocation(warehouseId: string, reference: string): Promise<LocationRecord> {
-    const location = await this.client.warehouseLocation.findFirst({
+  private async resolveLocation(
+    warehouseId: string, reference: string, client: ShippingTransactionClient = this.client,
+  ): Promise<LocationRecord> {
+    const location = await client.warehouseLocation.findFirst({
       where: {
         warehouseId,
         OR: locationReferenceOr(reference),
@@ -972,8 +970,9 @@ export class ShippingService {
     resourceType: string,
     resourceId: string,
     metadata: Record<string, unknown>,
+    client: ShippingTransactionClient = this.client,
   ): Promise<void> {
-    await this.client.auditLog.create({
+    await client.auditLog.create({
       data: { actorUserId: actor.id, warehouseId, action, resourceType, resourceId, metadata },
     });
   }

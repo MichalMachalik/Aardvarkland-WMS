@@ -747,6 +747,65 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.deepEqual(saved.lines.map(line => line.expectedQuantity), [4, 5]);
   });
 
+  await scenario('direct packing and shipping follow picking and record each movement once', async () => {
+    const { sku } = await createSku('DIRECT-FULFILLMENT');
+    const parcel = await own('POST', '/parcels', { trackingNumber: `DIRECT-PARCEL-${suffix}` });
+    const receive = await own('POST', '/inventory/quants/receive', {
+      skuReference: sku.code, locationReference: 'A-01-01', quantity: 4,
+    });
+    const order = await own('POST', '/outbound-orders', {
+      orderNumber: `DIRECT-FULFILLMENT-${suffix}`,
+      lines: [{ lineNumber: '10', sku: sku.code, orderedQuantity: 2, parcelReference: parcel.id }],
+    });
+    const orderPath = `/outbound-orders/${order.id}`;
+    const pack = `/packing/${order.id}/pack`;
+    const ship = `/shipping/${order.id}/ship`;
+    await own('POST', pack, {}, 409);
+    await own('POST', ship, {}, 409);
+    await own('POST', orderPath + '/allocate', {});
+    await own('POST', orderPath + '/release-picking', {});
+    const tasks = await prisma.warehouseTask.findMany({ where: { outboundOrderId: order.id, type: 'PICK' } });
+    assert.equal(tasks.length, 1);
+    await own('POST', `/tasks/${tasks[0].id}/confirm-pick`, { orderReference: order.id, quantity: 2 });
+    const pickedStock = await prisma.stockQuant.findUniqueOrThrow({ where: { id: receive.quant.id } });
+    const race = async (path, body, status) => {
+      const responses = await Promise.all(Array.from({ length: 2 }, () => own('POST', path, body, [201, 409])));
+      const successful = responses.filter(response => response.order?.status === status);
+      assert.equal(successful.length, 1);
+      assert.equal(successful[0].movementsCreated, 1);
+    };
+    await race(pack, { packageReference: `DIRECT-${suffix}` }, 'PACKED');
+    assert.equal((await own('GET', `/parcels/${parcel.id}`)).status, 'PACKED');
+    await race(ship, { carrier: 'INTERNAL', trackingReference: parcel.trackingNumber }, 'SHIPPED');
+    assert.equal((await own('GET', `/parcels/${parcel.id}`)).status, 'SHIPPED');
+    assert.equal((await own('GET', orderPath)).status, 'SHIPPED');
+    const journal = await prisma.stockMovement.findMany({
+      where: { referenceId: order.id, type: { in: ['PACK', 'SHIP'] } },
+      orderBy: { type: 'asc' },
+    });
+    assert.deepEqual(journal.map(entry => [entry.type, entry.quantity]), [['PACK', 2], ['SHIP', 2]]);
+    assert.equal((await prisma.stockQuant.findUniqueOrThrow({ where: { id: receive.quant.id } })).quantity, pickedStock.quantity);
+  });
+
+  await scenario('packing stations require a valid location and audit concurrent creation once', async () => {
+    const path = '/packing-stations';
+    const location = await own('POST', '/locations', {
+      code: `PACK-LOC-${suffix}`, name: 'Fixture packing location', type: 'PACKING', parentReference: 'A-01',
+    });
+    const input = { code: `pack-station-${suffix.toLowerCase()}`, name: '  Fixture station  ', locationReference: location.id };
+    await own('POST', path, { ...input, locationReference: 'MISSING-PACKING-LOCATION' }, 404);
+    const attempts = await Promise.all([own('POST', path, input, [201, 409]), own('POST', path, input, [201, 409])]);
+    const created = attempts.filter(attempt => attempt.id);
+    assert.equal(created.length, 1);
+    const [station] = created;
+    assert.equal(station.code, input.code.toUpperCase());
+    assert.equal(station.name, 'Fixture station');
+    assert.equal(station.locationId, location.id);
+    assert.equal(await prisma.auditLog.count({ where: { resourceId: station.id, action: 'packing.station_created' } }), 1);
+    assert.ok((await own('GET', path)).some(entry => entry.id === station.id));
+    await own('POST', path, { ...input, code: '   ' }, 400);
+  });
+
   await scenario('outbound picking waits for stock after an allocated line grows', async () => {
     const { sku } = await createSku('SHORT');
     const receipt = { skuReference: sku.code, locationReference: 'A-01-01', quantity: 2 };
