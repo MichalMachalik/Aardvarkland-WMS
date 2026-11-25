@@ -298,6 +298,11 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     await asAdmin('POST', path, receipt, 428, null);
     await asAdmin('POST', path, { ...receipt, quantity: 0 }, 400);
     const received = await asAdmin('POST', path, receipt, 201, key);
+    const movement = await own('GET', `/inventory/movements/${received.movement.id}`);
+    assert.deepEqual(
+      [movement.id, movement.skuId, movement.type, movement.quantityDelta],
+      [received.movement.id, sku.id, 'RECEIVE', receipt.quantity],
+    );
     const replay = await asAdmin('POST', path, receipt, 201, key);
     assert.equal(replay.movement.id, received.movement.id);
     await asAdmin('POST', path, { ...receipt, quantity: 5 }, 409, key);
@@ -531,6 +536,8 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     const lot = await own('POST', '/traceability/lots', {
       skuReference: sku.code, lotCode: `MOVE-LOT-${suffix}`, batch: 'PLANNED',
     });
+    const trackedLot = await own('GET', `/traceability/lots/${lot.id}`);
+    assert.deepEqual([trackedLot.id, trackedLot.skuId, trackedLot.lotCode, trackedLot.batch], [lot.id, sku.id, lot.lotCode, 'PLANNED']);
     const target = await own('POST', '/locations', {
       code: `MOVE-${suffix}`, name: 'Planned stock target', type: 'STORAGE', parentReference: 'A-01',
     });
@@ -1253,6 +1260,15 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.equal(invoice.totalAmountMinor, 2904);
     assert.equal(invoice.lines[0].billingEventId, event.id);
     const invoicePath = `${path}/billing-invoices/${invoice.id}`;
+    const draftsBefore = await own('GET', `${path}/billing-invoices?status=DRAFT&take=1`);
+    assert.deepEqual(draftsBefore.items.map(item => item.id), [invoice.id]);
+    const billable = await own('GET', `${path}/billing-events?status=BILLABLE&take=1`);
+    assert.deepEqual(billable.items.map(item => item.id), [event.id]);
+    const summary = await own('GET', `${path}/billing-summary?eventType=PICK`);
+    assert.equal(summary.clientId, client.id);
+    assert.equal(summary.currency, 'EUR');
+    assert.equal(summary.billableAmountMinor, 2400);
+    assert.deepEqual(summary.byType, [{ eventType: 'PICK', count: 1, amountMinor: 2400 }]);
     const ledger = () => prisma.billingEvent.findUniqueOrThrow({ where: { id: event.id } });
     await own('POST', `/billing-events/${event.id}/void`, { reason: 'Invoice event cannot be voided separately' }, 409);
     await own('POST', `${path}/billing-events`, { ...eventBody, quantity: 3 }, 409);
@@ -1264,7 +1280,22 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
       own('POST', `${invoicePath}/finalize`, {}, [201, 409]),
     ]);
     assert.equal(finalizations.filter(item => item.status === 'FINALIZED').length, 1);
+    assert.equal((await own('GET', invoicePath)).status, 'FINALIZED');
     assert.equal((await ledger()).status, 'INVOICED');
+    const invoiced = await own('GET', `${path}/billing-summary?status=INVOICED`);
+    assert.deepEqual([invoiced.billableEvents, invoiced.invoicedEvents, invoiced.invoicedAmountMinor], [0, 1, 2400]);
+    const csv = await own('GET', invoicePath + '/export');
+    assert.equal(csv.filename, invoice.invoiceNumber + '.csv');
+    assert.equal(csv.contentType, 'text/csv');
+    assert.match(csv.csv, /^invoiceNumber,clientCode,warehouseCode/);
+    assert.match(csv.csv, /2400,2100,504,2904,EUR\s*$/);
+    const pdf = await own('GET', invoicePath + '/export.pdf');
+    assert.equal(pdf.filename, invoice.invoiceNumber + '.pdf');
+    assert.equal(pdf.contentType, 'application/pdf');
+    const contents = Buffer.from(pdf.pdfBase64, 'base64').toString('latin1');
+    assert.match(contents, /^%PDF-[0-9.]+/);
+    assert.match(contents, /%%EOF\s*$/);
+    assert.ok(contents.includes(invoice.invoiceNumber));
     assert.equal(await prisma.outboxEvent.count({
       where: { aggregateId: invoice.id, type: 'BILLING_INVOICE_FINALIZED' },
     }), 1);
@@ -1359,6 +1390,21 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     ]);
     assert.equal(results.filter(item => item.status === 'FINALIZED').length, 1);
     assert.equal((await own('GET', creditPath)).metadata.confirmed, true);
+    const posted = await own('GET', `${path}/billing-credit-notes?invoiceReference=${invoice.id}&status=FINALIZED`);
+    assert.deepEqual(posted.items.map(item => item.id), [credit.id]);
+    const csv = await own('GET', creditPath + '/export');
+    assert.equal(csv.filename, credit.creditNoteNumber + '.csv');
+    assert.equal(csv.contentType, 'text/csv');
+    assert.match(csv.csv, /^creditNoteNumber,invoiceNumber,clientCode/);
+    assert.ok(csv.csv.includes(invoice.invoiceNumber));
+    const pdf = await own('GET', creditPath + '/export.pdf');
+    assert.equal(pdf.filename, credit.creditNoteNumber + '.pdf');
+    assert.equal(pdf.contentType, 'application/pdf');
+    const contents = Buffer.from(pdf.pdfBase64, 'base64').toString('latin1');
+    assert.match(contents, /^%PDF-[0-9.]+/);
+    assert.match(contents, /%%EOF\s*$/);
+    const printed = [...contents.matchAll(/^\((.*)\) Tj$/gm)].map(line => line[1]).join('');
+    assert.ok(printed.includes(credit.creditNoteNumber));
     assert.equal(await prisma.outboxEvent.count({ where: { aggregateId: credit.id, type: 'BILLING_CREDIT_NOTE_FINALIZED' } }), 1);
     assert.equal(await prisma.auditLog.count({ where: { resourceId: credit.id, action: 'billing.credit_note_finalized' } }), 1);
     await own('POST', credits, { invoiceLineNumbers: [1], finalize: true }, 409);
@@ -1474,6 +1520,12 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.equal(await owner(), other.id);
     assert.deepEqual(await own('GET', linkPath), []);
     assert.equal((await own('GET', otherLink))[0].id, link.id);
+    const snapshot = await own('GET', otherPath + '/ownership/snapshot');
+    assert.deepEqual(snapshot, {
+      clientId: other.id, warehouseId: attachment.warehouseId,
+      resourceCounts: [{ resourceType: 'STOCK_QUANT', count: 1 }],
+    });
+    assert.deepEqual((await own('GET', path + '/ownership/snapshot')).resourceCounts, []);
   });
 
   await scenario('storage billing uses daily captures and bills overlapping periods once', async () => {
@@ -1600,6 +1652,9 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     await asManager('POST', '/api/users', userBody, 403);
     const user = await asAdmin('POST', '/api/users', userBody);
     await asAdmin('POST', '/api/users', userBody, 409);
+    const accountPath = `/api/users/${user.id}`;
+    assert.equal((await asAdmin('GET', accountPath)).email, email);
+    await asWorker('GET', accountPath, undefined, 403);
     const session = await login(email, password);
     const asNewUser = bind(session.accessToken);
     assert.equal((await asNewUser('GET', '/api/auth/me')).email, email);

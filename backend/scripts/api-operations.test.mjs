@@ -86,19 +86,28 @@ test('OpenAPI operations on a disposable PostgreSQL database', { timeout: 180000
   const operations = Object.entries(paths).flatMap(([path, pathItem]) => Object.entries(pathItem)
     .filter(([method]) => methods.has(method))
     .map(([method, spec]) => ({ method: method.toUpperCase(), path, spec, key: `${method.toUpperCase()} ${path}` })));
-  const writeRoutes = operations
-    .filter(op => ['POST', 'PUT', 'PATCH', 'DELETE'].includes(op.method))
+  const routes = operations
     .map(op => {
       const segments = op.path.split('/').slice(1).map(segment => segment.startsWith('{') ? null : segment);
       return { ...op, segments, staticCount: segments.filter(segment => segment !== null).length };
     })
     .sort((left, right) => right.staticCount - left.staticCount);
-  const acceptedWrites = new Set();
+  const accepted = new Set();
   const covered = new Set();
   let testedWrites = 0;
   let testedReads = 0;
   let testedBodylessWrites = 0;
   let testedPublicWrites = 0;
+
+  function recordSuccessfulRequest(response, method) {
+    if (!response.ok) return;
+    const segments = new URL(response.url).pathname.split('/').slice(1);
+    const operation = routes.find(route =>
+      route.method === method && route.segments.length === segments.length &&
+      route.segments.every((segment, index) => segment === null ? Boolean(segments[index]) : segment === segments[index]),
+    );
+    if (operation) accepted.add(operation.key);
+  }
 
   async function request(method, path, { body, token, key = randomUUID(), expected, headers } = {}) {
     const response = await fetch(origin + path, {
@@ -118,14 +127,7 @@ test('OpenAPI operations on a disposable PostgreSQL database', { timeout: 180000
     const message = `${method} ${path} returned ${response.status}`
       + (response.ok ? '' : `: ${JSON.stringify(payload?.error?.message ?? payload?.message ?? '').slice(0, 200)}`);
     if (expected !== undefined) assert.ok([expected].flat().includes(response.status), message);
-    if (response.ok && method !== 'GET') {
-      const segments = new URL(response.url).pathname.split('/').slice(1);
-      const operation = writeRoutes.find(route =>
-        route.method === method && route.segments.length === segments.length &&
-        route.segments.every((segment, index) => segment === null ? Boolean(segments[index]) : segment === segments[index]),
-      );
-      if (operation) acceptedWrites.add(operation.key);
-    }
+    recordSuccessfulRequest(response, method);
     return { status: response.status, data: payload?.data ?? payload };
   }
 
@@ -198,6 +200,7 @@ test('OpenAPI operations on a disposable PostgreSQL database', { timeout: 180000
             assert.match(response.headers.get('content-type') ?? '', /text\/event-stream/);
             const chunk = await response.body.getReader().read();
             assert.match(new TextDecoder().decode(chunk.value), /realtime\.connected/);
+            recordSuccessfulRequest(response, 'GET');
           } finally {
             signal.abort();
           }
@@ -281,9 +284,9 @@ test('OpenAPI operations on a disposable PostgreSQL database', { timeout: 180000
     suite.diagnostic(`${fixtures} warehouse and administration scenarios`);
   });
 
-  await suite.test('every documented write route accepts a valid HTTP request', () => {
-    assert.deepEqual(writeRoutes.filter(op => !acceptedWrites.has(op.key)).map(op => op.key), []);
-    suite.diagnostic(`${acceptedWrites.size}/${writeRoutes.length} documented writes returned success`);
+  await suite.test('every documented route accepts a valid HTTP request', () => {
+    assert.deepEqual(operations.filter(op => !accepted.has(op.key)).map(op => op.key), []);
+    suite.diagnostic(`${accepted.size}/${operations.length} documented operations returned success`);
   });
 });
 
