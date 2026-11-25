@@ -7,18 +7,19 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: pages
   cancel-in-progress: true
 
 jobs:
-  deploy:
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+  build:
+    permissions:
+      contents: read
+      pages: read
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact_id }}
+      artifact_name: github-pages-${{ github.run_attempt }}
     timeout-minutes: 20
     runs-on: ubuntu-24.04
     steps:
@@ -36,8 +37,41 @@ jobs:
       - working-directory: demo
         run: node scripts/verify-ui.mjs --demo-only
       - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d
-      - uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b
+      - id: upload
+        uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b
         with:
+          name: github-pages-${{ github.run_attempt }}
           path: demo/_site
+
+  deploy:
+    needs: build
+    permissions:
+      actions: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    timeout-minutes: 15
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Wait for the uploaded artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PAGES_ARTIFACT_ID: ${{ needs.build.outputs.artifact_id }}
+        run: |
+          test -n "$PAGES_ARTIFACT_ID"
+          for attempt in {1..12}; do
+            artifact_id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$PAGES_ARTIFACT_ID" --jq 'select(.expired == false) | .id' 2>/dev/null) || artifact_id=
+            if [[ "$artifact_id" == "$PAGES_ARTIFACT_ID" ]]; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::The uploaded Pages artifact is unavailable."
+          exit 1
       - id: deployment
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346
+        with:
+          artifact_name: ${{ needs.build.outputs.artifact_name }}
