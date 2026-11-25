@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   ConflictException,
   Injectable,
   NotFoundException,
@@ -8,7 +9,7 @@ import {
 import { AuthenticatedUser } from '../access-control/types';
 import { OwnerScopeService } from '../clients/owner-scope.service';
 import { normalizeOffsetPagination } from '../common';
-import { lockPostgresRowById, PrismaService } from '../database';
+import { lockPostgresRowById, PrismaService, withTransactionRetry } from '../database';
 import { Prisma, User, Warehouse, WarehouseLocation } from '../generated/prisma/client';
 import { AssignWarehouseTaskDto } from './dto/assign-warehouse-task.dto';
 import { CancelWarehouseTaskDto } from './dto/cancel-warehouse-task.dto';
@@ -130,6 +131,7 @@ export class WarehouseTasksService {
     if (status !== WarehouseTaskStatus.OPEN) {
       throw new ConflictException('Warehouse task must be created as OPEN');
     }
+    assertValidTaskQuantity(dto.type, dto.quantity);
 
     const assignedUserId = dto.assignedUserReference
       ? (await this.resolveUser(dto.assignedUserReference)).id
@@ -145,25 +147,27 @@ export class WarehouseTasksService {
       ? (await this.resolveHandlingUnit(warehouse.id, dto.handlingUnitReference)).id
       : null;
 
-    const task = await this.tasks.create({
-      data: {
-        warehouseId: warehouse.id,
-        type: dto.type,
-        status,
-        assignedUserId,
-        fromLocationId,
-        toLocationId,
-        skuId,
-        quantity: dto.quantity,
-        handlingUnitId,
-        metadata: toJsonInput(dto.metadata),
-      },
-      include: warehouseTaskInclude,
+    return this.transaction(async (db) => {
+      const task = await this.getTaskDelegate(db).create({
+        data: {
+          warehouseId: warehouse.id,
+          type: dto.type,
+          status,
+          assignedUserId,
+          fromLocationId,
+          toLocationId,
+          skuId,
+          quantity: dto.quantity,
+          handlingUnitId,
+          metadata: toJsonInput(dto.metadata),
+        },
+        include: warehouseTaskInclude,
+      });
+
+      await this.writeAuditWithClient(db, actor, warehouse.id, 'warehouse_task.created', task);
+
+      return toWarehouseTaskResponse(task);
     });
-
-    await this.writeAudit(actor, warehouse.id, 'warehouse_task.created', task);
-
-    return toWarehouseTaskResponse(task);
   }
 
   async claimNext(
@@ -178,26 +182,30 @@ export class WarehouseTasksService {
       : actor.id;
 
     return this.transaction(async (db) => {
-      const where: QueryObject = {
-        warehouseId: warehouse.id,
-        status: WarehouseTaskStatus.OPEN,
-        ...(body.type ? { type: body.type } : {}),
-        ...(body.zone
-          ? { fromLocation: { is: { zone: normalizeOptionalString(body.zone) } } }
-          : {}),
-      };
-      const [candidate] = await this.getTaskDelegate(db).findMany({
-        where,
-        include: warehouseTaskInclude,
-        orderBy: [{ priority: 'asc' }, { createdAt: 'asc' }],
-        take: 1,
-      });
+      const [candidate] = await db.$queryRawUnsafe<{ id: string }[]>(
+        `SELECT task.id
+         FROM warehouse_tasks AS task
+         WHERE task.warehouse_id = $1::uuid
+           AND task.status = 'OPEN'
+           AND ($2::"WarehouseTaskType" IS NULL OR task.type = $2::"WarehouseTaskType")
+           AND (NOT $3::boolean OR EXISTS (
+             SELECT 1 FROM warehouse_locations AS location
+             WHERE location.id = task.from_location_id
+               AND location.zone IS NOT DISTINCT FROM $4::text
+           ))
+         ORDER BY task.priority, task.created_at, task.id
+         LIMIT 1
+         FOR UPDATE OF task SKIP LOCKED`,
+        warehouse.id,
+        body.type ?? null,
+        Boolean(body.zone),
+        normalizeOptionalString(body.zone),
+      );
 
       if (!candidate) {
         throw new NotFoundException('No open warehouse task is available to claim');
       }
 
-      await lockPostgresRowById(db, 'warehouse_tasks', candidate.id);
       const task = await this.resolveTaskWithClient(db, warehouse.id, candidate.id);
       this.assertTransition(task.status, WarehouseTaskStatus.ASSIGNED);
 
@@ -237,30 +245,34 @@ export class WarehouseTasksService {
   ): Promise<WarehouseTaskResponse> {
     const body: AssignWarehouseTaskDto = dto ?? {};
     const warehouse = await this.resolveWarehouse(warehouseReference);
-    const task = await this.resolveTask(warehouse.id, taskReference);
-    this.assertTransition(task.status, WarehouseTaskStatus.ASSIGNED);
 
-    const assignedUserId = body.assignedUserReference
-      ? (await this.resolveUser(body.assignedUserReference)).id
-      : actor.id;
-    const updatedTask = await this.tasks.update({
-      where: { id: task.id },
-      data: compactMutation({
-        status: WarehouseTaskStatus.ASSIGNED,
+    return this.transaction(async (db) => {
+      const task = await this.lockTaskForTransition(
+        db, warehouse.id, taskReference, WarehouseTaskStatus.ASSIGNED,
+      );
+
+      const assignedUserId = body.assignedUserReference
+        ? (await this.resolveUser(body.assignedUserReference, db)).id
+        : actor.id;
+      const updatedTask = await this.getTaskDelegate(db).update({
+        where: { id: task.id },
+        data: compactMutation({
+          status: WarehouseTaskStatus.ASSIGNED,
+          assignedUserId,
+          assignedAt: task.assignedAt ?? new Date(),
+          version: { increment: 1 },
+          ...(body.metadata === undefined ? {} : { metadata: toJsonInput(body.metadata) }),
+        }),
+        include: warehouseTaskInclude,
+      });
+
+      await this.writeAuditWithClient(db, actor, warehouse.id, 'warehouse_task.assigned', updatedTask, {
+        previousStatus: task.status,
         assignedUserId,
-        assignedAt: task.assignedAt ?? new Date(),
-        version: { increment: 1 },
-        ...(body.metadata === undefined ? {} : { metadata: toJsonInput(body.metadata) }),
-      }),
-      include: warehouseTaskInclude,
-    });
+      });
 
-    await this.writeAudit(actor, warehouse.id, 'warehouse_task.assigned', updatedTask, {
-      previousStatus: task.status,
-      assignedUserId,
+      return toWarehouseTaskResponse(updatedTask);
     });
-
-    return toWarehouseTaskResponse(updatedTask);
   }
 
   async start(
@@ -271,31 +283,35 @@ export class WarehouseTasksService {
   ): Promise<WarehouseTaskResponse> {
     const body: StartWarehouseTaskDto = dto ?? {};
     const warehouse = await this.resolveWarehouse(warehouseReference);
-    const task = await this.resolveTask(warehouse.id, taskReference);
-    this.assertTransition(task.status, WarehouseTaskStatus.IN_PROGRESS);
 
-    const assignedUserId = body.assignedUserReference
-      ? (await this.resolveUser(body.assignedUserReference)).id
-      : (task.assignedUserId ?? actor.id);
-    const data: MutationObject = compactMutation({
-      status: WarehouseTaskStatus.IN_PROGRESS,
-      assignedUserId,
-      assignedAt: task.assignedAt ?? new Date(),
-      startedAt: task.startedAt ?? new Date(),
-      version: { increment: 1 },
-      ...(body.metadata === undefined ? {} : { metadata: toJsonInput(body.metadata) }),
-    });
-    const updatedTask = await this.tasks.update({
-      where: { id: task.id },
-      data,
-      include: warehouseTaskInclude,
-    });
+    return this.transaction(async (db) => {
+      const task = await this.lockTaskForTransition(
+        db, warehouse.id, taskReference, WarehouseTaskStatus.IN_PROGRESS,
+      );
 
-    await this.writeAudit(actor, warehouse.id, 'warehouse_task.started', updatedTask, {
-      previousStatus: task.status,
-    });
+      const assignedUserId = body.assignedUserReference
+        ? (await this.resolveUser(body.assignedUserReference, db)).id
+        : (task.assignedUserId ?? actor.id);
+      const data: MutationObject = compactMutation({
+        status: WarehouseTaskStatus.IN_PROGRESS,
+        assignedUserId,
+        assignedAt: task.assignedAt ?? new Date(),
+        startedAt: task.startedAt ?? new Date(),
+        version: { increment: 1 },
+        ...(body.metadata === undefined ? {} : { metadata: toJsonInput(body.metadata) }),
+      });
+      const updatedTask = await this.getTaskDelegate(db).update({
+        where: { id: task.id },
+        data,
+        include: warehouseTaskInclude,
+      });
 
-    return toWarehouseTaskResponse(updatedTask);
+      await this.writeAuditWithClient(db, actor, warehouse.id, 'warehouse_task.started', updatedTask, {
+        previousStatus: task.status,
+      });
+
+      return toWarehouseTaskResponse(updatedTask);
+    });
   }
 
   async confirm(
@@ -306,48 +322,53 @@ export class WarehouseTasksService {
   ): Promise<WarehouseTaskResponse> {
     const body: ConfirmWarehouseTaskDto = dto ?? {};
     const warehouse = await this.resolveWarehouse(warehouseReference);
-    const task = await this.resolveTask(warehouse.id, taskReference);
-    this.assertTransition(task.status, WarehouseTaskStatus.DONE);
 
-    const fromLocationId = body.fromLocationReference
-      ? (await this.resolveLocation(warehouse.id, body.fromLocationReference)).id
-      : undefined;
-    const toLocationId = body.toLocationReference
-      ? (await this.resolveLocation(warehouse.id, body.toLocationReference)).id
-      : undefined;
-    const skuId = body.sku ? (await this.resolveSku(body.sku)).id : undefined;
-    const handlingUnitId = body.handlingUnitReference
-      ? (await this.resolveHandlingUnit(warehouse.id, body.handlingUnitReference)).id
-      : undefined;
-    const data: MutationObject = {
-      status: WarehouseTaskStatus.DONE,
-      completedAt: new Date(),
-      version: { increment: 1 },
-      ...(fromLocationId === undefined ? {} : { fromLocationId }),
-      ...(toLocationId === undefined ? {} : { toLocationId }),
-      ...(skuId === undefined ? {} : { skuId }),
-      ...(body.quantity === undefined ? {} : { quantity: body.quantity }),
-      ...(handlingUnitId === undefined ? {} : { handlingUnitId }),
-      ...(body.metadata === undefined ? {} : { metadata: toJsonInput(body.metadata) }),
-    };
-    const updatedTask = await this.tasks.update({
-      where: { id: task.id },
-      data,
-      include: warehouseTaskInclude,
+    return this.transaction(async (db) => {
+      const task = await this.lockTaskForTransition(
+        db, warehouse.id, taskReference, WarehouseTaskStatus.DONE,
+      );
+      assertValidTaskQuantity(task.type, body.quantity);
+
+      const fromLocationId = body.fromLocationReference
+        ? (await this.resolveLocation(warehouse.id, body.fromLocationReference, db)).id
+        : undefined;
+      const toLocationId = body.toLocationReference
+        ? (await this.resolveLocation(warehouse.id, body.toLocationReference, db)).id
+        : undefined;
+      const skuId = body.sku ? (await this.resolveSku(body.sku, db)).id : undefined;
+      const handlingUnitId = body.handlingUnitReference
+        ? (await this.resolveHandlingUnit(warehouse.id, body.handlingUnitReference, db)).id
+        : undefined;
+      const data: MutationObject = {
+        status: WarehouseTaskStatus.DONE,
+        completedAt: new Date(),
+        version: { increment: 1 },
+        ...(fromLocationId === undefined ? {} : { fromLocationId }),
+        ...(toLocationId === undefined ? {} : { toLocationId }),
+        ...(skuId === undefined ? {} : { skuId }),
+        ...(body.quantity === undefined ? {} : { quantity: body.quantity }),
+        ...(handlingUnitId === undefined ? {} : { handlingUnitId }),
+        ...(body.metadata === undefined ? {} : { metadata: toJsonInput(body.metadata) }),
+      };
+      const updatedTask = await this.getTaskDelegate(db).update({
+        where: { id: task.id },
+        data,
+        include: warehouseTaskInclude,
+      });
+
+      await this.writeAuditWithClient(db, actor, warehouse.id, 'warehouse_task.confirmed', updatedTask, {
+        previousStatus: task.status,
+        confirmation: {
+          fromLocationId: fromLocationId ?? task.fromLocationId ?? null,
+          toLocationId: toLocationId ?? task.toLocationId ?? null,
+          skuId: skuId ?? task.skuId ?? null,
+          quantity: body.quantity ?? task.quantity ?? null,
+          handlingUnitId: handlingUnitId ?? task.handlingUnitId ?? null,
+        },
+      });
+
+      return toWarehouseTaskResponse(updatedTask);
     });
-
-    await this.writeAudit(actor, warehouse.id, 'warehouse_task.confirmed', updatedTask, {
-      previousStatus: task.status,
-      confirmation: {
-        fromLocationId: fromLocationId ?? task.fromLocationId ?? null,
-        toLocationId: toLocationId ?? task.toLocationId ?? null,
-        skuId: skuId ?? task.skuId ?? null,
-        quantity: body.quantity ?? task.quantity ?? null,
-        handlingUnitId: handlingUnitId ?? task.handlingUnitId ?? null,
-      },
-    });
-
-    return toWarehouseTaskResponse(updatedTask);
   }
 
   async fail(
@@ -357,33 +378,37 @@ export class WarehouseTasksService {
     actor: AuthenticatedUser,
   ): Promise<WarehouseTaskResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
-    const task = await this.resolveTask(warehouse.id, taskReference);
-    this.assertTransition(task.status, WarehouseTaskStatus.FAILED);
 
-    const reason = normalizeOptionalString(dto.reason);
+    return this.transaction(async (db) => {
+      const task = await this.lockTaskForTransition(
+        db, warehouse.id, taskReference, WarehouseTaskStatus.FAILED,
+      );
 
-    if (!reason) {
-      throw new ConflictException('Failure reason is required');
-    }
+      const reason = normalizeOptionalString(dto.reason);
 
-    const updatedTask = await this.tasks.update({
-      where: { id: task.id },
-      data: compactMutation({
-        status: WarehouseTaskStatus.FAILED,
-        failureReason: reason,
-        completedAt: new Date(),
-        version: { increment: 1 },
-        ...(dto.metadata === undefined ? {} : { metadata: toJsonInput(dto.metadata) }),
-      }),
-      include: warehouseTaskInclude,
+      if (!reason) {
+        throw new ConflictException('Failure reason is required');
+      }
+
+      const updatedTask = await this.getTaskDelegate(db).update({
+        where: { id: task.id },
+        data: compactMutation({
+          status: WarehouseTaskStatus.FAILED,
+          failureReason: reason,
+          completedAt: new Date(),
+          version: { increment: 1 },
+          ...(dto.metadata === undefined ? {} : { metadata: toJsonInput(dto.metadata) }),
+        }),
+        include: warehouseTaskInclude,
+      });
+
+      await this.writeAuditWithClient(db, actor, warehouse.id, 'warehouse_task.failed', updatedTask, {
+        previousStatus: task.status,
+        reason,
+      });
+
+      return toWarehouseTaskResponse(updatedTask);
     });
-
-    await this.writeAudit(actor, warehouse.id, 'warehouse_task.failed', updatedTask, {
-      previousStatus: task.status,
-      reason,
-    });
-
-    return toWarehouseTaskResponse(updatedTask);
   }
 
   async cancel(
@@ -394,27 +419,31 @@ export class WarehouseTasksService {
   ): Promise<WarehouseTaskResponse> {
     const body: CancelWarehouseTaskDto = dto ?? {};
     const warehouse = await this.resolveWarehouse(warehouseReference);
-    const task = await this.resolveTask(warehouse.id, taskReference);
-    this.assertTransition(task.status, WarehouseTaskStatus.CANCELLED);
 
-    const reason = normalizeOptionalString(body.reason);
-    const updatedTask = await this.tasks.update({
-      where: { id: task.id },
-      data: compactMutation({
-        status: WarehouseTaskStatus.CANCELLED,
-        failureReason: reason,
-        version: { increment: 1 },
-        ...(body.metadata === undefined ? {} : { metadata: toJsonInput(body.metadata) }),
-      }),
-      include: warehouseTaskInclude,
+    return this.transaction(async (db) => {
+      const task = await this.lockTaskForTransition(
+        db, warehouse.id, taskReference, WarehouseTaskStatus.CANCELLED,
+      );
+
+      const reason = normalizeOptionalString(body.reason);
+      const updatedTask = await this.getTaskDelegate(db).update({
+        where: { id: task.id },
+        data: compactMutation({
+          status: WarehouseTaskStatus.CANCELLED,
+          failureReason: reason,
+          version: { increment: 1 },
+          ...(body.metadata === undefined ? {} : { metadata: toJsonInput(body.metadata) }),
+        }),
+        include: warehouseTaskInclude,
+      });
+
+      await this.writeAuditWithClient(db, actor, warehouse.id, 'warehouse_task.cancelled', updatedTask, {
+        previousStatus: task.status,
+        reason,
+      });
+
+      return toWarehouseTaskResponse(updatedTask);
     });
-
-    await this.writeAudit(actor, warehouse.id, 'warehouse_task.cancelled', updatedTask, {
-      previousStatus: task.status,
-      reason,
-    });
-
-    return toWarehouseTaskResponse(updatedTask);
   }
 
   private transaction<T>(fn: (db: WarehouseTaskPrismaClient) => Promise<T>): Promise<T> {
@@ -422,7 +451,7 @@ export class WarehouseTasksService {
       $transaction<TValue>(fn: (db: WarehouseTaskPrismaClient) => Promise<TValue>): Promise<TValue>;
     };
 
-    return client.$transaction(fn);
+    return withTransactionRetry(() => client.$transaction(fn));
   }
 
   private getTaskDelegate(db: WarehouseTaskPrismaClient): WarehouseTaskDelegate {
@@ -460,8 +489,9 @@ export class WarehouseTasksService {
   private async resolveLocation(
     warehouseId: string,
     locationReference: string,
+    db = this.db,
   ): Promise<WarehouseLocation> {
-    const location = await this.db.warehouseLocation.findFirst({
+    const location = await db.warehouseLocation.findFirst({
       where: locationReferenceWhere(warehouseId, locationReference),
     });
 
@@ -472,8 +502,8 @@ export class WarehouseTasksService {
     return location;
   }
 
-  private async resolveUser(userReference: string): Promise<User> {
-    const user = await this.db.user.findFirst({
+  private async resolveUser(userReference: string, db = this.db): Promise<User> {
+    const user = await db.user.findFirst({
       where: userReferenceWhere(userReference),
     });
 
@@ -484,8 +514,8 @@ export class WarehouseTasksService {
     return user;
   }
 
-  private async resolveSku(skuReference: string): Promise<SkuRecord> {
-    const sku = await this.db.sku.findFirst({
+  private async resolveSku(skuReference: string, db = this.db): Promise<SkuRecord> {
+    const sku = await db.sku.findFirst({
       where: skuReferenceWhere(skuReference),
     });
 
@@ -499,8 +529,9 @@ export class WarehouseTasksService {
   private async resolveHandlingUnit(
     warehouseId: string,
     handlingUnitReference: string,
+    db = this.db,
   ): Promise<HandlingUnitRecord> {
-    const handlingUnit = await this.db.handlingUnit.findFirst({
+    const handlingUnit = await db.handlingUnit.findFirst({
       where: handlingUnitReferenceWhere(warehouseId, handlingUnitReference),
     });
 
@@ -537,6 +568,19 @@ export class WarehouseTasksService {
     taskReference: string,
   ): Promise<WarehouseTaskWithRelations> {
     return this.resolveTaskWithClient(this.db, warehouseId, taskReference);
+  }
+
+  private async lockTaskForTransition(
+    db: WarehouseTaskPrismaClient,
+    warehouseId: string,
+    taskReference: string,
+    status: WarehouseTaskStatus,
+  ): Promise<WarehouseTaskWithRelations> {
+    const candidate = await this.resolveTaskWithClient(db, warehouseId, taskReference);
+    await lockPostgresRowById(db, 'warehouse_tasks', candidate.id);
+    const task = await this.resolveTaskWithClient(db, warehouseId, candidate.id);
+    this.assertTransition(task.status, status);
+    return task;
   }
 
   private assertTransition(
@@ -579,15 +623,11 @@ export class WarehouseTasksService {
       },
     });
   }
+}
 
-  private writeAudit(
-    actor: AuthenticatedUser,
-    warehouseId: string,
-    action: string,
-    task: WarehouseTaskRecord,
-    extraMetadata: Record<string, unknown> = {},
-  ): Promise<void> {
-    return this.writeAuditWithClient(this.db, actor, warehouseId, action, task, extraMetadata);
+function assertValidTaskQuantity(type: WarehouseTaskType, quantity: number | undefined): void {
+  if (quantity === 0 && type !== WarehouseTaskType.COUNT) {
+    throw new BadRequestException('Only count tasks can have a quantity of zero');
   }
 }
 
@@ -790,7 +830,7 @@ type QueryObject = Record<string, unknown>;
 type MutationObject = Record<string, unknown>;
 
 interface WarehouseTaskPrismaClient {
-  $queryRawUnsafe?<T = unknown>(query: string, ...values: unknown[]): Promise<T>;
+  $queryRawUnsafe<T = unknown>(query: string, ...values: unknown[]): Promise<T>;
   warehouse: FindFirstDelegate<Warehouse>;
   warehouseLocation: FindFirstDelegate<WarehouseLocation>;
   handlingUnit: FindFirstDelegate<HandlingUnitRecord>;

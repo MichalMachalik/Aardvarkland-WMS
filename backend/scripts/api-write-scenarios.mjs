@@ -85,6 +85,73 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.equal(saved.quantity, 3);
   });
 
+  await scenario('warehouse tasks claim available work and apply terminal transitions once', async () => {
+    const zone = `TASK-${suffix}`;
+    const location = await own('POST', '/locations', {
+      code: zone, zone, name: 'Task fixture location', type: 'STORAGE', parentReference: 'A-01',
+    });
+    const body = { type: 'PACK', fromLocationReference: location.id };
+    const claim = { type: body.type, zone: location.zone };
+    const change = (id, action, data = {}, status = 201) => own('POST', `/tasks/${id}/${action}`, data, status);
+    await own('POST', '/tasks', { ...body, status: 'DONE' }, 409);
+    await own('POST', '/tasks', { ...body, quantity: 0 }, 400);
+    await own('POST', '/tasks', { ...body, quantity: 2_147_483_648 }, 400);
+    await own('POST', '/tasks/claim-next', claim, 404);
+
+    const first = await own('POST', '/tasks', body);
+    const second = await own('POST', '/tasks', body);
+    await prisma.$transaction(async tx => {
+      await tx.$queryRaw`SELECT id FROM warehouse_tasks WHERE id = ${first.id}::uuid FOR UPDATE`;
+      const claimed = await own('POST', '/tasks/claim-next', claim);
+      assert.equal(claimed.id, second.id);
+      assert.equal(claimed.status, 'ASSIGNED');
+      assert.ok(claimed.assignedUserId);
+      assert.equal(claimed.version, second.version + 1);
+    }, { timeout: 12000 });
+    assert.equal((await own('POST', '/tasks/claim-next', claim)).id, first.id);
+    await own('POST', '/tasks/claim-next', claim, 404);
+
+    const task = await own('POST', '/tasks', body);
+    await change(task.id, 'confirm', {}, 409);
+    const assigned = await change(task.id, 'assign');
+    assert.ok(assigned.assignedAt);
+    const started = await change(task.id, 'start');
+    assert.equal(started.assignedAt, assigned.assignedAt);
+    assert.ok(started.startedAt);
+    await change(task.id, 'fail', { reason: '   ' }, 409);
+    await change(task.id, 'confirm', { quantity: 0 }, 400);
+    await change(task.id, 'confirm', { quantity: 2_147_483_648 }, 400);
+
+    await Promise.all([
+      change(task.id, 'confirm', { quantity: 1 }, [201, 409]),
+      change(task.id, 'cancel', { reason: 'Concurrent cancellation' }, [201, 409]),
+    ]);
+    const saved = await own('GET', `/tasks/${task.id}`);
+    assert.ok(['DONE', 'CANCELLED'].includes(saved.status));
+    assert.equal(saved.version, started.version + 1);
+    if (saved.status === 'DONE') assert.equal(saved.quantity, 1);
+    const terminalAudits = await prisma.auditLog.findMany({
+      where: { resourceId: task.id, action: { in: ['warehouse_task.confirmed', 'warehouse_task.cancelled'] } },
+    });
+    assert.equal(terminalAudits.length, 1);
+    assert.equal(terminalAudits[0].metadata.status, saved.status);
+    await change(task.id, 'start', {}, 409);
+
+    assert.equal((await change(first.id, 'start')).status, 'IN_PROGRESS');
+    const failed = await change(first.id, 'fail', { reason: '  Fixture stock unavailable  ' });
+    assert.equal(failed.status, 'FAILED');
+    assert.equal(failed.failureReason, 'Fixture stock unavailable');
+    assert.ok(failed.completedAt);
+    assert.equal((await change(first.id, 'cancel')).status, 'CANCELLED');
+    const countTask = await own('POST', '/tasks', { ...body, type: 'COUNT', quantity: 0 });
+    assert.equal(countTask.quantity, 0);
+    assert.equal((await change(countTask.id, 'start')).status, 'IN_PROGRESS');
+    const confirmed = await change(countTask.id, 'confirm', { quantity: 0 });
+    assert.equal(confirmed.status, 'DONE');
+    assert.equal(confirmed.quantity, 0);
+    assert.ok(confirmed.completedAt);
+  });
+
   await scenario('inbound shipment changes roll back when any line is invalid', async () => {
     const { sku } = await createSku('INBOUND');
     const shipment = await own('POST', '/inbound-shipments', {

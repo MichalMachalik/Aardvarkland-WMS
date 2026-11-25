@@ -17636,7 +17636,10 @@
           },
           "quantity": {
             "type": "number",
-            "example": 12
+            "example": 12,
+            "minimum": 0,
+            "maximum": 2147483647,
+            "description": "Zero is valid for count tasks."
           },
           "handlingUnitReference": {
             "type": "string",
@@ -17742,7 +17745,10 @@
           },
           "quantity": {
             "type": "number",
-            "example": 12
+            "example": 12,
+            "minimum": 0,
+            "maximum": 2147483647,
+            "description": "Zero is valid for count tasks."
           },
           "handlingUnitReference": {
             "type": "string",

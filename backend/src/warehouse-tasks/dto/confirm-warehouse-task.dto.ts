@@ -1,6 +1,6 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
-import { IsInt, IsObject, IsOptional, IsString, MaxLength, Min } from 'class-validator';
+import { IsInt, IsObject, IsOptional, IsString, Max, MaxLength, Min } from 'class-validator';
 
 export class ConfirmWarehouseTaskDto {
   @ApiPropertyOptional({ example: 'A-01-01' })
@@ -21,11 +21,12 @@ export class ConfirmWarehouseTaskDto {
   @MaxLength(120)
   sku?: string;
 
-  @ApiPropertyOptional({ example: 12 })
+  @ApiPropertyOptional({ example: 12, minimum: 0, maximum: 2_147_483_647, description: 'Zero is valid for count tasks.' })
   @IsOptional()
   @Type(() => Number)
   @IsInt()
   @Min(0)
+  @Max(2_147_483_647)
   quantity?: number;
 
   @ApiPropertyOptional({ example: 'HU-100001' })

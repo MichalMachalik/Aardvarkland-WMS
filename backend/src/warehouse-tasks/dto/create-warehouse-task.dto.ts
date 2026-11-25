@@ -1,6 +1,6 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
-import { IsEnum, IsInt, IsObject, IsOptional, IsString, MaxLength, Min } from 'class-validator';
+import { IsEnum, IsInt, IsObject, IsOptional, IsString, Max, MaxLength, Min } from 'class-validator';
 
 import { WarehouseTaskStatus, WarehouseTaskType } from '../warehouse-tasks.types';
 
@@ -38,11 +38,12 @@ export class CreateWarehouseTaskDto {
   @MaxLength(120)
   sku?: string;
 
-  @ApiPropertyOptional({ example: 12 })
+  @ApiPropertyOptional({ example: 12, minimum: 0, maximum: 2_147_483_647, description: 'Zero is valid for count tasks.' })
   @IsOptional()
   @Type(() => Number)
   @IsInt()
   @Min(0)
+  @Max(2_147_483_647)
   quantity?: number;
 
   @ApiPropertyOptional({ example: 'HU-100001' })
