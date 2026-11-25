@@ -19,13 +19,14 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           persist-credentials: false
-      - name: Configure login capacity for disposable test accounts
+      - name: Configure request capacity for the disposable test suite
         run: |
           override="$RUNNER_TEMP/wms-ci.compose.yml"
           cat > "$override" <<'YAML'
           services:
             backend:
               environment:
+                RATE_LIMIT_MAX: "2500"
                 RATE_LIMIT_AUTH_LOGIN_MAX: "100"
           YAML
           printf 'COMPOSE_FILE=docker-compose.yml:%s\n' "$override" >> "$GITHUB_ENV"

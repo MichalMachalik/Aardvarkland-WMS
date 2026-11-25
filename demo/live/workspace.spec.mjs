@@ -1117,7 +1117,13 @@ test('cycle counts isolate plans, hide the RF quantity and write only approved c
     await input.fill('2147483648');
     await expect(confirm).toBeDisabled();
     await input.fill('3');
+    const completion = workerPage.waitForResponse(response =>
+      response.request().method() === 'POST' && /\/rf\/sessions\/[^/]+\/scan$/.test(new URL(response.url()).pathname));
     await confirm.click();
+    const response = await completion;
+    const savedCount = await response.json();
+    expect(response.ok(), `RF count submission returned ${response.status()} ${JSON.stringify(savedCount.error ?? savedCount.message ?? '').slice(0, 180)}`).toBe(true);
+    expect((savedCount.data ?? savedCount).status).toBe('COMPLETED');
     await expect(input).toBeDisabled();
     await expect(workerPage.getByRole('heading', { name: 'Dokončeno' })).toBeVisible();
     const [submitted] = await api(warehouse + `/cycle-counts/${rfPlan.id}/tasks`, { token: admin });
