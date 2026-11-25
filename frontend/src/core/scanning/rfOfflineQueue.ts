@@ -3,6 +3,7 @@ const DATABASE_VERSION = 1;
 const STORE_NAME = 'offline-scans';
 const LEGACY_STORAGE_KEY = 'wms-rf-offline-queue-v2';
 const FALLBACK_STORAGE_KEY = 'wms-rf-offline-queue-v3';
+const FALLBACK_RECORD_PREFIX = 'wms-rf-offline-queue-v4';
 const QUEUE_LOCK = 'wms-rf-offline-queue';
 
 export interface StoredRfOfflineScan {
@@ -19,6 +20,7 @@ export interface StoredRfOfflineScan {
 }
 
 type UpdateQueue = (scans: StoredRfOfflineScan[]) => StoredRfOfflineScan[];
+type QueueChange = { scan: StoredRfOfflineScan } | { confirmed: string[]; failed: string[] };
 
 // Persist each user-acknowledged scan before indicating success in the scanner UI.
 const warehouseOperations = new Map<string, Promise<void>>();
@@ -39,48 +41,40 @@ export function loadRfOfflineQueue(warehouseId: string): Promise<StoredRfOffline
   return serializeWarehouse(normalizedWarehouse, () => accessRfOfflineQueue(normalizedWarehouse));
 }
 
-async function accessRfOfflineQueue(warehouseId: string, update?: UpdateQueue): Promise<StoredRfOfflineScan[]> {
-  // Read the fallback first. IndexedDB might recover after the fallback received
-  // newer unacknowledged scans; never erase those scans merely because IDB opens.
-  const fallback = loadFallbackQueue(warehouseId);
-  let pendingWrite: StoredRfOfflineScan[] | undefined;
+async function accessRfOfflineQueue(warehouseId: string, change?: QueueChange): Promise<StoredRfOfflineScan[]> {
+  const storage = window.localStorage;
+  const prefix = `${FALLBACK_RECORD_PREFIX}:${encodeURIComponent(warehouseId)}:`;
+  const activeKey = `${prefix}active`;
+  const legacy = loadFallbackQueue(storage, warehouseId);
+  let useFallback = legacy !== null || storage.getItem(activeKey) !== null;
+  let primary: StoredRfOfflineScan[] = [];
+  let primaryCommitted = false;
+
   try {
     const database = await openDatabase();
     try {
       await migrateLegacyQueue(database, warehouseId);
-      if (!update && fallback === null) return await transactWarehouseQueue(database, warehouseId);
-
-      const scans = await transactWarehouseQueue(database, warehouseId, stored => {
-        const merged = mergeScans(stored, fallback ?? []);
-        pendingWrite = update ? update(merged) : merged;
-        return pendingWrite;
-      });
-      if (fallback !== null) removeFallbackQueue(warehouseId);
-      return scans;
+      primary = await transactWarehouseQueue(database, warehouseId, change && !useFallback ? stored => {
+        primary = stored;
+        useFallback = storage.getItem(activeKey) !== null;
+        return useFallback ? stored : applyChange(stored, change);
+      } : undefined);
+      // If another tab activated the fallback after our commit, this change is
+      // already durable in IndexedDB. The combined view still includes it.
+      primaryCommitted = !useFallback;
+      if (primaryCommitted && storage.getItem(activeKey) === null) return primary;
     } finally {
       database.close();
     }
   } catch (error) {
-    // Do not silently create an empty queue when an existing IDB queue might
-    // only be temporarily inaccessible.
-    if (update) {
-      const next = pendingWrite ?? (fallback === null ? null : update(fallback));
-      if (next === null) throw error;
-      saveFallbackQueue(warehouseId, next);
-      return next;
-    }
-    if (fallback !== null) return fallback;
-    throw error;
+    if (error instanceof Error && error.message === 'RF_OFFLINE_DATABASE_CORRUPT') throw error;
   }
-}
 
-export function saveRfOfflineQueue(warehouseId: string, scans: StoredRfOfflineScan[]): Promise<void> {
-  const normalizedWarehouse = normalizeWarehouse(warehouseId);
-  return serializeWarehouse(normalizedWarehouse, async () => {
-    await persistWarehouseQueue(normalizedWarehouse, mergeScans(
-      scans.map((scan) => ({ ...scan, warehouseId: normalizedWarehouse })),
-    ));
-  });
+  // Keep fallback records as a separate source after IndexedDB recovers.
+  // Copying and deleting them across stores would race another tab's updates.
+  storage.setItem(activeKey, '1');
+  if (change && !primaryCommitted) writeFallbackChange(storage, prefix, change);
+  return readFallbackRecords(storage, prefix, warehouseId, mergeScans(primary, legacy ?? []));
 }
 
 export function appendRfOfflineScan(
@@ -89,8 +83,7 @@ export function appendRfOfflineScan(
 ): Promise<StoredRfOfflineScan[]> {
   const normalizedWarehouse = normalizeWarehouse(warehouseId);
   return serializeWarehouse(normalizedWarehouse, () =>
-    accessRfOfflineQueue(normalizedWarehouse, stored =>
-      mergeScans(stored, [{ ...scan, warehouseId: normalizedWarehouse }])));
+    accessRfOfflineQueue(normalizedWarehouse, { scan: { ...scan, warehouseId: normalizedWarehouse } }));
 }
 
 export function applyRfOfflineResults(
@@ -99,27 +92,17 @@ export function applyRfOfflineResults(
   failedIdempotencyKeys: string[] = [],
 ): Promise<StoredRfOfflineScan[]> {
   const normalizedWarehouse = normalizeWarehouse(warehouseId);
-  const confirmed = new Set(confirmedIdempotencyKeys);
-  const failed = new Set(failedIdempotencyKeys);
   return serializeWarehouse(normalizedWarehouse, () =>
-    accessRfOfflineQueue(normalizedWarehouse, stored => stored
-      .filter(scan => !confirmed.has(scan.idempotencyKey))
-      .map(scan => failed.has(scan.idempotencyKey) ? { ...scan, replayFailed: true } : scan)));
+    accessRfOfflineQueue(normalizedWarehouse, { confirmed: confirmedIdempotencyKeys, failed: failedIdempotencyKeys }));
 }
 
-async function persistWarehouseQueue(warehouseId: string, scans: StoredRfOfflineScan[]): Promise<void> {
-  let database: IDBDatabase | null = null;
-  try {
-    database = await openDatabase();
-    await transactWarehouseQueue(database, warehouseId, () => scans);
-    removeFallbackQueue(warehouseId);
-  } catch {
-    // If IndexedDB failed, fallback storage must also acknowledge its write.
-    // Quota/permission errors must reach the UI, never be reported as saved.
-    saveFallbackQueue(warehouseId, scans);
-  } finally {
-    database?.close();
-  }
+function applyChange(stored: StoredRfOfflineScan[], change: QueueChange): StoredRfOfflineScan[] {
+  if ('scan' in change) return mergeScans(stored, [change.scan]);
+
+  const confirmed = new Set(change.confirmed);
+  const failed = new Set(change.failed);
+  return sortAndLimit(stored.filter(scan => !confirmed.has(scan.idempotencyKey))
+    .map(scan => failed.has(scan.idempotencyKey) ? { ...scan, replayFailed: true } : scan));
 }
 
 function mergeScans(...groups: StoredRfOfflineScan[][]): StoredRfOfflineScan[] {
@@ -211,10 +194,9 @@ async function migrateLegacyQueue(database: IDBDatabase, warehouseId: string): P
   }
 }
 
-function loadFallbackQueue(warehouseId: string): StoredRfOfflineScan[] | null {
-  if (typeof window === 'undefined') return null;
+function loadFallbackQueue(storage: Storage, warehouseId: string): StoredRfOfflineScan[] | null {
   try {
-    const raw = window.localStorage.getItem(fallbackKey(warehouseId));
+    const raw = storage.getItem(`${FALLBACK_STORAGE_KEY}:${warehouseId}`);
     if (raw === null) return null;
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) throw new Error('RF_OFFLINE_FALLBACK_CORRUPT');
@@ -226,18 +208,47 @@ function loadFallbackQueue(warehouseId: string): StoredRfOfflineScan[] | null {
   }
 }
 
-function saveFallbackQueue(warehouseId: string, scans: StoredRfOfflineScan[]): void {
-  if (typeof window === 'undefined') throw new Error('RF_OFFLINE_STORAGE_UNAVAILABLE');
-  window.localStorage.setItem(fallbackKey(warehouseId), JSON.stringify(scans));
+function writeFallbackChange(storage: Storage, prefix: string, change: QueueChange): void {
+  if ('scan' in change) {
+    const [scan] = normalizeScans([change.scan]);
+    if (!scan) throw new Error('RF_OFFLINE_SCAN_INVALID');
+    storage.setItem(fallbackRecordKey(prefix, 'scan', scan.idempotencyKey), JSON.stringify(scan));
+    return;
+  }
+  const confirmed = new Set(change.confirmed);
+  for (const id of change.failed) {
+    if (!confirmed.has(id)) storage.setItem(fallbackRecordKey(prefix, 'failed', id), '1');
+  }
+  for (const id of confirmed) {
+    const key = fallbackRecordKey(prefix, 'scan', id);
+    if (storage.getItem(key) === null) {
+      // An older scan can still be present in IndexedDB or the legacy snapshot.
+      storage.setItem(fallbackRecordKey(prefix, 'confirmed', id), '1');
+    } else {
+      storage.removeItem(key);
+    }
+    storage.removeItem(fallbackRecordKey(prefix, 'failed', id));
+  }
 }
 
-function removeFallbackQueue(warehouseId: string): void {
-  if (typeof window === 'undefined') return;
-  try {
-    window.localStorage.removeItem(fallbackKey(warehouseId));
-  } catch {
-    // Primary is already durably written; retry removal at a later launch.
+function readFallbackRecords(
+  storage: Storage, prefix: string, warehouseId: string, stored: StoredRfOfflineScan[],
+): StoredRfOfflineScan[] {
+  const records: StoredRfOfflineScan[] = [];
+  for (const key of Object.keys(storage)) {
+    if (!key.startsWith(`${prefix}scan:`)) continue;
+    const value = storage.getItem(key);
+    if (value === null) continue;
+    const [scan] = normalizeScans([JSON.parse(value)]);
+    if (!scan || scan.warehouseId !== warehouseId || fallbackRecordKey(prefix, 'scan', scan.idempotencyKey) !== key) {
+      throw new Error('RF_OFFLINE_FALLBACK_CORRUPT');
+    }
+    records.push(scan);
   }
+  return mergeScans(stored, records)
+    .filter(scan => storage.getItem(fallbackRecordKey(prefix, 'confirmed', scan.idempotencyKey)) === null)
+    .map(scan => storage.getItem(fallbackRecordKey(prefix, 'failed', scan.idempotencyKey)) === null
+      ? scan : { ...scan, replayFailed: true });
 }
 
 function normalizeScans(value: unknown): StoredRfOfflineScan[] {
@@ -275,8 +286,8 @@ function normalizeWarehouse(value: string): string {
   return value.trim().toUpperCase() || 'MAIN';
 }
 
-function fallbackKey(warehouseId: string): string {
-  return `${FALLBACK_STORAGE_KEY}:${warehouseId}`;
+function fallbackRecordKey(prefix: string, kind: 'scan' | 'confirmed' | 'failed', id: string): string {
+  return `${prefix}${kind}:${encodeURIComponent(id)}`;
 }
 
 function stringValue(value: unknown): string {

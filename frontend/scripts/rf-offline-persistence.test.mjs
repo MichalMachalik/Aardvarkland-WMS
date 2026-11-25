@@ -9,20 +9,23 @@ const compiled = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
 }).outputText;
 
-function harness({ denyWrites = false, values = new Map(), locks } = {}) {
-  const storage = {
-    getItem(key) { return values.get(key) ?? null; },
+function memoryStorage(denyWrites = false) {
+  return Object.create({
+    getItem(key) { return Object.hasOwn(this, key) ? this[key] : null; },
     setItem(key, value) {
       if (denyWrites) throw new Error('QuotaExceededError');
-      values.set(key, value);
+      this[key] = String(value);
     },
-    removeItem(key) { values.delete(key); },
-  };
+    removeItem(key) { delete this[key]; },
+  });
+}
+
+function harness({ storage = memoryStorage(), locks } = {}) {
   const exports = {};
   vm.runInNewContext(compiled, {
     exports, window: { localStorage: storage }, navigator: { locks }, Map, Date, Promise,
   });
-  return { api: exports, values };
+  return { api: exports, storage };
 }
 function scan(n) {
   return {
@@ -33,8 +36,8 @@ function scan(n) {
 }
 
 test('501 offline scans persist and recover without silently dropping the oldest', async () => {
-  const { api } = harness();
-  await api.saveRfOfflineQueue('MAIN', Array.from({ length: 501 }, (_, i) => scan(i)));
+  const { api, storage } = harness();
+  storage.setItem('wms-rf-offline-queue-v3:MAIN', JSON.stringify(Array.from({ length: 501 }, (_, i) => scan(i))));
   const loaded = await api.loadRfOfflineQueue('MAIN');
   assert.equal(loaded.length, 501);
   assert.ok(loaded.some((item) => item.idempotencyKey === 'key-0'));
@@ -48,12 +51,12 @@ test('501 offline scans persist and recover without silently dropping the oldest
 });
 
 test('no local storage can accept writes: user must receive a persistence error', async () => {
-  const { api } = harness({ denyWrites: true });
-  await assert.rejects(api.saveRfOfflineQueue('MAIN', [scan(1)]));
+  const { api } = harness({ storage: memoryStorage(true) });
+  await assert.rejects(api.appendRfOfflineScan('MAIN', scan(1)), /QuotaExceededError/);
 });
 
 test('tabs share a storage lock for offline writes and acknowledgments', async () => {
-  const values = new Map();
+  const storage = memoryStorage();
   const pending = new Map();
   const locks = {
     request(name, action) {
@@ -63,9 +66,9 @@ test('tabs share a storage lock for offline writes and acknowledgments', async (
       return operation;
     },
   };
-  const { api: firstTab } = harness({ values, locks });
-  const { api: secondTab } = harness({ values, locks });
-  await firstTab.saveRfOfflineQueue('MAIN', []);
+  const { api: firstTab } = harness({ storage, locks });
+  const { api: secondTab } = harness({ storage, locks });
+  assert.equal((await firstTab.loadRfOfflineQueue('MAIN')).length, 0);
   await Promise.all([
     firstTab.appendRfOfflineScan('MAIN', scan(1)),
     secondTab.appendRfOfflineScan('MAIN', scan(2)),
