@@ -67,7 +67,7 @@ export function validateCarrierLabelRequest(input: CarrierLabelRequest): string[
 
 export function createCarrierLabelPayload(input: CarrierLabelRequest): CarrierLabelResult {
   const carrier = normalizeCarrierCode(input.carrier);
-  const idempotencyKey = normalizeIdempotencyKey(input);
+  const idempotencyKey = carrierLabelIdempotencyKey(input);
   const labelReference = `${carrier}-${shortHash(`${input.shipmentNumber}:${input.packageCode ?? input.packageId ?? 'SHIPMENT'}:${idempotencyKey}`)}`;
   const trackingNumber = `${carrier}-${shortHash(`${labelReference}:${input.warehouseId}`).slice(0, 14)}`;
   const labelFormat = carrier === 'CARRIER_D' ? 'PDF' : 'ZPL';
@@ -90,7 +90,7 @@ export function createCarrierManifestPayload(input: { carrier: string; warehouse
   };
 }
 
-function normalizeIdempotencyKey(input: CarrierLabelRequest): string {
+export function carrierLabelIdempotencyKey(input: CarrierLabelRequest): string {
   return input.idempotencyKey?.trim() || shortHash(`${input.carrier}:${input.shipmentId}:${input.packageId ?? 'shipment'}`);
 }
 

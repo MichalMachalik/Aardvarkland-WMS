@@ -1,7 +1,7 @@
 import { createHash, createHmac } from 'node:crypto';
 
 import { verifyWebhookSignature } from '../../common';
-import { normalizeCarrierCode } from '../carriers.helpers';
+import { carrierLabelIdempotencyKey, normalizeCarrierCode } from '../carriers.helpers';
 import { CarrierLabelRequest, CarrierLabelResult, CarrierTrackingStatus } from '../carriers.types';
 import {
   CarrierAdapterExecutionInput,
@@ -35,7 +35,7 @@ export function resolveEffectiveCarrierAdapterMode(input: {
 
 export function createMockCarrierLabelResult(input: CarrierLabelRequest, adapterCode = 'LOCAL_TEST_CARRIER_ADAPTER'): CarrierLabelResult {
   const carrier = normalizeCarrierCode(input.carrier);
-  const idempotencyKey = normalizeIdempotencyKey(input);
+  const idempotencyKey = carrierLabelIdempotencyKey(input);
   const labelReference = `${carrier}-${shortHash(`${input.shipmentNumber}:${input.packageCode ?? input.packageId ?? 'SHIPMENT'}:${idempotencyKey}`)}`;
   const trackingNumber = `${carrier}-${shortHash(`${labelReference}:${input.warehouseId}`).slice(0, 14)}`;
   const labelFormat = carrier === 'CARRIER_D' ? 'PDF' : 'ZPL';
@@ -178,12 +178,10 @@ export function normalizeCarrierWebhookSignature(input: CarrierWebhookSignatureI
   return ok ? { ok: true, headerName } : { ok: false, reason: `Invalid ${carrier} webhook signature`, headerName };
 }
 
-export function normalizeTrackingWebhookPayload(carrierInput: string, payload: Record<string, unknown>): CarrierTrackingWebhookNormalizedEvent {
-  const carrier = normalizeCarrierCode(carrierInput);
+export function normalizeTrackingWebhookPayload(payload: Record<string, unknown>): CarrierTrackingWebhookNormalizedEvent {
   const trackingNumber = firstString(payload, ['trackingNumber', 'tracking_number', 'trackingId', 'trackingIdNumber', 'shipmentTrackingNumber', 'barcode']);
   const labelReference = firstString(payload, ['labelReference', 'label_reference', 'labelId', 'shipmentId', 'packetId']);
-  const externalEventId = firstString(payload, ['externalEventId', 'eventId', 'id', 'trackingEventId'])
-    ?? (trackingNumber ? `${carrier}:${trackingNumber}:${firstString(payload, ['status', 'eventCode', 'code']) ?? 'UNKNOWN'}` : null);
+  const externalEventId = firstString(payload, ['externalEventId', 'eventId', 'id', 'trackingEventId']);
   const rawStatus = firstString(payload, ['status', 'shipmentStatus', 'eventStatus', 'code', 'eventCode']);
   const eventCode = firstString(payload, ['eventCode', 'code', 'scanCode', 'activityCode']);
   const message = firstString(payload, ['message', 'description', 'eventDescription', 'statusDescription']);
@@ -249,10 +247,6 @@ export function firstString(value: unknown, keys: string[]): string | null {
     if (typeof found === 'number' && Number.isFinite(found)) return String(found);
   }
   return null;
-}
-
-function normalizeIdempotencyKey(input: CarrierLabelRequest): string {
-  return input.idempotencyKey?.trim() || shortHash(`${input.carrier}:${input.shipmentId}:${input.packageId ?? 'shipment'}`);
 }
 
 function shortHash(value: string): string {

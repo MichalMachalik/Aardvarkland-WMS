@@ -1,4 +1,5 @@
-import { ConflictException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import { createHash } from 'node:crypto';
+import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 
 import { AuthenticatedUser } from '../access-control/types';
@@ -8,6 +9,7 @@ import {
   normalizeOffsetPagination,
   PageEnvelope,
   safeCompareSecrets,
+  stableJsonStringify,
 } from '../common';
 import { Env } from '../config/env';
 import {
@@ -18,6 +20,7 @@ import {
   normalizeCarrierCredentialStatus,
 } from './carrier-credentials.helpers';
 import { PrismaService, withTransactionRetry } from '../database';
+import { lockPostgresAdvisoryTransaction, lockPostgresRowById } from '../database/transaction-locks';
 import {
   CarrierAdapterMode,
   CarrierCredentialContext,
@@ -33,6 +36,7 @@ import {
 } from './carrier-tracking.helpers';
 import {
   carrierRequiresLabel,
+  carrierLabelIdempotencyKey,
   createCarrierManifestPayload,
   getCarrierServiceProfile,
   listCarrierProfiles,
@@ -48,6 +52,7 @@ import { UpsertCarrierCredentialDto } from './dto/upsert-carrier-credential.dto'
 import { VoidCarrierLabelDto } from './dto/void-carrier-label.dto';
 import {
   CarrierCredentialResponse,
+  CarrierLabelResult,
   CarrierServiceProfile,
   CarrierTrackingEventResponse,
   CarrierTrackingStatus,
@@ -97,9 +102,9 @@ export class CarriersService {
       const result = await tx.carrierCredential.upsert({
         where: { warehouseId_carrier_environment: { warehouseId: warehouse.id, carrier, environment } },
         update: {
-          status,
-          accountNumber: normalizeOptionalString(dto.accountNumber),
-          metadata: dto.metadata ?? null,
+          ...(dto.status == null ? {} : { status }),
+          ...(dto.accountNumber === undefined ? {} : { accountNumber: normalizeOptionalString(dto.accountNumber) }),
+          ...(dto.metadata === undefined ? {} : { metadata: dto.metadata }),
           ...(encryptedSecrets
             ? {
                 secretCiphertext: encryptedSecrets,
@@ -127,7 +132,7 @@ export class CarriersService {
       await this.writeAudit(tx, actor.id, warehouse.id, 'carrier.credentials_upserted', 'carrier_credential', result.id, {
         carrier,
         environment,
-        status,
+        status: result.status,
         hasSecret: Boolean(encryptedSecrets),
         secretFingerprint: encryptedSecrets?.fingerprint ?? null,
       });
@@ -135,7 +140,7 @@ export class CarriersService {
         warehouseId: warehouse.id,
         carrier,
         environment,
-        status,
+        status: result.status,
         hasSecret: Boolean(encryptedSecrets),
       });
       return result;
@@ -169,7 +174,7 @@ export class CarriersService {
         packageId: shipmentPackage?.id ?? null,
         packageCode: shipmentPackage?.packageCode ?? null,
         carrier,
-        serviceLevel: dto.serviceLevel ?? shipment.serviceLevel ?? null,
+        serviceLevel: normalizeOptionalString(dto.serviceLevel ?? shipment.serviceLevel),
         dimensions: {
           weightGrams: dto.weightGrams ?? shipmentPackage?.weightGrams ?? null,
           lengthCm: dto.lengthCm ?? shipmentPackage?.lengthCm ?? null,
@@ -185,17 +190,41 @@ export class CarriersService {
         throw new ConflictException({ code: 'carrier_label_invalid', message: 'Carrier label request is invalid', details: validationIssues.map((code) => ({ code, message: code })) });
       }
 
+      const idempotencyKey = carrierLabelIdempotencyKey(request);
+      const requestHash = createHash('sha256').update(stableJsonStringify({
+        serviceLevel: request.serviceLevel,
+        dimensions: request.dimensions,
+        ownerClientId: owner?.id ?? null,
+        environment: dto.environment ? normalizeCarrierCredentialEnvironment(dto.environment) : null,
+        metadata: request.metadata,
+      })).digest('hex');
+      await lockPostgresAdvisoryTransaction(tx, 'carrier_label_request', JSON.stringify([
+        warehouse.id, carrier, shipment.id, request.packageId, idempotencyKey,
+      ]));
+      const existing = await tx.carrierLabel.findFirst({
+        where: {
+          warehouseId: warehouse.id, shipmentId: shipment.id, packageId: request.packageId, carrier,
+          payload: { path: ['idempotencyKey'], equals: idempotencyKey },
+        },
+      });
+      if (existing) {
+        const storedHash = toRecord(existing.payload)['requestHash'];
+        if (typeof storedHash === 'string' && storedHash !== requestHash) {
+          throw new ConflictException('The carrier label request key was already used with different details');
+        }
+        return { duplicate: true, label: toCarrierLabelResponse(existing), adapter: toSavedCarrierAdapter(existing, carrier, idempotencyKey) };
+      }
+
       const credential = await this.resolveCarrierCredentialContext(tx, warehouse.id, carrier, dto.environment);
       const adapter = await createCarrierLabelWithAdapter({
-        request,
+        request: { ...request, idempotencyKey },
         credential,
         mode: this.getCarrierAdapterMode(),
         timeoutMs: this.getCarrierHttpTimeoutMs(),
       });
-      const existing = await tx.carrierLabel.findFirst({ where: { warehouseId: warehouse.id, labelReference: adapter.labelReference } });
-
-      if (existing) {
-        return { duplicate: true, label: toCarrierLabelResponse(existing), adapter };
+      const referenceExists = await tx.carrierLabel.findFirst({ where: { warehouseId: warehouse.id, labelReference: adapter.labelReference } });
+      if (referenceExists) {
+        throw new ConflictException('The carrier returned a label reference already assigned to another request');
       }
 
       const label = await tx.carrierLabel.create({
@@ -217,6 +246,7 @@ export class CarriersService {
             externalShipmentId: adapter.externalShipmentId ?? null,
             rawResponse: adapter.rawResponse ?? null,
             idempotencyKey: adapter.idempotencyKey,
+            requestHash,
             environment: credential?.environment ?? dto.environment ?? null,
             requestMetadata: dto.metadata ?? null,
           },
@@ -250,7 +280,8 @@ export class CarriersService {
     }
 
     return this.transaction(async (tx) => {
-      const label = await tx.carrierLabel.findFirst({ where: { warehouseId: warehouse.id, labelReference, carrier } });
+      const found = await tx.carrierLabel.findFirst({ where: { warehouseId: warehouse.id, labelReference, carrier } });
+      const label = found ? await this.lockCarrierLabel(tx, found) : null;
 
       if (!label) throw new NotFoundException('Carrier label was not found');
       if (label.status === 'CANCELLED') return { labelReference: label.labelReference, carrier, status: label.status, voided: false };
@@ -269,13 +300,22 @@ export class CarriersService {
 
   async closeManifest(warehouseReference: string, carrierInput: string, dto: CloseCarrierManifestDto, actor: AuthenticatedUser): Promise<CloseCarrierManifestResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
-    const carrier = normalizeCarrierCode(dto.carrier ?? carrierInput);
+    const carrier = normalizeCarrierCode(carrierInput);
+    if (dto.carrier && normalizeCarrierCode(dto.carrier) !== carrier) {
+      throw new ConflictException('The manifest carrier must match the requested carrier');
+    }
     const profile = getCarrierServiceProfile(carrier);
 
     if (!profile.supportsManifest) throw new ConflictException(`Carrier ${carrier} does not support manifests`);
 
+    const serviceLevel = normalizeOptionalString(dto.serviceLevel);
     return this.transaction(async (tx) => {
-      const labels = await tx.carrierLabel.findMany({ where: { warehouseId: warehouse.id, carrier, status: { in: ['GENERATED', 'PRINTED'] }, ...(dto.serviceLevel ? { serviceLevel: normalizeCarrierCode(dto.serviceLevel) } : {}) } });
+      const labels = await tx.carrierLabel.findMany({
+        where: {
+          warehouseId: warehouse.id, carrier, status: { in: ['GENERATED', 'PRINTED'] },
+          ...(serviceLevel ? { serviceLevel: { equals: serviceLevel, mode: 'insensitive' } } : {}),
+        },
+      });
       const shipmentIds = new Set(labels.map((label) => label.shipmentId).filter(isString));
       const packageIds = new Set(labels.map((label) => label.packageId).filter(isString));
       const manifest = createCarrierManifestPayload({ carrier, warehouseId: warehouse.id, shipmentCount: shipmentIds.size, packageCount: packageIds.size });
@@ -313,18 +353,25 @@ export class CarriersService {
     this.assertWebhookSecret(carrier, webhookSecret, headers, dto);
 
     return this.transaction(async (tx) => {
-      const normalizedWebhook = dto.rawPayload ? normalizeTrackingWebhookPayload(carrier, dto.rawPayload) : null;
-      const label = await this.resolveCarrierLabelForTracking(tx, warehouse.id, carrier, dto);
-      const shipmentPackage = await this.resolvePackageForTracking(tx, warehouse.id, label, dto);
+      const normalizedWebhook = dto.rawPayload ? normalizeTrackingWebhookPayload(dto.rawPayload) : null;
+      const providedLabelReference = normalizeOptionalString(dto.labelReference) ?? normalizedWebhook?.labelReference ?? null;
+      const providedTrackingNumber = normalizeOptionalString(dto.trackingNumber) ?? normalizedWebhook?.trackingNumber ?? null;
+      const timestamp = dto.occurredAt ?? normalizedWebhook?.occurredAt;
+      const occurredAt = timestamp ? new Date(timestamp) : new Date();
+      if (Number.isNaN(occurredAt.getTime())) {
+        throw new BadRequestException('Carrier tracking timestamp must be a valid date');
+      }
+      const label = await this.resolveCarrierLabelForTracking(tx, warehouse.id, carrier, providedLabelReference, providedTrackingNumber);
+      const shipmentPackage = await this.resolvePackageForTracking(tx, warehouse.id, label, dto.packageReference, providedTrackingNumber);
       const shipment = await this.resolveShipmentForTracking(tx, warehouse.id, label, shipmentPackage, dto);
-      const occurredAt = dto.occurredAt ? new Date(dto.occurredAt) : normalizedWebhook?.occurredAt ? new Date(normalizedWebhook.occurredAt) : new Date();
       const status = dto.status ? normalizeCarrierTrackingStatus(dto.status) : normalizedWebhook?.status ?? normalizeCarrierTrackingStatus(dto.status);
-      const labelReference = dto.labelReference ?? normalizedWebhook?.labelReference ?? label?.labelReference ?? null;
-      const trackingNumber = dto.trackingNumber ?? normalizedWebhook?.trackingNumber ?? label?.trackingNumber ?? shipmentPackage?.trackingNumber ?? null;
+      const labelReference = label?.labelReference ?? providedLabelReference;
+      const trackingNumber = providedTrackingNumber ?? label?.trackingNumber ?? shipmentPackage?.trackingNumber ?? null;
       const eventCode = normalizeOptionalString(dto.eventCode) ?? normalizedWebhook?.eventCode ?? null;
       const message = normalizeOptionalString(dto.message) ?? normalizedWebhook?.message ?? null;
-      const externalEventId = dto.externalEventId ?? normalizedWebhook?.externalEventId ?? createCarrierTrackingExternalId({ carrier, labelReference, trackingNumber, status, eventCode, occurredAt, message });
-      const existing = await tx.carrierTrackingEvent.findFirst({ where: { warehouseId: warehouse.id, carrier, externalEventId } });
+      const externalEventId = normalizeOptionalString(dto.externalEventId) ?? normalizedWebhook?.externalEventId
+        ?? createCarrierTrackingExternalId({ carrier, labelReference, trackingNumber, status, eventCode, occurredAt: timestamp ? occurredAt : null, message });
+      const existing = await this.findExistingTrackingEvent(tx, warehouse.id, carrier, externalEventId);
 
       if (existing) return { duplicate: true, event: toCarrierTrackingEventResponse(existing) };
 
@@ -346,7 +393,7 @@ export class CarriersService {
       });
 
       await this.afterTrackingEvent(tx, warehouse.id, carrier, event, label, shipmentPackage, null);
-      await this.recordInboxEvent(tx, carrier, externalEventId, dto, headers, event.id);
+      await this.recordInboxEvent(tx, warehouse.id, carrier, externalEventId, dto, headers, event.id);
 
       return { duplicate: false, event: toCarrierTrackingEventResponse(event) };
     });
@@ -359,13 +406,13 @@ export class CarriersService {
     const maxEvents = Math.max(1, Math.min(dto.maxEvents ?? 50, 250));
 
     return this.transaction(async (tx) => {
-      const labels = await tx.carrierLabel.findMany({ where: { warehouseId: warehouse.id, carrier, status: { in: ['GENERATED', 'PRINTED'] } }, orderBy: { createdAt: 'asc' }, take: maxEvents });
+      const labels = await tx.carrierLabel.findMany({ where: { warehouseId: warehouse.id, carrier, status: { in: ['GENERATED', 'PRINTED'] } }, orderBy: [{ createdAt: 'asc' }, { id: 'asc' }], take: maxEvents });
       const events: CarrierTrackingEventResponse[] = [];
       let skippedDuplicates = 0;
 
       for (const label of labels) {
         const externalEventId = `LOCAL_SYNC:${label.labelReference}:${status}`;
-        const existing = await tx.carrierTrackingEvent.findFirst({ where: { warehouseId: warehouse.id, carrier, externalEventId } });
+        const existing = await this.findExistingTrackingEvent(tx, warehouse.id, carrier, externalEventId);
 
         if (existing) { skippedDuplicates += 1; continue; }
 
@@ -376,6 +423,13 @@ export class CarriersService {
 
       return { carrier, scannedLabels: labels.length, createdEvents: events.length, skippedDuplicates, events };
     });
+  }
+
+  private async findExistingTrackingEvent(
+    tx: CarrierTransactionClient, warehouseId: string, carrier: string, externalEventId: string,
+  ): Promise<CarrierTrackingEventRecord | null> {
+    await lockPostgresAdvisoryTransaction(tx, 'carrier_tracking_event', JSON.stringify([warehouseId, carrier, externalEventId]));
+    return tx.carrierTrackingEvent.findFirst({ where: { warehouseId, carrier, externalEventId } });
   }
 
   private async resolveOperationOwner(
@@ -561,7 +615,19 @@ export class CarriersService {
     const latestTracking = { carrier, status: event.status, eventCode: event.eventCode, message: event.message, occurredAt: toIsoString(event.occurredAt), trackingNumber: event.trackingNumber, labelReference: event.labelReference };
 
     if (label) {
-      await tx.carrierLabel.update({ where: { id: label.id }, data: { ...(event.status === CarrierTrackingStatus.EXCEPTION ? { errorMessage: event.message ?? event.eventCode ?? 'TRACKING_EXCEPTION' } : {}), ...(event.status === CarrierTrackingStatus.CANCELLED ? { status: 'CANCELLED' } : {}), payload: mergeLatestTrackingPayload(label.payload, latestTracking) } });
+      const current = await this.lockCarrierLabel(tx, label);
+      const previous = toRecord(toRecord(current?.payload)['latestTracking'])['occurredAt'];
+      const previousTime = typeof previous === 'string' ? Date.parse(previous) : NaN;
+      if (current && (Number.isNaN(previousTime) || previousTime < toDate(event.occurredAt).getTime())) {
+        await tx.carrierLabel.update({
+          where: { id: current.id },
+          data: {
+            ...(event.status === CarrierTrackingStatus.EXCEPTION ? { errorMessage: event.message ?? event.eventCode ?? 'TRACKING_EXCEPTION' } : {}),
+            ...(event.status === CarrierTrackingStatus.CANCELLED ? { status: 'CANCELLED' } : {}),
+            payload: mergeLatestTrackingPayload(current.payload, latestTracking),
+          },
+        });
+      }
     }
 
     if (shipmentPackage && event.trackingNumber && !shipmentPackage.trackingNumber) {
@@ -588,8 +654,13 @@ export class CarriersService {
     await this.writeOutbox(tx, 'CARRIER_TRACKING_EVENT_RECEIVED', 'carrier_tracking_event', event.id, { warehouseId, ...latestTracking });
   }
 
-  private async recordInboxEvent(tx: CarrierTransactionClient, carrier: string, externalEventId: string, dto: CarrierTrackingWebhookDto, headers: Record<string, string | string[] | undefined>, resourceId: string): Promise<void> {
-    const sourceSystem = `CARRIER:${carrier}`;
+  private async lockCarrierLabel(tx: CarrierTransactionClient, label: CarrierLabelRecord): Promise<CarrierLabelRecord | null> {
+    await lockPostgresRowById(tx, 'carrier_labels', label.id);
+    return tx.carrierLabel.findFirst({ where: { id: label.id, warehouseId: label.warehouseId } });
+  }
+
+  private async recordInboxEvent(tx: CarrierTransactionClient, warehouseId: string, carrier: string, externalEventId: string, dto: CarrierTrackingWebhookDto, headers: Record<string, string | string[] | undefined>, resourceId: string): Promise<void> {
+    const sourceSystem = `CARRIER:${carrier}:${warehouseId}`;
     const existing = await tx.inboxEvent.findFirst({ where: { sourceSystem, externalEventId } });
 
     if (existing) return;
@@ -619,23 +690,39 @@ export class CarriersService {
     return tx.shipmentPackage.findFirst({ where: { warehouseId, shipmentId, status: { in: ['PACKED', 'STAGED', 'LOADED', 'SHIPPED'] } }, orderBy: { createdAt: 'asc' } });
   }
 
-  private async resolveCarrierLabelForTracking(tx: CarrierTransactionClient, warehouseId: string, carrier: string, dto: CarrierTrackingWebhookDto): Promise<CarrierLabelRecord | null> {
-    const or: Record<string, string>[] = [];
-    if (dto.labelReference) or.push({ labelReference: dto.labelReference });
-    if (dto.trackingNumber) or.push({ trackingNumber: dto.trackingNumber });
-    return or.length === 0 ? null : tx.carrierLabel.findFirst({ where: { warehouseId, carrier, OR: or } });
+  private async resolveCarrierLabelForTracking(tx: CarrierTransactionClient, warehouseId: string, carrier: string, labelReference: string | null, trackingNumber: string | null): Promise<CarrierLabelRecord | null> {
+    const label = labelReference
+      ? await tx.carrierLabel.findFirst({ where: { warehouseId, carrier, labelReference } })
+      : null;
+    if (label?.trackingNumber && trackingNumber && label.trackingNumber !== trackingNumber) {
+      throw new ConflictException('Tracking number does not match the referenced carrier label');
+    }
+    return label ?? (trackingNumber ? tx.carrierLabel.findFirst({ where: { warehouseId, carrier, trackingNumber } }) : null);
   }
 
-  private async resolvePackageForTracking(tx: CarrierTransactionClient, warehouseId: string, label: CarrierLabelRecord | null, dto: CarrierTrackingWebhookDto): Promise<ShipmentPackageRecord | null> {
-    if (dto.packageReference) return tx.shipmentPackage.findFirst({ where: { warehouseId, OR: referenceOr(dto.packageReference, { packageCode: normalizeReference(dto.packageReference) }) } });
+  private async resolvePackageForTracking(tx: CarrierTransactionClient, warehouseId: string, label: CarrierLabelRecord | null, packageReference: string | undefined, trackingNumber: string | null): Promise<ShipmentPackageRecord | null> {
+    if (packageReference) {
+      const shipmentPackage = await tx.shipmentPackage.findFirst({ where: { warehouseId, OR: referenceOr(packageReference, { packageCode: normalizeReference(packageReference) }) } });
+      if (!shipmentPackage) throw new NotFoundException('Shipment package was not found');
+      if ((label?.packageId && label.packageId !== shipmentPackage.id) || (label?.shipmentId && label.shipmentId !== shipmentPackage.shipmentId)) {
+        throw new ConflictException('Shipment package does not match the referenced carrier label');
+      }
+      return shipmentPackage;
+    }
     if (label?.packageId) return tx.shipmentPackage.findFirst({ where: { warehouseId, id: label.packageId } });
-    if (dto.trackingNumber) return tx.shipmentPackage.findFirst({ where: { warehouseId, trackingNumber: dto.trackingNumber } });
+    if (trackingNumber) return tx.shipmentPackage.findFirst({ where: { warehouseId, trackingNumber } });
     return null;
   }
 
   private async resolveShipmentForTracking(tx: CarrierTransactionClient, warehouseId: string, label: CarrierLabelRecord | null, shipmentPackage: ShipmentPackageRecord | null, dto: CarrierTrackingWebhookDto): Promise<ShipmentRecord | null> {
-    if (dto.shipmentReference) return this.resolveShipment(tx, warehouseId, dto.shipmentReference);
     const shipmentId = label?.shipmentId ?? shipmentPackage?.shipmentId ?? null;
+    if (dto.shipmentReference) {
+      const shipment = await this.resolveShipment(tx, warehouseId, dto.shipmentReference);
+      if (shipmentId && shipment.id !== shipmentId) {
+        throw new ConflictException('Shipment does not match the referenced carrier label or package');
+      }
+      return shipment;
+    }
     return shipmentId ? tx.shipment.findFirst({ where: { warehouseId, id: shipmentId } }) : null;
   }
 
@@ -676,6 +763,26 @@ function toCarrierCredentialResponse(credential: CarrierCredentialRecord): Carri
 
 function toCarrierLabelResponse(label: CarrierLabelRecord): CreateCarrierLabelResponse['label'] {
   return { id: label.id, labelReference: label.labelReference, status: label.status, carrier: label.carrier ?? null, serviceLevel: label.serviceLevel ?? null, trackingNumber: label.trackingNumber ?? null, labelFormat: label.labelFormat, shipmentId: label.shipmentId ?? null, packageId: label.packageId ?? null, payload: label.payload ?? null };
+}
+
+function toSavedCarrierAdapter(label: CarrierLabelRecord, carrier: string, idempotencyKey: string): CarrierLabelResult {
+  const { labelData, testMode, adapter, externalShipmentId, rawResponse } = toRecord(label.payload);
+  if (!label.trackingNumber || typeof labelData !== 'string' || (label.labelFormat !== 'ZPL' && label.labelFormat !== 'PDF')) {
+    throw new ConflictException('The stored carrier label has incomplete adapter data');
+  }
+  return {
+    carrier,
+    serviceLevel: label.serviceLevel,
+    labelReference: label.labelReference,
+    trackingNumber: label.trackingNumber,
+    labelFormat: label.labelFormat,
+    labelData,
+    idempotencyKey,
+    testMode: testMode === true,
+    ...(typeof adapter === 'string' ? { adapterCode: adapter } : {}),
+    ...(typeof externalShipmentId === 'string' ? { externalShipmentId } : {}),
+    ...(rawResponse ? { rawResponse: toRecord(rawResponse) } : {}),
+  };
 }
 
 function toCarrierTrackingEventResponse(event: CarrierTrackingEventRecord): CarrierTrackingEventResponse {

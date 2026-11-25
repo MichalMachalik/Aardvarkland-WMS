@@ -4,7 +4,7 @@ import { createServer } from 'node:http';
 
 const warehouse = '/api/warehouses/MAIN';
 
-export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, bind, request, login, prisma, runQueueCycle, baseCom }) {
+export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, bind, request, login, prisma, runQueueCycle, baseCom, carrierWebhookSecret }) {
   const suffix = randomUUID().slice(0, 8).toUpperCase();
   const own = (method, path, ...args) => asAdmin(method, warehouse + path, ...args);
   let scenarios = 0;
@@ -2427,6 +2427,130 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     const delivery = await own('POST', `${prefix}/domain-events/${event.id}/replay`);
     const attempts = delivery.filter(item => item.subscriptionId === subscription.id).map(item => item.attemptNumber).sort();
     assert.deepEqual(attempts, [1, 2]);
+  });
+
+  await scenario('carrier credentials stay encrypted and a status-only update preserves the account', async () => {
+    const carrier = `CREDENTIAL-FIXTURE-${suffix}`.replaceAll('-', '_');
+    const path = `/carriers/${carrier}/credentials`;
+    const metadata = { contract: 'Fixture' };
+    const apiKey = randomUUID();
+    const body = { environment: 'test', accountNumber: 'FIXTURE-ACCOUNT', metadata, secrets: { apiKey } };
+    await asWorker('POST', warehouse + path, body, 403);
+    const stored = await own('POST', path, body);
+    assert.equal(stored.environment, 'TEST');
+    assert.equal(stored.secretLast4, apiKey.slice(-4));
+    assert.ok(!JSON.stringify(stored).includes(apiKey));
+    const persisted = await prisma.carrierCredential.findUniqueOrThrow({ where: { id: stored.id } });
+    assert.equal(persisted.secretCiphertext.algorithm, 'aes-256-gcm');
+    assert.ok(!JSON.stringify(persisted).includes(apiKey));
+    const deactivated = await own('POST', path, { status: 'INACTIVE' });
+    assert.equal(deactivated.id, stored.id);
+    assert.equal(deactivated.status, 'INACTIVE');
+    assert.equal(deactivated.accountNumber, body.accountNumber);
+    assert.deepEqual(deactivated.metadata, metadata);
+    assert.equal(deactivated.secretFingerprint, stored.secretFingerprint);
+    const newKey = randomUUID();
+    const rotated = await own('POST', path, { status: 'ACTIVE', secrets: { apiKey: newKey } });
+    assert.equal(rotated.id, stored.id);
+    assert.notEqual(rotated.secretFingerprint, stored.secretFingerprint);
+    assert.equal(rotated.secretLast4, newKey.slice(-4));
+    const listed = await own('GET', `/carriers/credentials?carrier=${carrier}`);
+    assert.equal(listed.length, 1);
+    assert.ok(!JSON.stringify(listed).includes(newKey));
+  });
+
+  async function carrierFixture(group) {
+    const carrier = `FIXTURE_${group}_${suffix}`;
+    const shipment = await own('POST', '/shipments', { shipmentNumber: `CARRIER-${group}-${suffix}` });
+    const shipmentPackage = await own('POST', `/shipments/${shipment.id}/packages`, { packageCode: `PKG-${group}-${suffix}` });
+    const path = `/carriers/${carrier}`;
+    return { carrier, shipment, shipmentPackage, path, body: {
+      shipmentReference: shipment.id,
+      packageReference: shipmentPackage.id,
+      idempotencyKey: randomUUID(),
+      weightGrams: 1000,
+    } };
+  }
+
+  await scenario('carrier label creation is idempotent and checks the original request', async () => {
+    const { path, body, shipmentPackage } = await carrierFixture('LABEL');
+    const labels = path + '/labels';
+    await own('POST', labels, { ...body, packageReference: randomUUID() }, 404);
+    const pair = await Promise.all([own('POST', labels, body), own('POST', labels, body)]);
+    assert.deepEqual(pair.map(result => result.duplicate).sort(), [false, true]);
+    const [first, second] = pair;
+    assert.equal(first.label.id, second.label.id);
+    assert.deepEqual(first.adapter, second.adapter);
+    assert.equal(first.adapter.testMode, true);
+    assert.equal(first.label.packageId, shipmentPackage.id);
+    assert.equal((await prisma.shipmentPackage.findUniqueOrThrow({ where: { id: shipmentPackage.id } })).trackingNumber, first.label.trackingNumber);
+    await own('POST', labels, { ...body, weightGrams: 2000 }, 409);
+    assert.equal(await prisma.auditLog.count({ where: { resourceId: first.label.id, action: 'carrier.label_created' } }), 1);
+  });
+
+  await scenario('carrier manifests respect carrier and service filters and concurrent void happens once', async () => {
+    const { path, carrier, shipment, body } = await carrierFixture('MANIFEST');
+    const extra = await own('POST', `/shipments/${shipment.id}/packages`, { packageCode: `PKG-EXPRESS-${suffix}` });
+    const labels = path + '/labels';
+    const ordinary = await own('POST', labels, { ...body, serviceLevel: 'STANDARD' });
+    const express = await own('POST', labels, { ...body, idempotencyKey: randomUUID(), serviceLevel: 'EXPRESS', packageReference: extra.id });
+    const manifestPath = path + '/manifests/close';
+    const first = await own('POST', manifestPath, { carrier, serviceLevel: ' standard ' });
+    assert.deepEqual([first.manifest.carrier, first.manifest.shipmentCount, first.manifest.packageCount], [carrier, 1, 1]);
+    await own('POST', manifestPath, { carrier: 'OTHER_FIXTURE_CARRIER' }, 409);
+    const voidPath = `${labels}/${ordinary.label.labelReference}/void`;
+    const voided = await Promise.all([
+      own('POST', voidPath, { reasonCode: 'FIXTURE' }),
+      own('POST', voidPath, { reasonCode: 'FIXTURE' }),
+    ]);
+    assert.deepEqual(voided.map(item => item.voided).sort(), [false, true]);
+    assert.ok(voided.every(item => item.status === 'CANCELLED'));
+    assert.equal(await prisma.auditLog.count({ where: { resourceId: ordinary.label.id, action: 'carrier.label_voided' } }), 1);
+    const remaining = await own('POST', manifestPath, {});
+    assert.deepEqual([remaining.manifest.shipmentCount, remaining.manifest.packageCount], [1, 1]);
+    assert.equal((await prisma.carrierLabel.findUniqueOrThrow({ where: { id: express.label.id } })).status, 'GENERATED');
+    await prisma.carrierLabel.update({ where: { id: express.label.id }, data: { status: 'PRINTED' } });
+    await own('POST', `${labels}/${express.label.labelReference}/void`, {}, 409);
+  });
+
+  await scenario('carrier tracking sync and authenticated callbacks keep the latest linked scan', async () => {
+    const { carrier, path, body, shipment, shipmentPackage } = await carrierFixture('TRACKING');
+    const { label } = await own('POST', path + '/labels', body);
+    const syncPath = path + '/tracking-sync';
+    const syncPair = await Promise.all([own('POST', syncPath, { status: 'IN_TRANSIT' }), own('POST', syncPath, { status: 'IN_TRANSIT' })]);
+    assert.deepEqual(syncPair.map(result => result.createdEvents).sort(), [0, 1]);
+    assert.deepEqual(syncPair.map(result => result.skippedDuplicates).sort(), [0, 1]);
+    const callback = warehouse + path + '/webhooks/tracking';
+    const eventBody = {
+      rawPayload: {
+        id: `SCAN-${suffix}`, barcode: label.trackingNumber, eventStatus: 'DELIVERED',
+        eventTime: '2035-02-10T10:00:00.000Z',
+      },
+    };
+    await request('POST', callback, { body: eventBody, expected: 403 });
+    const send = async (body, expected = 201) => (await request('POST', callback, {
+      body, headers: { 'x-webhook-secret': carrierWebhookSecret }, expected,
+    })).data;
+    const reports = await Promise.all([send(eventBody), send(eventBody)]);
+    assert.deepEqual(reports.map(item => item.duplicate).sort(), [false, true]);
+    assert.equal(reports[0].event.id, reports[1].event.id);
+    assert.equal(reports[0].event.shipmentId, shipment.id);
+    assert.equal(reports[0].event.packageId, shipmentPackage.id);
+    assert.equal(reports[0].event.status, 'DELIVERED');
+    const inbox = await prisma.inboxEvent.findFirstOrThrow({ where: { resourceId: reports[0].event.id } });
+    assert.ok(!Object.hasOwn(inbox.headers, 'x-webhook-secret'));
+    const unrelated = await own('POST', `/shipments/${shipment.id}/packages`, { packageCode: `PKG-UNRELATED-${suffix}` });
+    await send({ ...eventBody, packageReference: unrelated.id }, 409);
+    await send({ rawPayload: { ...eventBody.rawPayload, id: `OLD-${suffix}`, eventStatus: 'CANCELLED', eventTime: '2035-02-09T10:00:00.000Z' } });
+    await send({ rawPayload: { ...eventBody.rawPayload, id: `BAD-${suffix}`, eventTime: 'invalid' } }, 400);
+    const noTimestamp = { rawPayload: { barcode: label.trackingNumber, eventStatus: 'OUT_FOR_DELIVERY' } };
+    const unversioned = await send(noTimestamp);
+    assert.equal((await send(noTimestamp)).event.id, unversioned.event.id);
+    const latest = await prisma.carrierLabel.findUniqueOrThrow({ where: { id: label.id } });
+    assert.equal(latest.status, 'GENERATED');
+    assert.equal(latest.payload.latestTracking.status, 'DELIVERED');
+    const list = await own('GET', `/carriers/tracking-events?carrier=${carrier}`);
+    assert.equal(list.items.length, 4);
   });
 
   await scenario('yard check-in links one appointment and rejects missing or conflicting references', async () => {

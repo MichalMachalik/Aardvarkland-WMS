@@ -20,6 +20,7 @@ test('OpenAPI operations on a disposable PostgreSQL database', { timeout: 180000
   const connectionOptions = database.searchParams.get('options');
   database.searchParams.set('options', [connectionOptions, '-c timezone=Europe/Prague'].filter(Boolean).join(' '));
   const baseComToken = randomUUID();
+  const carrierWebhookSecret = randomUUID();
   const baseComOrders = new Map();
   const baseComShippedStatus = 7200;
   const connector = createServer(async (incoming, outgoing) => {
@@ -61,6 +62,8 @@ test('OpenAPI operations on a disposable PostgreSQL database', { timeout: 180000
     DATABASE_DIRECT_URL: database.href,
     NODE_ENV: 'test',
     CARRIER_ADAPTER_MODE: 'mock',
+    CARRIER_CREDENTIAL_ENCRYPTION_KEY: randomUUID(),
+    WEBHOOK_SHARED_SECRET: carrierWebhookSecret,
     BASE_COM_API_URL: `http://127.0.0.1:${connector.address().port}/connector.php`,
     BASE_COM_API_TOKEN: baseComToken,
     BASE_COM_SHIPPED_STATUS_ID: String(baseComShippedStatus),
@@ -89,11 +92,12 @@ test('OpenAPI operations on a disposable PostgreSQL database', { timeout: 180000
   let testedBodylessWrites = 0;
   let testedPublicWrites = 0;
 
-  async function request(method, path, { body, token, key = randomUUID(), expected } = {}) {
+  async function request(method, path, { body, token, key = randomUUID(), expected, headers } = {}) {
     const response = await fetch(origin + path, {
       method,
       redirect: 'error',
       headers: {
+        ...headers,
         ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
         ...(key ? { 'Idempotency-Key': key } : {}),
@@ -246,6 +250,7 @@ test('OpenAPI operations on a disposable PostgreSQL database', { timeout: 180000
     login,
     prisma: app.get(PrismaService),
     baseCom: { orders: baseComOrders, shippedStatus: baseComShippedStatus },
+    carrierWebhookSecret,
     runQueueCycle: () => app.get(QueueWorkerService).runLoop({
       stopAfterCycles: 1,
       eventType: 'STORAGE_OCCUPANCY_FIXTURE',
