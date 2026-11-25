@@ -1,3 +1,5 @@
+import { BadRequestException } from '@nestjs/common';
+
 import {
   IdempotencyCheckStatus,
   IdempotencyRecordStatus,
@@ -62,7 +64,7 @@ function normalizeRequired(value: string, fieldName: string): string {
   const normalized = value.trim();
 
   if (normalized.length === 0) {
-    throw new Error(`${fieldName} is required`);
+    throw new BadRequestException(`${fieldName} is required`);
   }
 
   return normalized;

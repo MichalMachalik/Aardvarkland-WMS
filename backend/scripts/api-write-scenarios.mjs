@@ -2701,6 +2701,46 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     await own('POST', `${slotting}/recommendations/${discard[0].id}/apply`, {}, 409);
   });
 
+  await scenario('idempotency records bind the request and replay only the first completed result', async () => {
+    const check = '/api/idempotency/check';
+    const records = '/api/idempotency/records';
+    const key = { sourceSystem: `fixture-${suffix}`, idempotencyKey: randomUUID(), requestHash: randomUUID() };
+    const empty = await asAdmin('POST', check, key);
+    assert.equal(empty.status, 'available');
+    assert.equal(empty.record, null);
+    const registered = await Promise.all([asAdmin('POST', records, key), asAdmin('POST', records, key)]);
+    assert.equal(registered[0].status, 'IN_PROGRESS');
+    assert.equal(registered[1].id, registered[0].id);
+    assert.equal((await asAdmin('POST', check, key)).status, 'conflict');
+    const results = await Promise.all([
+      asAdmin('POST', records, { ...key, responseBody: { result: 'first' } }),
+      asAdmin('POST', records, { ...key, responseBody: { result: 'second' } }),
+    ]);
+    assert.equal(results[0].id, registered[0].id);
+    assert.equal(results[0].status, 'COMPLETED');
+    assert.deepEqual(results[0], results[1]);
+    const replay = await asAdmin('POST', check, key);
+    assert.equal(replay.status, 'replay');
+    assert.deepEqual(replay.responseBody, results[0].responseBody);
+    const changed = { ...key, requestHash: randomUUID() };
+    await asAdmin('POST', records, { ...changed, responseBody: { result: 'changed' } }, 409);
+    assert.equal((await asAdmin('POST', check, changed)).status, 'conflict');
+    await asAdmin('POST', check, { ...key, idempotencyKey: '        ' }, 400);
+    assert.equal(await prisma.idempotencyRecord.count({ where: { sourceSystem: key.sourceSystem.toUpperCase(), idempotencyKey: key.idempotencyKey } }), 1);
+    const failedKey = { ...key, idempotencyKey: randomUUID() };
+    await asAdmin('POST', records, failedKey);
+    const failure = await asAdmin('POST', records, { ...failedKey, status: 'FAILED', responseBody: false });
+    assert.equal(failure.responseBody, false);
+    assert.deepEqual(await asAdmin('POST', records, { ...failedKey, status: 'FAILED' }), failure);
+    assert.equal((await asAdmin('POST', check, failedKey)).status, 'conflict');
+    await asAdmin('POST', records, { ...failedKey, responseBody: {} }, 409);
+    const nullKey = { ...key, idempotencyKey: randomUUID() };
+    await asAdmin('POST', records, nullKey);
+    const nullResponse = await asAdmin('POST', records, { ...nullKey, responseBody: null });
+    assert.equal(nullResponse.status, 'COMPLETED');
+    assert.equal(nullResponse.responseBody, null);
+  });
+
   await scenario('incident transitions audit a repeated request once and clear the prior resolution on recurrence', async () => {
     const key = `fixture-incident-${suffix}`;
     const path = `/api/operations/reliability/incidents/${key}`;

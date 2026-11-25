@@ -35,10 +35,12 @@ export class IdempotencyService {
 
   async store(input: StoreIdempotencyRecordInput): Promise<IdempotencyRecordResponse> {
     const key = normalizeIdempotencyKey(input);
+    const status = input.status ?? (input.responseBody === undefined
+      ? IdempotencyRecordStatus.IN_PROGRESS : IdempotencyRecordStatus.COMPLETED);
     const existing = await this.findExisting(key);
 
     if (existing) {
-      return this.resolveExistingRecord(existing, key.requestHash);
+      return this.storeExistingRecord(existing, key, input, status);
     }
 
     try {
@@ -51,11 +53,7 @@ export class IdempotencyService {
           responseBody: input.responseBody ?? null,
           resourceType: input.resourceType ?? null,
           resourceId: input.resourceId ?? null,
-          status:
-            input.status ??
-            (input.responseBody === undefined
-              ? IdempotencyRecordStatus.IN_PROGRESS
-              : IdempotencyRecordStatus.COMPLETED),
+          status,
         },
       });
 
@@ -71,7 +69,7 @@ export class IdempotencyService {
         throw error;
       }
 
-      return this.resolveExistingRecord(duplicate, key.requestHash);
+      return this.storeExistingRecord(duplicate, key, input, status);
     }
   }
 
@@ -88,17 +86,38 @@ export class IdempotencyService {
     });
   }
 
-  private resolveExistingRecord(
+  private async storeExistingRecord(
     record: IdempotencyRecord,
-    requestHash: string,
-  ): IdempotencyRecordResponse {
-    const evaluation = evaluateIdempotencyRecord(record, requestHash);
-
-    if (evaluation.status === IdempotencyCheckStatus.CONFLICT) {
+    key: NormalizedIdempotencyKey,
+    input: StoreIdempotencyRecordInput,
+    status: IdempotencyRecordStatus,
+  ): Promise<IdempotencyRecordResponse> {
+    if (record.requestHash !== key.requestHash) {
       throw new ConflictException('Idempotency key was reused with a different request hash');
     }
-
-    return toIdempotencyRecordResponse(record);
+    if (record.status === IdempotencyRecordStatus.COMPLETED || record.status === status) {
+      return toIdempotencyRecordResponse(record);
+    }
+    if (record.status === IdempotencyRecordStatus.FAILED) {
+      throw new ConflictException('The idempotency request already failed');
+    }
+    await this.client.idempotencyRecord.updateMany({
+      where: { id: record.id, status: IdempotencyRecordStatus.IN_PROGRESS, requestHash: key.requestHash },
+      data: {
+        status,
+        ...(input.responseBody === undefined ? {} : { responseBody: input.responseBody }),
+        ...(input.resourceType === undefined ? {} : { resourceType: input.resourceType }),
+        ...(input.resourceId === undefined ? {} : { resourceId: input.resourceId }),
+      },
+    });
+    const updated = await this.findExisting(key);
+    if (!updated || updated.id !== record.id || updated.requestHash !== key.requestHash) {
+      throw new ConflictException('The idempotency record changed during completion');
+    }
+    if (updated.status !== status && updated.status !== IdempotencyRecordStatus.COMPLETED) {
+      throw new ConflictException('The idempotency request already failed');
+    }
+    return toIdempotencyRecordResponse(updated);
   }
 }
 
@@ -134,6 +153,10 @@ interface IdempotencyPrismaClient {
 interface IdempotencyRecordDelegate {
   findFirst(args: { where: IdempotencyRecordWhereInput }): Promise<IdempotencyRecord | null>;
   create(args: { data: IdempotencyRecordCreateInput }): Promise<IdempotencyRecord>;
+  updateMany(args: {
+    where: { id: string; status: IdempotencyRecordStatus; requestHash: string };
+    data: Partial<Pick<IdempotencyRecordCreateInput, 'status' | 'responseBody' | 'resourceType' | 'resourceId'>>;
+  }): Promise<{ count: number }>;
 }
 
 interface IdempotencyRecordWhereInput {

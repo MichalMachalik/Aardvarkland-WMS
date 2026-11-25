@@ -1,5 +1,5 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsIn, IsOptional, IsString, MaxLength, MinLength } from 'class-validator';
+import { Allow, IsIn, IsOptional, IsString, MaxLength, MinLength } from 'class-validator';
 
 import { IdempotencyRecordStatus } from '../idempotency.types';
 
@@ -29,6 +29,7 @@ export class StoreIdempotencyRecordDto {
   requestHash!: string;
 
   @ApiPropertyOptional({ example: { status: 'created', id: 'ORDER-10001' } })
+  @Allow()
   responseBody?: unknown;
 
   @ApiPropertyOptional({ example: 'outbound_order' })
