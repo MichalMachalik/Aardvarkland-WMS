@@ -86,6 +86,14 @@ test('OpenAPI operations on a disposable PostgreSQL database', { timeout: 180000
   const operations = Object.entries(paths).flatMap(([path, pathItem]) => Object.entries(pathItem)
     .filter(([method]) => methods.has(method))
     .map(([method, spec]) => ({ method: method.toUpperCase(), path, spec, key: `${method.toUpperCase()} ${path}` })));
+  const writeRoutes = operations
+    .filter(op => ['POST', 'PUT', 'PATCH', 'DELETE'].includes(op.method))
+    .map(op => {
+      const segments = op.path.split('/').slice(1).map(segment => segment.startsWith('{') ? null : segment);
+      return { ...op, segments, staticCount: segments.filter(segment => segment !== null).length };
+    })
+    .sort((left, right) => right.staticCount - left.staticCount);
+  const acceptedWrites = new Set();
   const covered = new Set();
   let testedWrites = 0;
   let testedReads = 0;
@@ -110,6 +118,14 @@ test('OpenAPI operations on a disposable PostgreSQL database', { timeout: 180000
     const message = `${method} ${path} returned ${response.status}`
       + (response.ok ? '' : `: ${JSON.stringify(payload?.error?.message ?? payload?.message ?? '').slice(0, 200)}`);
     if (expected !== undefined) assert.ok([expected].flat().includes(response.status), message);
+    if (response.ok && method !== 'GET') {
+      const segments = new URL(response.url).pathname.split('/').slice(1);
+      const operation = writeRoutes.find(route =>
+        route.method === method && route.segments.length === segments.length &&
+        route.segments.every((segment, index) => segment === null ? Boolean(segments[index]) : segment === segments[index]),
+      );
+      if (operation) acceptedWrites.add(operation.key);
+    }
     return { status: response.status, data: payload?.data ?? payload };
   }
 
@@ -263,6 +279,11 @@ test('OpenAPI operations on a disposable PostgreSQL database', { timeout: 180000
     assert.equal(checkedWrites, operations.filter(op => op.method !== 'GET').length);
     suite.diagnostic(`${covered.size} operations, ${testedReads} authenticated reads, ${checkedWrites} write contracts (${testedWrites} DTO checks)`);
     suite.diagnostic(`${fixtures} warehouse and administration scenarios`);
+  });
+
+  await suite.test('every documented write route accepts a valid HTTP request', () => {
+    assert.deepEqual(writeRoutes.filter(op => !acceptedWrites.has(op.key)).map(op => op.key), []);
+    suite.diagnostic(`${acceptedWrites.size}/${writeRoutes.length} documented writes returned success`);
   });
 });
 

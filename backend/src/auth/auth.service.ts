@@ -12,7 +12,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 
 import { AuthenticatedUser } from '../access-control';
 import { Env } from '../config';
-import { PrismaService } from '../database';
+import { lockPostgresRowById, PrismaService } from '../database';
 import { UserStatus } from '../generated/prisma/client';
 import { UsersService } from '../users/users.service';
 import { assertStrongPassword } from './password-policy';
@@ -479,22 +479,25 @@ export class AuthService {
       this.config.get('MFA_SECRET_ENCRYPTION_KEY_ID', { infer: true }),
     );
 
-    await this.prisma.$executeRawUnsafe(
-      `UPDATE mfa_totp_secrets SET disabled_at = NOW(), updated_at = NOW() WHERE user_id = $1::uuid AND verified_at IS NULL AND disabled_at IS NULL`,
-      user.id,
-    );
-    await this.prisma.$executeRawUnsafe(
-      `
-        INSERT INTO mfa_totp_secrets
-          (id, user_id, secret_ciphertext, secret_last4, label, metadata, created_at, updated_at)
-        VALUES ($1::uuid, $2::uuid, $3::jsonb, $4, 'default', $5::jsonb, NOW(), NOW())
-      `,
-      randomUUID(),
-      user.id,
-      JSON.stringify(encrypted),
-      secret.slice(-4),
-      JSON.stringify({ issuer }),
-    );
+    await this.prisma.$transaction(async (client) => {
+      await lockPostgresRowById(client, 'users', user.id);
+      await client.$executeRawUnsafe(
+        `UPDATE mfa_totp_secrets SET disabled_at = NOW(), updated_at = NOW() WHERE user_id = $1::uuid AND verified_at IS NULL AND disabled_at IS NULL`,
+        user.id,
+      );
+      await client.$executeRawUnsafe(
+        `
+          INSERT INTO mfa_totp_secrets
+            (id, user_id, secret_ciphertext, secret_last4, label, metadata, created_at, updated_at)
+          VALUES ($1::uuid, $2::uuid, $3::jsonb, $4, 'default', $5::jsonb, NOW(), NOW())
+        `,
+        randomUUID(),
+        user.id,
+        JSON.stringify(encrypted),
+        secret.slice(-4),
+        JSON.stringify({ issuer }),
+      );
+    });
     await this.writeSecurityAudit(user.id, 'auth.mfa_setup_started', { issuer, keyId: encrypted.kid ?? null });
 
     return {
@@ -506,55 +509,58 @@ export class AuthService {
   }
 
   async verifyMfaSetup(user: AuthenticatedUser, dto: VerifyMfaDto): Promise<MfaStatusResponse> {
-    const row = await this.findPendingMfaSecret(user.id);
-    if (!row) {
-      throw new BadRequestException('MFA setup has not been started');
-    }
-
-    const secret = this.decryptMfaSecretPayload(row.secret_ciphertext);
-    if (!verifyTotpCode(secret, dto.code)) {
-      throw new UnauthorizedException('Invalid MFA code');
-    }
-
-    await this.prisma.$transaction(async (tx: unknown) => {
-      const client = tx as PrismaRawClient;
+    const enabled = await this.prisma.$transaction(async (client) => {
+      await lockPostgresRowById(client, 'users', user.id);
+      const pending = await this.findPendingMfaSecret(client, user.id);
+      if (!pending) {
+        throw new BadRequestException('MFA setup has not been started');
+      }
+      const secret = this.decryptMfaSecretPayload(pending.secret_ciphertext);
+      if (!verifyTotpCode(secret, dto.code)) {
+        throw new UnauthorizedException('Invalid MFA code');
+      }
       await client.$executeRawUnsafe(
         `UPDATE mfa_totp_secrets SET disabled_at = NOW(), updated_at = NOW() WHERE user_id = $1::uuid AND verified_at IS NOT NULL AND disabled_at IS NULL`,
         user.id,
       );
-      await client.$executeRawUnsafe(
-        `UPDATE mfa_totp_secrets SET verified_at = NOW(), updated_at = NOW() WHERE id = $1::uuid`,
-        row.id,
+      const [activated] = await client.$queryRawUnsafe<{ id: string; verified_at: Date }[]>(
+        `UPDATE mfa_totp_secrets SET verified_at = NOW(), updated_at = NOW() WHERE id = $1::uuid RETURNING id, verified_at`,
+        pending.id,
       );
+      if (!activated) {
+        throw new BadRequestException('MFA setup has not been started');
+      }
       await this.bumpUserSessionVersion(client, user.id);
       await this.revokeActiveRefreshSessions(client, user.id);
+      return activated;
     });
-    await this.writeSecurityAudit(user.id, 'auth.mfa_enabled', { secretId: row.id, sessionsInvalidated: true });
+    await this.writeSecurityAudit(user.id, 'auth.mfa_enabled', { secretId: enabled.id, sessionsInvalidated: true });
 
-    return this.getMfaStatus(user);
+    return { enabled: true, verifiedAt: enabled.verified_at };
   }
 
   async disableMfa(user: AuthenticatedUser, dto: VerifyMfaDto): Promise<MfaStatusResponse> {
-    const row = await this.findActiveMfaSecret(user.id);
-    if (!row) {
-      return { enabled: false, verifiedAt: null };
-    }
-
-    const secret = this.decryptMfaSecretPayload(row.secret_ciphertext);
-    if (!verifyTotpCode(secret, dto.code)) {
-      throw new UnauthorizedException('Invalid MFA code');
-    }
-
-    await this.prisma.$transaction(async (tx: unknown) => {
-      const client = tx as PrismaRawClient;
+    const secretId = await this.prisma.$transaction(async (client) => {
+      await lockPostgresRowById(client, 'users', user.id);
+      const active = await this.findActiveMfaSecret(user.id, client);
+      if (!active) {
+        return null;
+      }
+      const secret = this.decryptMfaSecretPayload(active.secret_ciphertext);
+      if (!verifyTotpCode(secret, dto.code)) {
+        throw new UnauthorizedException('Invalid MFA code');
+      }
       await client.$executeRawUnsafe(
         `UPDATE mfa_totp_secrets SET disabled_at = NOW(), updated_at = NOW() WHERE user_id = $1::uuid AND disabled_at IS NULL`,
         user.id,
       );
       await this.bumpUserSessionVersion(client, user.id);
       await this.revokeActiveRefreshSessions(client, user.id);
+      return active.id;
     });
-    await this.writeSecurityAudit(user.id, 'auth.mfa_disabled', { secretId: row.id, sessionsInvalidated: true });
+    if (secretId) {
+      await this.writeSecurityAudit(user.id, 'auth.mfa_disabled', { secretId, sessionsInvalidated: true });
+    }
 
     return { enabled: false, verifiedAt: null };
   }
@@ -674,8 +680,8 @@ export class AuthService {
     return { refreshToken, refreshExpiresAt: toDate(created.expires_at) };
   }
 
-  private async findActiveMfaSecret(userId: string): Promise<MfaSecretRow | null> {
-    const rows = await this.prisma.$queryRawUnsafe<MfaSecretRow[]>(
+  private async findActiveMfaSecret(userId: string, client: PrismaRawClient = this.prisma): Promise<MfaSecretRow | null> {
+    const rows = await client.$queryRawUnsafe<MfaSecretRow[]>(
       `
         SELECT id, user_id, secret_ciphertext, verified_at, disabled_at
         FROM mfa_totp_secrets
@@ -688,8 +694,8 @@ export class AuthService {
     return rows[0] ?? null;
   }
 
-  private async findPendingMfaSecret(userId: string): Promise<MfaSecretRow | null> {
-    const rows = await this.prisma.$queryRawUnsafe<MfaSecretRow[]>(
+  private async findPendingMfaSecret(client: PrismaRawClient, userId: string): Promise<MfaSecretRow | null> {
+    const rows = await client.$queryRawUnsafe<MfaSecretRow[]>(
       `
         SELECT id, user_id, secret_ciphertext, verified_at, disabled_at
         FROM mfa_totp_secrets

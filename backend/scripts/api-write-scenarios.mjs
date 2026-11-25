@@ -1,8 +1,19 @@
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHmac, randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 
 const warehouse = '/api/warehouses/MAIN';
+
+function authenticatorCodeForFixture(secret) {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  const bits = [...secret].map(symbol => alphabet.indexOf(symbol).toString(2).padStart(5, '0')).join('');
+  const key = Buffer.from(bits.match(/.{8}/g).map(byte => Number.parseInt(byte, 2)));
+  const counter = Buffer.alloc(8);
+  counter.writeBigUInt64BE(BigInt(Math.floor(Date.now() / 30_000)));
+  const digest = createHmac('sha1', key).update(counter).digest();
+  const offset = digest[digest.length - 1] & 15;
+  return String((digest.readUInt32BE(offset) & 0x7fff_ffff) % 1_000_000).padStart(6, '0');
+}
 
 export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, bind, request, login, prisma, runQueueCycle, baseCom, carrierWebhookSecret }) {
   const suffix = randomUUID().slice(0, 8).toUpperCase();
@@ -22,6 +33,50 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     });
     return { product, sku };
   }
+
+  await scenario('a separate test account can enroll and disable MFA with session renewal', async () => {
+    const email = `factor-${suffix.toLowerCase()}@example.invalid`;
+    const password = `Fixture-${randomUUID()}-42!`;
+    const user = await asAdmin('POST', '/api/users', {
+      email, password, displayName: 'Authenticator fixture operator',
+      roleCode: 'WAREHOUSE_WORKER', warehouseCode: 'MAIN',
+    });
+    const initial = await login(email, password);
+    const asInitial = bind(initial.accessToken);
+    const path = '/api/auth/me/mfa';
+    assert.deepEqual(await asInitial('GET', path), { enabled: false, verifiedAt: null });
+    await asInitial('POST', path + '/setup');
+    const setup = await asInitial('POST', path + '/setup');
+    assert.equal(setup.accountName, email);
+    assert.equal(/^[A-Z2-7]{32}$/.test(setup.secret), true);
+    assert.equal(new URL(setup.otpAuthUri).searchParams.get('secret') === setup.secret, true);
+    assert.equal(await prisma.mfaTotpSecret.count({ where: { userId: user.id, verifiedAt: null, disabledAt: null } }), 1);
+    await asInitial('POST', path + '/verify', { code: 'invalid' }, 400);
+    const enabled = await asInitial('POST', path + '/verify', { code: authenticatorCodeForFixture(setup.secret) });
+    assert.equal(enabled.enabled, true);
+    assert.ok(Number.isFinite(Date.parse(enabled.verifiedAt)));
+    await asInitial('GET', '/api/auth/me', undefined, 401);
+    await request('POST', '/api/auth/refresh', { body: { refreshToken: initial.refreshToken }, expected: 401 });
+    const saved = await prisma.mfaTotpSecret.findFirstOrThrow({ where: { userId: user.id, disabledAt: null } });
+    assert.equal(saved.secretCiphertext.alg, 'A256GCM');
+    assert.equal(JSON.stringify(saved.secretCiphertext).includes(setup.secret), false);
+
+    await request('POST', '/api/auth/login', { body: { email, password }, expected: 401 });
+    const enrolled = (await request('POST', '/api/auth/login', {
+      body: { email, password, mfaCode: authenticatorCodeForFixture(setup.secret) }, expected: 201,
+    })).data;
+    assert.equal(enrolled.mfaSatisfied, true);
+    const asEnrolled = bind(enrolled.accessToken);
+    assert.deepEqual(await asEnrolled('GET', path), enabled);
+    await asEnrolled('POST', path + '/disable', { code: 'invalid' }, 400);
+    const disabled = await asEnrolled('POST', path + '/disable', { code: authenticatorCodeForFixture(setup.secret) });
+    assert.deepEqual(disabled, { enabled: false, verifiedAt: null });
+    await asEnrolled('GET', '/api/auth/me', undefined, 401);
+    await request('POST', '/api/auth/refresh', { body: { refreshToken: enrolled.refreshToken }, expected: 401 });
+    const renewed = await login(email, password);
+    assert.deepEqual(await bind(renewed.accessToken)('GET', path), disabled);
+    assert.equal(await prisma.mfaTotpSecret.count({ where: { userId: user.id, disabledAt: null } }), 0);
+  });
 
   await scenario('operational summaries respect the requested window and recommendation option', async () => {
     const path = '/decision-support/ops-summary';

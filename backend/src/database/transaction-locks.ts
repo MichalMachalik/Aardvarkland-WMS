@@ -28,6 +28,7 @@ const SAFE_TABLE_NAMES = new Set([
   'inbox_events',
   'integration_endpoints',
   'scanner_sessions',
+  'users',
 ]);
 const SAFE_ADVISORY_LOCK_NAMESPACES = new Set([
   'stock_quant_identity',
