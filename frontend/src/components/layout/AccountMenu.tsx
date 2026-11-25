@@ -1,7 +1,6 @@
-import { FormEvent, useEffect, useMemo, useState } from 'react';
-import { toSVG } from 'bwip-js/generic';
+import { FormEvent, useEffect, useState } from 'react';
 import { config } from '../../app/config';
-import { svgPreviewDataUri } from '../../core/scanning/svgPreview';
+import { useBarcodePreview } from '../../core/scanning/useBarcodePreview';
 import { changePassword, disableMfa, getMfaStatus, logout, startMfaSetup, verifyMfaSetup, type MfaSetupResponse, type MfaStatusResponse } from '../../core/api/auth';
 import { useWorkspace } from '../../core/workspace/workspace';
 import { pickLanguage } from '../../core/i18n/i18n';
@@ -592,29 +591,12 @@ function isMfaCode(value: string) {
 }
 
 function MfaQrCode({ value, label, errorText }: { value: string; label: string; errorText: string }) {
-  const result = useMemo(() => {
-    try {
-      return {
-        svg: toSVG({
-          bcid: 'qrcode',
-          text: value,
-          scale: 3,
-          paddingwidth: 6,
-          paddingheight: 6,
-        }),
-        error: '',
-      };
-    } catch (error) {
-      return {
-        svg: '',
-        error: error instanceof Error ? error.message : errorText,
-      };
-    }
-  }, [errorText, value]);
+  const preview = useBarcodePreview('qr', value, 3);
 
   return (
-    <div className="account-mfa-qr" aria-label={label}>
-      {result.svg ? <img src={svgPreviewDataUri(result.svg)} alt={label} /> : <p>{result.error || errorText}</p>}
+    <div className="account-mfa-qr" aria-label={label} aria-busy={preview.status === 'loading'}>
+      {preview.status === 'ready' && <img src={preview.src} alt={label} />}
+      {preview.status === 'error' && <p role="status">{errorText}</p>}
     </div>
   );
 }

@@ -1,62 +1,27 @@
-import { useMemo } from 'react';
-import { toSVG } from 'bwip-js/generic';
-import { svgPreviewDataUri } from '../../core/scanning/svgPreview';
-
-export type BarcodePreviewType = 'qr' | 'code128' | 'gs1-128' | 'datamatrix';
+import type { BarcodeType } from '../../core/scanning/renderBarcode';
+import { useBarcodePreview } from '../../core/scanning/useBarcodePreview';
 
 interface BarcodePreviewProps {
-  type: BarcodePreviewType;
+  type: BarcodeType;
   value: string;
   label: string;
   emptyText: string;
   errorText: string;
 }
 
-const bwipType: Record<BarcodePreviewType, string> = {
-  qr: 'qrcode',
-  code128: 'code128',
-  'gs1-128': 'gs1-128',
-  datamatrix: 'datamatrix',
-};
-
 export function BarcodePreview({ type, value, label, emptyText, errorText }: BarcodePreviewProps) {
-  const result = useMemo(() => {
-    const text = value.trim();
-    if (!text) {
-      return { svg: '', error: '' };
-    }
-
-    try {
-      return {
-        svg: toSVG({
-          bcid: bwipType[type],
-          text,
-          scale: 2,
-          includetext: type === 'code128' || type === 'gs1-128',
-          textxalign: 'center',
-          paddingwidth: 6,
-          paddingheight: 6,
-        }),
-        error: '',
-      };
-    } catch (error) {
-      return {
-        svg: '',
-        error: error instanceof Error ? error.message : errorText,
-      };
-    }
-  }, [type, value]);
+  const preview = useBarcodePreview(type, value);
 
   return (
-    <article className="barcode-preview">
+    <article className="barcode-preview" aria-busy={preview.status === 'loading'}>
       <span>{label}</span>
-      {result.svg ? (
+      {preview.status === 'ready' && (
         <div className="barcode-preview__canvas">
-          <img src={svgPreviewDataUri(result.svg)} alt={label} />
+          <img src={preview.src} alt={label} />
         </div>
-      ) : (
-        <p>{result.error || emptyText}</p>
       )}
+      {preview.status === 'idle' && <p>{emptyText}</p>}
+      {preview.status === 'error' && <p role="status">{errorText}</p>}
     </article>
   );
 }

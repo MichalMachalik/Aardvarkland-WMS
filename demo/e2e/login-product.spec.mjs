@@ -10,6 +10,9 @@ test('real product login preserves layout and uses username/password semantics',
   await page.goto(url);
   await expect(page.locator('input[autocomplete="username"]')).toBeVisible();
   await expect(page.locator('input[autocomplete="current-password"]')).toBeVisible();
+  expect(await page.evaluate(() => performance.getEntriesByType('resource').filter(resource =>
+    /\/assets\/(?:barcode-preview|renderBarcode)-/.test(new URL(resource.name).pathname),
+  ).length)).toBe(0);
   await expect(page.locator('input[autocomplete="username"]')).toHaveAttribute('autocapitalize','none');
   await expect(page.locator('input[autocomplete="current-password"]')).toHaveAttribute('maxlength','128');
   await page.screenshot({path:'artifacts/ui/09-real-product-login.png',fullPage:true});
@@ -79,42 +82,62 @@ test('an account awaiting MFA setup can sign in to try WMS with a password', asy
   await expect(account.getByRole('button', { name: 'Multi-factor authentication (MFA)', exact: true })).toHaveCount(0);
 });
 
-test('account settings offer authenticator setup only when the backend supports it', async ({ page }) => {
-  let available = false;
-  await page.addInitScript(() => localStorage.setItem('aardvarkland-ui-language', 'en'));
-  await page.route('**/config.js', route => route.fulfill({
-    contentType: 'text/javascript',
-    body: 'window.__AARDVARKLAND_STORAGE_SYSTEM_CONFIG__ = { apiBaseUrl: "/api", showMfaSettings: true };',
-  }));
-  await page.route(requestUrl => requestUrl.pathname.startsWith('/api/'), route => {
-    const { pathname } = new URL(route.request().url());
-    if (pathname === '/api/auth/login') {
-      return route.fulfill({ status: 201, json: { accessToken: 'account-fixture' } });
+for (const loadQrRenderer of [true, false]) {
+  test(`authenticator setup ${loadQrRenderer ? 'loads its QR preview on demand' : 'keeps the manual key when QR rendering is unavailable'}`, async ({ page }) => {
+    let available = false;
+    const testKey = 'ABCDEFGHIJKLMNOP';
+    if (!loadQrRenderer) await page.route('**/assets/barcode-preview-*.js', route => route.abort());
+    await page.addInitScript(() => localStorage.setItem('aardvarkland-ui-language', 'en'));
+    await page.route('**/config.js', route => route.fulfill({
+      contentType: 'text/javascript',
+      body: 'window.__AARDVARKLAND_STORAGE_SYSTEM_CONFIG__ = { apiBaseUrl: "/api", showMfaSettings: true };',
+    }));
+    await page.route(requestUrl => requestUrl.pathname.startsWith('/api/'), route => {
+      const { pathname } = new URL(route.request().url());
+      if (pathname === '/api/auth/login') {
+        return route.fulfill({ status: 201, json: { accessToken: 'account-fixture' } });
+      }
+      if (pathname === '/api/auth/me/mfa') {
+        return route.fulfill({ json: { available, enabled: false, verifiedAt: null } });
+      }
+      if (pathname === '/api/auth/me/mfa/setup') {
+        return route.fulfill({ status: 201, json: {
+          secret: testKey, issuer: 'Test warehouse', accountName: 'warehouse.admin',
+          otpAuthUri: `otpauth://totp/Test%20warehouse:warehouse.admin?secret=${testKey}`,
+        } });
+      }
+      return route.fulfill({ status: 503, json: { message: 'Unavailable in this test' } });
+    });
+
+    await page.goto(url);
+    await page.locator('input[autocomplete="username"]').fill('warehouse.admin');
+    await page.locator('input[autocomplete="current-password"]').fill('Demo-test-only-42!');
+    await page.locator('.login-form button[type="submit"]').click();
+    const account = page.locator('.account-menu');
+    const settings = account.getByRole('button', { name: 'Settings', exact: true });
+    const authenticator = account.getByRole('button', { name: 'Multi-factor authentication (MFA)', exact: true });
+
+    const disabledResponse = page.waitForResponse(response => new URL(response.url()).pathname === '/api/auth/me/mfa');
+    await settings.click();
+    expect((await (await disabledResponse).json()).available).toBe(false);
+    await expect(account.getByRole('button', { name: 'Change password', exact: true })).toBeVisible();
+    await expect(authenticator).toHaveCount(0);
+    await settings.click();
+
+    available = true;
+    await settings.click();
+    await expect(authenticator).toBeVisible();
+    await authenticator.click();
+    const setup = account.getByRole('region', { name: 'Multi-factor authentication (MFA)', exact: true });
+    await setup.getByRole('button', { name: 'Create QR code', exact: true }).click();
+    await expect(setup.getByLabel('Manual key', { exact: true })).toHaveValue(testKey);
+    const qr = setup.getByRole('img', { name: 'MFA QR code' });
+    if (loadQrRenderer) {
+      await expect(qr).toHaveAttribute('src', /^data:image\/svg\+xml/);
+      await expect.poll(() => qr.evaluate(image => image.naturalWidth)).toBeGreaterThan(0);
+    } else {
+      await expect(setup.getByRole('status')).toHaveText('The QR code could not be rendered.');
+      await expect(qr).toHaveCount(0);
     }
-    if (pathname === '/api/auth/me/mfa') {
-      return route.fulfill({ json: { available, enabled: false, verifiedAt: null } });
-    }
-    return route.fulfill({ status: 503, json: { message: 'Unavailable in this test' } });
   });
-
-  await page.goto(url);
-  await page.locator('input[autocomplete="username"]').fill('warehouse.admin');
-  await page.locator('input[autocomplete="current-password"]').fill('Demo-test-only-42!');
-  await page.locator('.login-form button[type="submit"]').click();
-  const account = page.locator('.account-menu');
-  const settings = account.getByRole('button', { name: 'Settings', exact: true });
-  const authenticator = account.getByRole('button', { name: 'Multi-factor authentication (MFA)', exact: true });
-
-  const disabledResponse = page.waitForResponse(response => new URL(response.url()).pathname === '/api/auth/me/mfa');
-  await settings.click();
-  expect((await (await disabledResponse).json()).available).toBe(false);
-  await expect(account.getByRole('button', { name: 'Change password', exact: true })).toBeVisible();
-  await expect(authenticator).toHaveCount(0);
-  await settings.click();
-
-  available = true;
-  await settings.click();
-  await expect(authenticator).toBeVisible();
-  await authenticator.click();
-  await expect(account.getByRole('region', { name: 'Multi-factor authentication (MFA)', exact: true })).toBeVisible();
-});
+}

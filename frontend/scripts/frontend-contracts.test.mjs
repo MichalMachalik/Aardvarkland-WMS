@@ -92,10 +92,12 @@ test('realtime invalidation refreshes resources while polling remains available'
 test('barcode and MFA previews do not inject SVG markup into the application DOM', () => {
   const barcode = read('src/components/scanning/BarcodePreview.tsx');
   const account = read('src/components/layout/AccountMenu.tsx');
+  const renderer = read('src/core/scanning/renderBarcode.ts');
   assert.doesNotMatch(barcode, /dangerouslySetInnerHTML/);
   assert.doesNotMatch(account, /dangerouslySetInnerHTML/);
-  assert.match(barcode, /svgPreviewDataUri/);
-  assert.match(account, /svgPreviewDataUri/);
+  assert.match(barcode, /useBarcodePreview/);
+  assert.match(account, /useBarcodePreview/);
+  assert.match(renderer, /return svgPreviewDataUri\(svg\)/);
 });
 
 test('warehouse manager overview exposes the compact operational system status', () => {

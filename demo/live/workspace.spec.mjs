@@ -124,6 +124,16 @@ test('print stations only offer retry after failure and return the job to the qu
 
   await login(page, roles.system);
   await desktopNav(page).getByRole('button', { name: 'Tiskárny', exact: true }).click();
+  const code = page.getByTestId('print-label-code');
+  await code.fill(`LABEL-${fixture}`);
+  const previews = page.locator('.barcode-preview-grid');
+  for (const symbol of ['QR', 'Code 128', 'DataMatrix']) {
+    const preview = previews.getByRole('img', { name: symbol, exact: true });
+    await expect(preview).toHaveAttribute('src', /^data:image\/svg\+xml/);
+    await expect.poll(() => preview.evaluate(image => image.naturalWidth)).toBeGreaterThan(0);
+  }
+  await code.clear();
+  await expect(previews.getByRole('img')).toHaveCount(0);
   const row = page.getByRole('row').filter({ has: page.getByRole('cell', { name: printerCode, exact: true }) });
   const retry = row.getByRole('button', { name: 'Opakovat tisk' });
   const reassign = row.getByRole('button', { name: 'Přesměrovat' });
