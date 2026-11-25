@@ -747,6 +747,78 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.deepEqual(saved.lines.map(line => line.expectedQuantity), [4, 5]);
   });
 
+  await scenario('manual stock adjustment preserves reservations and applies a concurrent replay only once', async () => {
+    const { sku } = await createSku('MANUAL-ADJUST');
+    const { quant } = await own('POST', '/inventory/quants/receive', {
+      skuReference: sku.code, locationReference: 'A-01-01', quantity: 6,
+    });
+    const order = await own('POST', '/outbound-orders', {
+      orderNumber: `MANUAL-ADJUST-${suffix}`, lines: [{ lineNumber: '10', sku: sku.code, orderedQuantity: 4 }],
+    });
+    await own('POST', `/outbound-orders/${order.id}/allocate`, {});
+    const adjust = '/inventory/quants/adjust';
+    await asWorker('POST', warehouse + adjust, { quantReference: quant.id, quantity: 7 }, 403);
+    await own('POST', adjust, { quantReference: quant.id, quantity: 3 }, 409);
+    const body = {
+      quantReference: quant.id, quantityDelta: 2, reasonCode: 'FOUND_STOCK',
+      reason: 'Test stock found after review', idempotencyKey: randomUUID(),
+    };
+    const [first, second] = await Promise.all(Array.from({ length: 2 }, () => own('POST', adjust, body, 201, body.idempotencyKey)));
+    assert.equal(first.movement.id, second.movement.id);
+    assert.equal(first.quant.quantity, 8);
+    assert.equal(first.quant.reservedQuantity, 4);
+    assert.equal(first.movement.metadata.reasonCode, 'FOUND_STOCK');
+    assert.equal(first.movement.metadata.reason, body.reason);
+    assert.equal(await prisma.stockMovement.count({ where: { stockQuantId: quant.id, type: 'ADJUST' } }), 1);
+    await own('POST', adjust, { ...body, quantityDelta: 3 }, 409, body.idempotencyKey);
+    await own('POST', adjust, { ...body, quantityDelta: 2_147_483_647, idempotencyKey: randomUUID() }, 409);
+    assert.equal((await prisma.stockQuant.findUniqueOrThrow({ where: { id: quant.id } })).quantity, 8);
+  });
+
+  await scenario('cycle count submissions keep unresolved variance visible and approval reconciles stock once', async () => {
+    const { sku } = await createSku('DIRECT-COUNT');
+    const quantAt = async label => {
+      const location = await own('POST', '/locations', {
+        code: `DIRECT-COUNT-${label}-${suffix}`, name: `Fixture count ${label}`, type: 'STORAGE', parentReference: 'A-01',
+      });
+      return (await own('POST', '/inventory/quants/receive', {
+        skuReference: sku.code, locationReference: location.id, quantity: 4,
+      })).quant;
+    };
+    const first = await quantAt('A');
+    const second = await quantAt('B');
+    const plan = await own('POST', '/cycle-counts', { code: `DIRECT-COUNT-${suffix}`, scopeType: 'SKU', scopeReference: sku.code });
+    const planPath = `/cycle-counts/${plan.id}`;
+    await own('POST', planPath + '/release', {});
+    const tasks = await own('GET', planPath + '/tasks');
+    assert.equal(tasks.length, 2);
+    const variance = tasks.find(task => task.stockQuantId === first.id);
+    const exact = tasks.find(task => task.stockQuantId === second.id);
+    const variancePath = `/cycle-counts/tasks/${variance.id}`;
+    const exactPath = `/cycle-counts/tasks/${exact.id}`;
+    await own('POST', variancePath + '/approve', {}, 409);
+    const counts = await Promise.all(Array.from({ length: 2 }, () => own('POST', variancePath + '/submit', { countedQuantity: 3 }, [201, 409])));
+    assert.equal(counts.filter(result => result.status === 'SUBMITTED').length, 1);
+    assert.equal((await own('POST', exactPath + '/submit', { countedQuantity: 4 })).varianceQuantity, 0);
+    assert.equal((await prisma.cycleCountPlan.findUniqueOrThrow({ where: { id: plan.id } })).status, 'RECONCILING');
+    assert.equal((await prisma.stockQuant.findUniqueOrThrow({ where: { id: first.id } })).quantity, 4);
+    await own('POST', '/inventory/quants/adjust', { quantReference: first.id, quantity: 5 }, 409);
+    await prisma.stockQuant.update({ where: { id: first.id }, data: { quantity: 5 } });
+    await own('POST', variancePath + '/approve', {}, 409);
+    assert.equal((await prisma.stockQuant.findUniqueOrThrow({ where: { id: first.id } })).quantity, 5);
+    await prisma.stockQuant.update({ where: { id: first.id }, data: { quantity: 4 } });
+    const approvals = await Promise.all(Array.from({ length: 2 }, () => own('POST', variancePath + '/approve', {}, [201, 409])));
+    assert.equal(approvals.filter(result => result.adjustmentCreated).length, 1);
+    assert.equal((await prisma.stockQuant.findUniqueOrThrow({ where: { id: first.id } })).quantity, 3);
+    const movement = await prisma.stockMovement.findMany({ where: { referenceId: variance.id, type: 'ADJUST' } });
+    assert.equal(movement.length, 1);
+    assert.equal(movement[0].quantity, 1);
+    const done = await own('POST', exactPath + '/approve', {});
+    assert.equal(done.adjustmentCreated, false);
+    assert.equal(done.planCompleted, true);
+    assert.equal(await prisma.stockFreeze.count({ where: { planId: plan.id, status: 'ACTIVE' } }), 0);
+  });
+
   await scenario('direct packing and shipping follow picking and record each movement once', async () => {
     const { sku } = await createSku('DIRECT-FULFILLMENT');
     const parcel = await own('POST', '/parcels', { trackingNumber: `DIRECT-PARCEL-${suffix}` });

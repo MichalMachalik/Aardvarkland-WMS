@@ -197,9 +197,9 @@ function createRfCycleCountService(taskQuantity: number | null = 10): {
       },
     },
     cycleCountPlan: {
-      update: async (args: WriteCall) => {
+      updateMany: async (args: WriteCall) => {
         calls.cycleCountPlanUpdates.push(args);
-        return { id: 'plan-1', ...(args.data ?? {}) };
+        return { count: 1 };
       },
     },
     auditLog: {

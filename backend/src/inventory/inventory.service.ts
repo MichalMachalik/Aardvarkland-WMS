@@ -778,21 +778,15 @@ export class InventoryService {
       actorId: actor.id,
       dto,
     });
-    const existingOperation = await this.findIdempotentOperation(
-      client,
-      warehouse.id,
-      StockMovementType.ADJUST,
-      dto.idempotencyKey,
-      requestFingerprint,
-    );
-
-    if (existingOperation) {
-      return existingOperation;
-    }
-
-    assertAdjustmentQuantityInput(dto);
-    const target = await this.resolveAdjustTarget(client, warehouse.id, dto);
-    const result = await this.transaction(client, async (tx) => {
+    return this.transaction(client, async (tx) => {
+      const key = normalizeOptionalString(dto.idempotencyKey);
+      if (key) {
+        await lockPostgresAdvisoryTransaction(tx, 'idempotency_key', `inventory-adjust:${key}`);
+        const existing = await this.findIdempotentOperation(tx, warehouse.id, StockMovementType.ADJUST, key, requestFingerprint);
+        if (existing) return existing;
+      }
+      assertAdjustmentQuantityInput(dto);
+      const target = await this.resolveAdjustTarget(tx, warehouse.id, dto);
       const quant = target.quant
         ? await this.resolveQuant(tx, warehouse.id, target.quant.id)
         : await this.incrementOrCreateQuant(tx, {
@@ -816,11 +810,13 @@ export class InventoryService {
         operation: 'adjust stock',
       });
       const currentQuantity = toNumber(lockedQuant.quantity);
-      const nextQuantity =
-        dto.quantity === undefined ? currentQuantity + (dto.quantityDelta ?? 0) : dto.quantity;
+      const nextQuantity = dto.quantity ?? currentQuantity + (dto.quantityDelta ?? 0);
 
       if (nextQuantity < 0) {
         throw new ConflictException('Adjustment would make stock quantity negative');
+      }
+      if (!Number.isSafeInteger(nextQuantity) || nextQuantity > 2_147_483_647) {
+        throw new ConflictException('Adjustment would exceed the supported stock quantity');
       }
 
       if (nextQuantity < getQuantReservedQuantity(lockedQuant)) {
@@ -875,10 +871,8 @@ export class InventoryService {
 
       await this.writeMovementAudit(tx, actor, warehouse.id, movement);
 
-      return { movement, quant: updatedQuant };
+      return this.toOperationResponse(tx, updatedQuant, movement);
     });
-
-    return this.toOperationResponse(client, result.quant, result.movement);
   }
 
   async block(
@@ -1993,8 +1987,8 @@ function getMovementQuantityDelta(movement: StockMovementRecord): number | null 
 }
 
 function assertAdjustmentQuantityInput(dto: AdjustStockDto): void {
-  const hasQuantity = dto.quantity !== undefined;
-  const hasQuantityDelta = dto.quantityDelta !== undefined;
+  const hasQuantity = dto.quantity != null;
+  const hasQuantityDelta = dto.quantityDelta != null;
 
   if (hasQuantity === hasQuantityDelta) {
     throw new ConflictException('Provide exactly one of quantity or quantityDelta');

@@ -1,8 +1,8 @@
 import { BadRequestException, ConflictException, ForbiddenException, HttpException, Injectable, NotFoundException } from '@nestjs/common';
 
 import { AuthenticatedUser } from '../access-control/types';
-import { calculateCountVariance, MAX_COUNT_QUANTITY } from '../cycle-counts/cycle-counts.helpers';
-import { CycleCountPlanStatus, CycleCountTaskStatus } from '../cycle-counts/cycle-counts.types';
+import { calculateCountVariance, countSubmissionPlanUpdate, MAX_COUNT_QUANTITY } from '../cycle-counts/cycle-counts.helpers';
+import { CycleCountTaskStatus } from '../cycle-counts/cycle-counts.types';
 import { lockPostgresRowById, PrismaService, withTransactionRetry } from '../database';
 import { Prisma, WarehouseTaskType } from '../generated/prisma/client';
 import { InventoryService } from '../inventory/inventory.service';
@@ -723,6 +723,7 @@ export class RfWorkflowsService {
       throw new ConflictException('RF cycle count requires a counted quantity');
     }
 
+    await lockPostgresRowById(tx, 'cycle_count_plans', countTask.planId);
     const submittedAt = new Date();
     const varianceQuantity = calculateCountVariance(countTask.expectedQuantity, countedQuantity);
 
@@ -755,13 +756,7 @@ export class RfWorkflowsService {
         }),
       },
     });
-    await tx.cycleCountPlan.update({
-      where: { id: countTask.planId },
-      data: {
-        status:
-          varianceQuantity === 0 ? CycleCountPlanStatus.COUNTING : CycleCountPlanStatus.RECONCILING,
-      },
-    });
+    await tx.cycleCountPlan.updateMany(countSubmissionPlanUpdate(countTask.planId, varianceQuantity));
     await tx.auditLog.create({
       data: {
         actorUserId: actor.id,
@@ -1576,7 +1571,7 @@ interface RfTransactionClient extends StockFreezeClient {
     update(args: Record<string, unknown>): Promise<WarehouseTaskRecord>;
   };
   cycleCountPlan?: {
-    update(args: Record<string, unknown>): Promise<unknown>;
+    updateMany(args: Record<string, unknown>): Promise<{ count: number }>;
   };
   cycleCountTask?: {
     findFirst(args: Record<string, unknown>): Promise<CycleCountTaskRecord | null>;

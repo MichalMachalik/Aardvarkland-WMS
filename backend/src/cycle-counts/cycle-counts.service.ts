@@ -3,7 +3,7 @@ import { BadRequestException, ConflictException, Injectable, NotFoundException }
 import { AuthenticatedUser } from '../access-control/types';
 import { lockPostgresRowById, PrismaService, withTransactionRetry } from '../database';
 import { assertNoBlockingStockFreeze } from '../inventory/stock-freeze.helpers';
-import { calculateCountVariance, makeCycleCountPlanCode } from './cycle-counts.helpers';
+import { calculateCountVariance, countSubmissionPlanUpdate, makeCycleCountPlanCode } from './cycle-counts.helpers';
 import {
   CycleCountApprovalResponse,
   CycleCountPlanResponse,
@@ -260,15 +260,7 @@ export class CycleCountsService {
         });
       }
 
-      await tx.cycleCountPlan.update({
-        where: { id: countTask.planId },
-        data: {
-          status:
-            varianceQuantity === 0
-              ? CycleCountPlanStatus.COUNTING
-              : CycleCountPlanStatus.RECONCILING,
-        },
-      });
+      await tx.cycleCountPlan.updateMany(countSubmissionPlanUpdate(countTask.planId, varianceQuantity));
       await tx.outboxEvent.create({
         data: {
           type: 'CYCLE_COUNT_SUBMITTED',
@@ -321,6 +313,9 @@ export class CycleCountsService {
 
         if (!stockQuant) {
           throw new NotFoundException('Stock quant was not found');
+        }
+        if (stockQuant.quantity !== countTask.expectedQuantity) {
+          throw new ConflictException('Stock changed since the count was started');
         }
 
         if (stockQuant.reservedQuantity > countTask.countedQuantity) {
@@ -687,6 +682,7 @@ interface CycleCountTransactionClient {
     update(args: Record<string, unknown>): Promise<unknown>;
   };
   cycleCountPlan: {
+    updateMany(args: Record<string, unknown>): Promise<{ count: number }>;
     create(args: Record<string, unknown>): Promise<CycleCountPlanRecord>;
     findFirst(args: Record<string, unknown>): Promise<CycleCountPlanRecord | null>;
     findMany(args: Record<string, unknown>): Promise<CycleCountPlanRecord[]>;
