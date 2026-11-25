@@ -1,7 +1,7 @@
 import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 
-import { PrismaService } from '../database';
-import { mirrorOwnerClientIdToResource, OwnerClientMirrorClient } from './direct-owner-client.helpers';
+import { lockPostgresAdvisoryTransaction, PrismaService } from '../database';
+import { getOwnerClientMirrorDelegateName, mirrorOwnerClientIdToResource, OwnerClientMirrorClient } from './direct-owner-client.helpers';
 import { normalizeClientCode, normalizeOptionalResourceCode } from './clients.helpers';
 import {
   ClientResourceLinkRecord,
@@ -177,16 +177,34 @@ export class OwnerScopeService {
       clientReference: input.clientReference,
     });
     if (!owner) return null;
+    const resourceType = normalizeOptionalResourceCode(input.resourceType);
+    if (!resourceType) throw new ConflictException('Resource type is required.');
+    const delegateName = getOwnerClientMirrorDelegateName(resourceType);
+    const resourceId = delegateName && isUuid(input.resourceId) ? input.resourceId.toLowerCase() : input.resourceId;
+    await lockPostgresAdvisoryTransaction(client, 'idempotency_key', `client-resource:${input.warehouseId}:${resourceType}:${resourceId}`);
+    if (delegateName) {
+      const delegates = client as unknown as Record<string, {
+        findFirst(args: Record<string, unknown>): Promise<{ ownerClientId: string | null } | null>;
+      }>;
+      const resource = isUuid(resourceId) && await delegates[delegateName]?.findFirst({
+        where: { id: resourceId, warehouseId: input.warehouseId },
+        select: { ownerClientId: true },
+      });
+      if (!resource) throw new NotFoundException('Operational resource was not found in this warehouse.');
+      if (resource.ownerClientId && resource.ownerClientId !== owner.id && !input.allowOwnerTransfer) {
+        throw new ConflictException('Operational resource is already owned by another client.');
+      }
+    }
     const link = await ensureOwnedResourceLink(client, {
       warehouseId: input.warehouseId,
       clientId: owner.id,
-      resourceType: input.resourceType,
-      resourceId: input.resourceId,
+      resourceType,
+      resourceId,
       externalReference: input.externalReference,
       metadata: input.metadata,
       allowOwnerTransfer: input.allowOwnerTransfer,
     });
-    await this.mirrorOwnerClientId(client, input.resourceType, input.resourceId, owner.id);
+    await this.mirrorOwnerClientId(client, resourceType, resourceId, owner.id);
     return link;
   }
 

@@ -42,7 +42,7 @@ import {
   summarizeInvoiceLines,
 } from './billing-invoice.helpers';
 import { buildBillingPdfBase64 } from './billing-pdf.helpers';
-import { OwnerScopeService } from './owner-scope.service';
+import { OwnerScopePrismaClient, OwnerScopeService } from './owner-scope.service';
 import { evaluateOwnershipIntegrity, OwnershipIntegritySummary } from './ownership-integrity.helpers';
 import {
   buildBillingEventsFromCounters,
@@ -190,31 +190,27 @@ export class ClientsService {
     const client = await this.resolveClient(clientReference);
     const sku = dto.skuReference ? await this.resolveSku(dto.skuReference) : null;
     const clientSku = dto.clientSku.trim().toUpperCase();
+    if (!clientSku) throw new BadRequestException('Client SKU is required.');
 
-    const alias = await this.client.clientSkuAlias.upsert({
-      where: { clientId_clientSku: { clientId: client.id, clientSku } },
-      update: {
+    const alias = await this.transaction(async tx => {
+      const changes = {
         warehouseId: warehouse.id,
         skuId: sku?.id ?? null,
         clientBarcode: normalizeOptionalString(dto.clientBarcode),
         description: normalizeOptionalString(dto.description),
         metadata: dto.metadata ?? null,
-      },
-      create: {
-        clientId: client.id,
-        warehouseId: warehouse.id,
-        skuId: sku?.id ?? null,
+      };
+      const saved = await tx.clientSkuAlias.upsert({
+        where: { clientId_clientSku: { clientId: client.id, clientSku } },
+        update: changes,
+        create: { ...changes, clientId: client.id, clientSku },
+      });
+      await this.writeAudit(actor.id, warehouse.id, 'client.sku_alias_upserted', 'client_sku_alias', saved.id, {
+        clientCode: client.code,
         clientSku,
-        clientBarcode: normalizeOptionalString(dto.clientBarcode),
-        description: normalizeOptionalString(dto.description),
-        metadata: dto.metadata ?? null,
-      },
-    });
-
-    await this.writeAudit(actor.id, warehouse.id, 'client.sku_alias_upserted', 'client_sku_alias', alias.id, {
-      clientCode: client.code,
-      clientSku,
-      skuId: sku?.id ?? null,
+        skuId: sku?.id ?? null,
+      }, tx);
+      return saved;
     });
     return toClientSkuAliasResponse(alias);
   }
@@ -252,28 +248,32 @@ export class ClientsService {
     if (!dto.rates?.length) {
       throw new ConflictException('Rate card must contain at least one rate.');
     }
+    const name = dto.name.trim();
+    if (!name) throw new BadRequestException('Rate card name is required.');
+    const rates = dto.rates.map(rate => ({
+      eventType: normalizeBillingEventType(rate.eventType),
+      unit: normalizeOptionalResourceCode(rate.unit ?? 'EA') ?? 'EA',
+      unitPriceMinor: Math.max(0, Math.trunc(rate.unitPriceMinor)),
+      minChargeMinor: rate.minChargeMinor === undefined ? null : Math.max(0, Math.trunc(rate.minChargeMinor)),
+      vatRateBps: rate.vatRateBps === undefined ? null : Math.min(10_000, Math.max(0, Math.trunc(rate.vatRateBps))),
+      metadata: rate.metadata ?? null,
+    }));
+    if (new Set(rates.map(rate => `${rate.eventType}:${rate.unit}`)).size !== rates.length) {
+      throw new ConflictException('Rate card contains multiple rates for the same event type and unit.');
+    }
 
     const card = await this.transaction(async (tx) => {
       const created = await tx.clientRateCard.create({
         data: {
           warehouseId: warehouse.id,
           clientId: client.id,
-          name: dto.name.trim(),
+          name,
           currency: normalizeCurrency(dto.currency, client.billingCurrency),
           validFrom,
           validTo,
           isActive: dto.isActive ?? true,
           metadata: dto.metadata ?? null,
-          rates: {
-            create: dto.rates.map((rate) => ({
-              eventType: normalizeBillingEventType(rate.eventType),
-              unit: normalizeOptionalResourceCode(rate.unit ?? 'EA') ?? 'EA',
-              unitPriceMinor: Math.max(0, Math.trunc(rate.unitPriceMinor)),
-              minChargeMinor: rate.minChargeMinor === undefined ? null : Math.max(0, Math.trunc(rate.minChargeMinor)),
-              vatRateBps: rate.vatRateBps === undefined ? null : Math.min(10_000, Math.max(0, Math.trunc(rate.vatRateBps))),
-              metadata: rate.metadata ?? null,
-            })),
-          },
+          rates: { create: rates },
         },
         include: { rates: { orderBy: [{ eventType: 'asc' }, { unit: 'asc' }] } },
       });
@@ -299,13 +299,22 @@ export class ClientsService {
     });
     if (!user) throw new NotFoundException('User was not found.');
 
-    const access = await this.client.userClientAccess.upsert({
-      where: { userId_clientId_warehouseId: { userId: user.id, clientId: client.id, warehouseId: warehouse.id } },
-      update: { isActive: dto.isActive ?? true, metadata: dto.metadata ?? null },
-      create: { userId: user.id, clientId: client.id, warehouseId: warehouse.id, isActive: dto.isActive ?? true, metadata: dto.metadata ?? null },
+    const access = await this.transaction(async tx => {
+      const identity = { userId: user.id, clientId: client.id, warehouseId: warehouse.id };
+      const changes = { isActive: dto.isActive ?? true, metadata: dto.metadata ?? null };
+      const saved = await tx.userClientAccess.upsert({
+        where: { userId_clientId_warehouseId: identity },
+        update: changes,
+        create: { ...identity, ...changes },
+      });
+      await this.writeAudit(actor.id, warehouse.id, 'client.user_access_granted', 'user_client_access', saved.id, {
+        userId: user.id, userEmail: user.email, clientCode: client.code, isActive: saved.isActive,
+      }, tx);
+      await this.writeOutbox('CLIENT_USER_ACCESS_GRANTED', 'user_client_access', saved.id, {
+        ...identity, isActive: saved.isActive,
+      }, tx);
+      return saved;
     });
-    await this.writeAudit(actor.id, warehouse.id, 'client.user_access_granted', 'user_client_access', access.id, { userId: user.id, userEmail: user.email, clientCode: client.code });
-    await this.writeOutbox('CLIENT_USER_ACCESS_GRANTED', 'user_client_access', access.id, { warehouseId: warehouse.id, clientId: client.id, userId: user.id });
     return toUserClientAccessResponse(access);
   }
 
@@ -321,23 +330,25 @@ export class ClientsService {
     if (!resourceType) throw new ConflictException('Resource type is required.');
     const resourceId = dto.resourceId.trim();
 
-    const link = await this.ownerScope.linkResourceToClient({
-      warehouseId: warehouse.id,
-      clientReference: client.code,
-      resourceType,
-      resourceId,
-      externalReference: dto.externalReference,
-      metadata: dto.metadata ?? null,
-      allowOwnerTransfer: dto.allowOwnerTransfer === true,
-    });
-
-    if (!link) throw new ConflictException('Resource id is required.');
-
-    await this.writeAudit(actor.id, warehouse.id, 'client.resource_linked', 'client_resource_link', link.id, {
-      clientCode: client.code,
-      resourceType,
-      resourceId,
-      allowOwnerTransfer: dto.allowOwnerTransfer === true,
+    const link = await this.transaction(async tx => {
+      const saved = await this.ownerScope.linkResourceToClient({
+        warehouseId: warehouse.id,
+        clientReference: client.code,
+        resourceType,
+        resourceId,
+        externalReference: dto.externalReference,
+        metadata: dto.metadata ?? null,
+        allowOwnerTransfer: dto.allowOwnerTransfer === true,
+        client: tx as unknown as OwnerScopePrismaClient,
+      });
+      if (!saved) throw new ConflictException('Resource id is required.');
+      await this.writeAudit(actor.id, warehouse.id, 'client.resource_linked', 'client_resource_link', saved.id, {
+        clientCode: client.code,
+        resourceType,
+        resourceId: saved.resourceId,
+        allowOwnerTransfer: dto.allowOwnerTransfer === true,
+      }, tx);
+      return saved;
     });
     return toClientResourceLinkResponse(link);
   }

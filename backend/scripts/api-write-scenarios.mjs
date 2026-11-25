@@ -1082,6 +1082,91 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     }, 400);
   });
 
+  await scenario('client setup validates rate cards, aliases, access and warehouse-safe ownership', async () => {
+    const { sku } = await createSku('CLIENT-OPS');
+    const client = await asAdmin('POST', '/api/clients', { code: `OPS-A-${suffix}`, name: 'First test client' });
+    const other = await asAdmin('POST', '/api/clients', { code: `OPS-B-${suffix}`, name: 'Second test client' });
+    const path = `/clients/${client.code}`;
+    const otherPath = `/clients/${other.code}`;
+    const attachment = await own('POST', path + '/attach', {});
+    await own('POST', otherPath + '/attach', {});
+    const ratePath = path + '/rate-cards';
+    const rate = { eventType: 'PICK', unit: 'EA', unitPriceMinor: 700, vatRateBps: 2100 };
+    const card = { name: 'Fixture rates', currency: 'CZK', validFrom: '2026-01-01', validTo: '2027-01-01', rates: [rate] };
+    await own('POST', ratePath, { ...card, rates: [rate, { ...rate, unit: ' ea ' }] }, 409);
+    await own('POST', ratePath, { ...card, validTo: card.validFrom }, 409);
+    await own('POST', ratePath, { ...card, name: '  ' }, 400);
+    assert.deepEqual(await own('GET', ratePath), []);
+    const savedCard = await own('POST', ratePath, { ...card, rates: [rate, { ...rate, eventType: 'PACK', unitPriceMinor: 900 }] });
+    assert.equal(savedCard.currency, 'CZK');
+    assert.deepEqual(savedCard.rates.map(item => [item.eventType, item.unit, item.unitPriceMinor]).sort(),
+      [['PACK', 'EA', 900], ['PICK', 'EA', 700]]);
+    assert.equal((await own('GET', ratePath))[0].id, savedCard.id);
+    assert.equal(await prisma.outboxEvent.count({ where: { aggregateId: savedCard.id, type: 'CLIENT_RATE_CARD_CREATED' } }), 1);
+
+    const aliasPath = path + '/sku-aliases';
+    const aliasBody = { skuReference: sku.code, clientSku: ' sku-client-1 ', clientBarcode: '87654321000' };
+    await asWorker('POST', warehouse + aliasPath, aliasBody, 403);
+    await own('POST', aliasPath, { ...aliasBody, clientSku: '   ' }, 400);
+    const alias = await own('POST', aliasPath, aliasBody);
+    const updatedAlias = await own('POST', aliasPath, { ...aliasBody, clientSku: 'SKU-CLIENT-1', description: 'Updated client SKU' });
+    assert.equal(updatedAlias.id, alias.id);
+    const aliasRow = await prisma.clientSkuAlias.findUniqueOrThrow({ where: { id: alias.id } });
+    assert.equal(aliasRow.warehouseId, attachment.warehouseId);
+    assert.equal(aliasRow.skuId, sku.id);
+    assert.equal(aliasRow.description, 'Updated client SKU');
+    const otherAlias = await own('POST', otherPath + '/sku-aliases', aliasBody);
+    assert.notEqual(otherAlias.id, alias.id);
+
+    const email = `client-access-${suffix.toLowerCase()}@example.invalid`;
+    const password = `Fixture-${randomUUID()}-42!`;
+    const user = await asAdmin('POST', '/api/users', {
+      email, password, displayName: 'Test client worker', roleCode: 'WAREHOUSE_WORKER', warehouseCode: 'MAIN',
+    });
+    const account = bind((await login(email, password)).accessToken);
+    const userPath = path + '/user-access';
+    await own('POST', userPath, { userReference: 'missing@example.invalid' }, 404);
+    const readAccess = async () => (await account('GET', '/api/auth/me')).clientAccess.find(item => item.clientId === client.id);
+    assert.equal(await readAccess(), undefined);
+    const grant = await own('POST', userPath, { userReference: email.toUpperCase() });
+    assert.equal(grant.userId, user.id);
+    assert.equal((await readAccess()).isActive, true);
+    const revoke = await own('POST', userPath, { userReference: user.id, isActive: false });
+    assert.equal(revoke.id, grant.id);
+    assert.equal((await readAccess()).isActive, false);
+    const accessEvents = await prisma.outboxEvent.findMany({
+      where: { aggregateId: grant.id, type: 'CLIENT_USER_ACCESS_GRANTED' },
+    });
+    assert.deepEqual(accessEvents.map(event => event.payload.isActive).sort(), [false, true]);
+
+    const outsideWarehouse = await prisma.warehouse.create({ data: { code: `OTHER-${suffix}`, name: 'Other fixture warehouse' } });
+    const outsideLocation = await prisma.warehouseLocation.create({
+      data: { warehouseId: outsideWarehouse.id, code: 'STORAGE', name: 'Fixture storage', type: 'STORAGE' },
+    });
+    const outsideStock = await prisma.stockQuant.create({
+      data: { warehouseId: outsideWarehouse.id, locationId: outsideLocation.id, skuId: sku.id, quantity: 4 },
+    });
+    const stock = await own('POST', '/inventory/quants/receive', { skuReference: sku.code, locationReference: 'A-01-01', quantity: 2 });
+    const linkPath = path + '/resource-links';
+    const linkBody = { resourceType: 'STOCK_QUANT', resourceId: stock.quant.id, externalReference: 'CLIENT-STOCK' };
+    await own('POST', linkPath, { ...linkBody, resourceId: outsideStock.id }, 404);
+    await own('POST', linkPath, { ...linkBody, resourceId: randomUUID() }, 404);
+    assert.equal((await prisma.stockQuant.findUniqueOrThrow({ where: { id: outsideStock.id } })).ownerClientId, null);
+    assert.deepEqual(await own('GET', linkPath), []);
+    const link = await own('POST', linkPath, linkBody);
+    const owner = async () => (await prisma.stockQuant.findUniqueOrThrow({ where: { id: stock.quant.id } })).ownerClientId;
+    assert.equal(await owner(), client.id);
+    const otherLink = otherPath + '/resource-links';
+    await own('POST', otherLink, linkBody, 409);
+    await own('POST', otherLink, { ...linkBody, allowOwnerTransfer: { unexpected: true } }, 400);
+    assert.equal(await owner(), client.id);
+    const transferred = await own('POST', otherLink, { ...linkBody, allowOwnerTransfer: true });
+    assert.equal(transferred.id, link.id);
+    assert.equal(await owner(), other.id);
+    assert.deepEqual(await own('GET', linkPath), []);
+    assert.equal((await own('GET', otherLink))[0].id, link.id);
+  });
+
   await scenario('parcels, tracking, operational exceptions and notifications can be updated', async () => {
     const parcelBody = { trackingNumber: `PARCEL-${suffix}`, currentLocationReference: 'A-01-01' };
     const parcel = await own('POST', '/parcels', parcelBody);

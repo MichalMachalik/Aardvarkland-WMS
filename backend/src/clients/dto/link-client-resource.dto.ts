@@ -36,9 +36,12 @@ export class LinkClientResourceDto {
   metadata?: Record<string, unknown>;
 }
 
-function toOptionalBoolean(value: unknown): boolean | undefined {
+function toOptionalBoolean(value: unknown): unknown {
   if (value === undefined || value === null || value === '') return undefined;
-  if (typeof value === 'boolean') return value;
-  if (typeof value === 'string') return ['1', 'true', 'yes'].includes(value.toLowerCase());
-  return Boolean(value);
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (['1', 'true', 'yes'].includes(normalized)) return true;
+    if (['0', 'false', 'no'].includes(normalized)) return false;
+  }
+  return value;
 }
