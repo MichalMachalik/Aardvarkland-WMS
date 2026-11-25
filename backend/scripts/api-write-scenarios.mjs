@@ -2553,6 +2553,93 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.equal(list.items.length, 4);
   });
 
+  await scenario('slotting validates rules and preserves counters in incremental velocity updates', async () => {
+    const slotting = '/slotting';
+    const { sku } = await createSku('SLOT-COUNTERS');
+    const invalid = { code: `INVALID-${suffix}`, minVelocityScore: 50, maxVelocityScore: 30 };
+    await own('POST', slotting + '/rules', invalid, 409);
+    await own('POST', slotting + '/rules', { ...invalid, maxVelocityScore: 70, targetLocationType: 'MISSING-TYPE' }, 400);
+    const input = { code: `LOT-VELOCITY-${suffix}`, minVelocityScore: 60, maxVelocityScore: 100, targetLocationType: 'picking' };
+    const rule = await own('POST', slotting + '/rules', input);
+    assert.equal(rule.targetLocationType, 'PICKING');
+    await own('POST', slotting + '/rules', input, 409);
+    await own('POST', slotting + '/velocities', { sku: 'TEST-MISSING-SKU' }, 404);
+    const original = await own('POST', slotting + '/velocities', {
+      sku: sku.code, picksLast30Days: 10, unitsPickedLast30Days: 30, replenishmentsLast30Days: 1,
+    });
+    assert.deepEqual([original.velocityScore, original.abcClass], [76, 'A']);
+    const revised = await own('POST', slotting + '/velocities', { sku: sku.id, replenishmentsLast30Days: 0 });
+    assert.equal(revised.id, original.id);
+    assert.deepEqual([revised.picksLast30Days, revised.unitsPickedLast30Days, revised.velocityScore, revised.abcClass], [10, 30, 70, 'B']);
+  });
+
+  await scenario('slotting previews safely, creates each recommendation once and moves confirmed stock', async () => {
+    const slotting = '/slotting';
+    const { sku } = await createSku('SLOTTING');
+    const { sku: dismissedSku } = await createSku('SLOT-DISMISS');
+    const zone = `SLOT-ZONE-${suffix}`;
+    const location = (name, type, pickSequence) => own('POST', '/locations', {
+      code: `SLOT-${name}-${suffix}`, name: `Slotting ${name}`, type, zone, pickSequence, parentReference: 'A-01',
+    });
+    const source = await location('SOURCE', 'STORAGE', 300);
+    const target = await location('TARGET', 'PICKING', 20);
+    const inventory = (await own('POST', '/inventory/quants/receive', {
+      skuReference: sku.id, locationReference: source.id, quantity: 9,
+    })).quant;
+    const otherStock = (await own('POST', '/inventory/quants/receive', {
+      skuReference: dismissedSku.id, locationReference: source.id, quantity: 7,
+    })).quant;
+    await own('POST', slotting + '/rules', {
+      code: `00-SLOT-${suffix}`, zone, targetLocationType: 'PICKING', maxPickSequence: 40, minPickFaceQuantity: 3,
+    });
+    await own('POST', slotting + '/rules', {
+      code: `00-SLOT-OTHER-${suffix}`, zone: 'OTHER-ZONE', targetLocationType: 'PICKING', maxPickSequence: 0,
+    });
+    await own('POST', slotting + '/velocities', { sku: sku.id, velocityScore: 99 });
+    await own('POST', slotting + '/velocities', { sku: dismissedSku.id, velocityScore: 98 });
+    const evaluate = slotting + '/evaluate';
+    const options = { minVelocityScore: 95, lowVelocityScore: 0 };
+    await own('POST', evaluate, { ...options, dryRun: 'false' }, 400);
+    const preview = await own('POST', evaluate, { ...options, dryRun: true });
+    assert.equal(preview.recommendationsCreated, 0);
+    const drafts = preview.recommendations.filter(item => item.skuId === sku.id);
+    assert.equal(drafts.length, 1);
+    assert.equal(drafts[0].toLocationId, target.id);
+    assert.equal(drafts[0].metadata.plannedQuantity, 3);
+    assert.ok(!Object.hasOwn(drafts[0].metadata, 'sourceQuantId'));
+    assert.equal(await prisma.slottingRecommendation.count({ where: { skuId: sku.id } }), 0);
+    const runs = await Promise.all([own('POST', evaluate, options), own('POST', evaluate, options)]);
+    const saved = runs.flatMap(run => run.recommendations).filter(item => item.skuId === sku.id);
+    const discard = runs.flatMap(run => run.recommendations).filter(item => item.skuId === dismissedSku.id);
+    assert.equal(saved.length, 1);
+    assert.equal(discard.length, 1);
+    const apply = `${slotting}/recommendations/${saved[0].id}/apply`;
+    const results = await Promise.all([own('POST', apply, {}, [201, 409]), own('POST', apply, {}, [201, 409])]);
+    assert.equal(results.filter(item => item.status === 'APPLIED').length, 1);
+    const applied = results.find(item => item.status === 'APPLIED');
+    const taskId = applied.metadata.moveTaskId;
+    const task = await prisma.warehouseTask.findUniqueOrThrow({ where: { id: taskId } });
+    assert.deepEqual([task.type, task.fromLocationId, task.toLocationId, task.quantity], ['MOVE', source.id, target.id, 3]);
+    assert.equal(await prisma.warehouseTask.count({ where: { skuId: sku.id, type: 'MOVE' } }), 1);
+    const rerun = await own('POST', evaluate, options);
+    assert.ok(!rerun.recommendations.some(item => item.skuId === sku.id));
+    assert.equal((await prisma.stockQuant.findUniqueOrThrow({ where: { id: inventory.id } })).quantity, 9);
+    await own('POST', `/tasks/${taskId}/start`, {});
+    assert.equal((await own('POST', `/tasks/${taskId}/confirm`, {})).status, 'DONE');
+    assert.equal((await prisma.stockQuant.findUniqueOrThrow({ where: { id: inventory.id } })).quantity, 6);
+    const destination = await prisma.stockQuant.findFirstOrThrow({ where: { skuId: sku.id, locationId: target.id } });
+    assert.equal(destination.quantity, 3);
+    assert.ok(!(await own('POST', evaluate, options)).recommendations.some(item => item.skuId === sku.id));
+    await prisma.stockQuant.update({ where: { id: otherStock.id }, data: { quantity: 0 } });
+    await own('POST', `${slotting}/recommendations/${discard[0].id}/apply`, {}, 409);
+    assert.equal((await prisma.slottingRecommendation.findUniqueOrThrow({ where: { id: discard[0].id } })).status, 'OPEN');
+    const dismiss = `${slotting}/recommendations/${discard[0].id}/dismiss`;
+    const decisions = await Promise.all([own('POST', dismiss, {}, [201, 409]), own('POST', dismiss, {}, [201, 409])]);
+    assert.equal(decisions.filter(item => item.status === 'DISMISSED').length, 1);
+    assert.equal(await prisma.auditLog.count({ where: { resourceId: discard[0].id, action: 'slotting.recommendation_dismissed' } }), 1);
+    await own('POST', `${slotting}/recommendations/${discard[0].id}/apply`, {}, 409);
+  });
+
   await scenario('yard check-in links one appointment and rejects missing or conflicting references', async () => {
     const yard = '/enterprise-ops/yard';
     const appointment = await own('POST', yard + '/appointments', {

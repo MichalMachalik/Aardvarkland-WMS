@@ -5,7 +5,6 @@ import { IsBoolean, IsInt, IsOptional, Max, Min } from 'class-validator';
 export class EvaluateSlottingDto {
   @ApiPropertyOptional({ example: true })
   @IsOptional()
-  @Type(() => Boolean)
   @IsBoolean()
   dryRun?: boolean;
 

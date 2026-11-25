@@ -1,8 +1,11 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 
 import { AuthenticatedUser } from '../access-control/types';
 import { normalizeOffsetPagination } from '../common';
 import { PrismaService, withTransactionRetry } from '../database';
+import { lockPostgresAdvisoryTransaction, lockPostgresRowById } from '../database/transaction-locks';
+import { Prisma, WarehouseLocationType } from '../generated/prisma/client';
 import { CreateSlottingRuleDto } from './dto/create-slotting-rule.dto';
 import { EvaluateSlottingDto } from './dto/evaluate-slotting.dto';
 import { ListSlottingRecommendationsQueryDto } from './dto/list-slotting-recommendations-query.dto';
@@ -57,41 +60,43 @@ export class SlottingService {
       throw new ConflictException('minVelocityScore cannot be greater than maxVelocityScore.');
     }
 
-    const code = normalizeSlottingCode(
-      dto.code ?? `${dto.zone ?? 'GLOBAL'}-SLOTTING-${Date.now()}`,
-    );
-    const rule = await this.client.slottingRule.create({
-      data: {
-        warehouseId: warehouse.id,
-        code,
-        status: SlottingRuleStatus.ACTIVE,
-        zone: normalizeNullableCode(dto.zone),
-        minVelocityScore: dto.minVelocityScore ?? null,
-        maxVelocityScore: dto.maxVelocityScore ?? null,
-        targetLocationType: dto.targetLocationType ? normalizeCode(dto.targetLocationType) : null,
-        maxPickSequence: dto.maxPickSequence ?? null,
-        minPickFaceQuantity: dto.minPickFaceQuantity ?? null,
-        metadata: dto.metadata ?? undefined,
-      },
-    });
-
-    await this.writeAudit(
-      actor.id,
-      warehouse.id,
-      'slotting.rule_created',
-      'slotting_rule',
-      rule.id,
-      {
-        code: rule.code,
-        zone: rule.zone,
-      },
-    );
-    await this.writeOutbox('SLOTTING_RULE_CREATED', 'slotting_rule', rule.id, {
-      warehouseId: warehouse.id,
-      code: rule.code,
-    });
-
-    return toRuleResponse(rule);
+    const code = normalizeSlottingCode(dto.code ?? `SLOTTING-${randomUUID()}`);
+    if (!code) throw new BadRequestException('Slotting rule code must not be blank.');
+    const rawType = normalizeNullableCode(dto.targetLocationType);
+    const targetLocationType = rawType === 'PICK' ? WarehouseLocationType.PICKING : rawType;
+    if (targetLocationType && !Object.values(WarehouseLocationType).some(type => type === targetLocationType)) {
+      throw new BadRequestException('Invalid target location type.');
+    }
+    try {
+      return await this.transaction(async tx => {
+        const rule = await tx.slottingRule.create({
+          data: {
+            warehouseId: warehouse.id,
+            code,
+            status: SlottingRuleStatus.ACTIVE,
+            zone: normalizeNullableCode(dto.zone),
+            minVelocityScore: dto.minVelocityScore ?? null,
+            maxVelocityScore: dto.maxVelocityScore ?? null,
+            targetLocationType,
+            maxPickSequence: dto.maxPickSequence ?? null,
+            minPickFaceQuantity: dto.minPickFaceQuantity ?? null,
+            metadata: dto.metadata ?? undefined,
+          },
+        });
+        await this.writeAudit(tx, actor.id, warehouse.id, 'slotting.rule_created', 'slotting_rule', rule.id, {
+          code: rule.code, zone: rule.zone,
+        });
+        await this.writeOutbox(tx, 'SLOTTING_RULE_CREATED', 'slotting_rule', rule.id, {
+          warehouseId: warehouse.id, code: rule.code,
+        });
+        return toRuleResponse(rule);
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        throw new ConflictException('A slotting rule with this code already exists in the warehouse.');
+      }
+      throw error;
+    }
   }
 
   async listVelocities(
@@ -122,55 +127,32 @@ export class SlottingService {
   ): Promise<SkuVelocityResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
     const sku = await this.resolveSku(dto.sku);
-    const velocityScore = dto.velocityScore ?? calculateVelocityScore(dto);
-    const abcClass = classifyVelocity(velocityScore);
-
-    const velocity = await this.client.skuVelocity.upsert({
-      where: { warehouseId_skuCode: { warehouseId: warehouse.id, skuCode: sku.code } },
-      create: {
-        warehouseId: warehouse.id,
-        skuId: sku.id,
-        skuCode: sku.code,
-        picksLast30Days: dto.picksLast30Days ?? 0,
-        unitsPickedLast30Days: dto.unitsPickedLast30Days ?? 0,
-        replenishmentsLast30Days: dto.replenishmentsLast30Days ?? 0,
-        velocityScore,
-        abcClass,
-        metadata: dto.metadata ?? undefined,
-        lastCalculatedAt: new Date(),
-      },
-      update: {
-        skuId: sku.id,
-        picksLast30Days: dto.picksLast30Days ?? 0,
-        unitsPickedLast30Days: dto.unitsPickedLast30Days ?? 0,
-        replenishmentsLast30Days: dto.replenishmentsLast30Days ?? 0,
-        velocityScore,
-        abcClass,
-        metadata: dto.metadata ?? undefined,
-        lastCalculatedAt: new Date(),
-      },
+    return this.transaction(async tx => {
+      const key = { warehouseId: warehouse.id, skuCode: sku.code };
+      await lockPostgresAdvisoryTransaction(tx, 'slotting_velocity', JSON.stringify([warehouse.id, sku.code]));
+      const current = await tx.skuVelocity.findFirst({ where: key });
+      const counters = {
+        picksLast30Days: dto.picksLast30Days ?? current?.picksLast30Days ?? 0,
+        unitsPickedLast30Days: dto.unitsPickedLast30Days ?? current?.unitsPickedLast30Days ?? 0,
+        replenishmentsLast30Days: dto.replenishmentsLast30Days ?? current?.replenishmentsLast30Days ?? 0,
+      };
+      const recalculate = dto.picksLast30Days != null || dto.unitsPickedLast30Days != null || dto.replenishmentsLast30Days != null;
+      const velocityScore = dto.velocityScore ?? (recalculate || !current ? calculateVelocityScore(counters) : current.velocityScore);
+      const abcClass = classifyVelocity(velocityScore);
+      const data = { skuId: sku.id, ...counters, velocityScore, abcClass, metadata: dto.metadata ?? undefined, lastCalculatedAt: new Date() };
+      const velocity = await tx.skuVelocity.upsert({
+        where: { warehouseId_skuCode: key },
+        create: { ...key, ...data },
+        update: data,
+      });
+      await this.writeAudit(tx, actor.id, warehouse.id, 'slotting.velocity_upserted', 'sku_velocity', velocity.id, {
+        skuCode: sku.code, velocityScore, abcClass,
+      });
+      await this.writeOutbox(tx, 'SKU_VELOCITY_UPDATED', 'sku_velocity', velocity.id, {
+        warehouseId: warehouse.id, skuCode: sku.code, velocityScore, abcClass,
+      });
+      return toVelocityResponse(velocity);
     });
-
-    await this.writeAudit(
-      actor.id,
-      warehouse.id,
-      'slotting.velocity_upserted',
-      'sku_velocity',
-      velocity.id,
-      {
-        skuCode: sku.code,
-        velocityScore,
-        abcClass,
-      },
-    );
-    await this.writeOutbox('SKU_VELOCITY_UPDATED', 'sku_velocity', velocity.id, {
-      warehouseId: warehouse.id,
-      skuCode: sku.code,
-      velocityScore,
-      abcClass,
-    });
-
-    return toVelocityResponse(velocity);
   }
 
   async evaluate(
@@ -179,115 +161,89 @@ export class SlottingService {
     actor: AuthenticatedUser,
   ): Promise<SlottingEvaluationResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
-    const [rules, velocities, stock, locations, openRecommendations] = await Promise.all([
-      this.client.slottingRule.findMany({
-        where: { warehouseId: warehouse.id, status: SlottingRuleStatus.ACTIVE },
-        orderBy: [{ code: 'asc' }],
-      }),
-      this.client.skuVelocity.findMany({
-        where: { warehouseId: warehouse.id },
-        orderBy: [{ velocityScore: 'desc' }, { skuCode: 'asc' }],
-      }),
-      this.client.stockQuant.findMany({
-        where: { warehouseId: warehouse.id, status: { in: ['AVAILABLE', 'RESERVED'] } },
-        include: { sku: true, location: true },
-      }),
-      this.client.warehouseLocation.findMany({
-        where: { warehouseId: warehouse.id, isActive: true },
-        orderBy: [{ pickSequence: 'asc' }, { code: 'asc' }],
-      }),
-      this.client.slottingRecommendation.findMany({
-        where: { warehouseId: warehouse.id, status: SlottingRecommendationStatus.OPEN },
-      }),
-    ]);
-
-    const velocityCandidates = velocities.map(toVelocityCandidate);
-    const locationCandidates = locations.map(toLocationCandidate);
-    const stockCandidates = stock.map(toStockCandidate);
-    const ruleCandidates = rules.map((rule) => ({
-      id: rule.id,
-      code: rule.code,
-      zone: rule.zone,
-      minVelocityScore: rule.minVelocityScore,
-      maxVelocityScore: rule.maxVelocityScore,
-      targetLocationType: rule.targetLocationType,
-      maxPickSequence: rule.maxPickSequence,
-      minPickFaceQuantity: rule.minPickFaceQuantity,
-    }));
-    const maxRecommendations = clampSlottingLimit(dto.maxRecommendations, 100);
-    const drafts = buildSlottingRecommendations({
-      velocities: velocityCandidates,
-      stock: stockCandidates,
-      locations: locationCandidates,
-      rules: ruleCandidates,
-      maxRecommendations,
-      minVelocityScore: dto.minVelocityScore,
-      lowVelocityScore: dto.lowVelocityScore,
-    });
-    const existingKeys = new Set(openRecommendations.map(recommendationKey));
-    const freshDrafts = drafts.filter((draft) => !existingKeys.has(draftKey(draft)));
     const dryRun = dto.dryRun ?? false;
-    const created: SlottingRecommendationRecord[] = [];
-
-    if (!dryRun && freshDrafts.length > 0) {
-      for (const draft of freshDrafts) {
-        const recommendation = await this.client.slottingRecommendation.create({
-          data: {
-            warehouseId: warehouse.id,
-            skuId: draft.skuId,
-            skuCode: draft.skuCode,
-            fromLocationId: draft.fromLocationId,
-            toLocationId: draft.toLocationId,
-            status: SlottingRecommendationStatus.OPEN,
-            reason: draft.reason,
-            priority: draft.priority,
-            velocityScore: draft.velocityScore,
-            expectedTravelSavings: draft.expectedTravelSavings,
-            message: draft.message,
-            metadata: draft.metadata,
-          },
-        });
-        created.push(recommendation);
-      }
-
-      await this.writeAudit(
-        actor.id,
-        warehouse.id,
-        'slotting.evaluated',
-        'warehouse',
-        warehouse.id,
-        {
-          recommendationsCreated: created.length,
-          recommendationsSkipped: drafts.length - freshDrafts.length,
-        },
-      );
-      await this.writeOutbox('SLOTTING_EVALUATED', 'warehouse', warehouse.id, {
-        warehouseId: warehouse.id,
-        recommendationsCreated: created.length,
-      });
+    const minVelocityScore = dto.minVelocityScore ?? 60;
+    const lowVelocityScore = dto.lowVelocityScore ?? 20;
+    if (lowVelocityScore >= minVelocityScore) {
+      throw new BadRequestException('Low velocity threshold must be below the high velocity threshold.');
     }
+    return this.transaction(async tx => {
+      if (!dryRun) await lockPostgresAdvisoryTransaction(tx, 'slotting_evaluation', warehouse.id);
+      const [rules, velocities, stock, locations, existing] = await Promise.all([
+        tx.slottingRule.findMany({
+          where: { warehouseId: warehouse.id, status: SlottingRuleStatus.ACTIVE },
+          orderBy: [{ code: 'asc' }],
+        }),
+        tx.skuVelocity.findMany({
+          where: { warehouseId: warehouse.id },
+          orderBy: [{ velocityScore: 'desc' }, { skuCode: 'asc' }],
+        }),
+        tx.stockQuant.findMany({
+          where: { warehouseId: warehouse.id, status: 'AVAILABLE', handlingUnitId: null, location: { isActive: true } },
+          include: { sku: true, location: true },
+        }),
+        tx.warehouseLocation.findMany({
+          where: { warehouseId: warehouse.id, isActive: true },
+          orderBy: [{ pickSequence: 'asc' }, { code: 'asc' }],
+        }),
+        tx.slottingRecommendation.findMany({
+          where: { warehouseId: warehouse.id, status: { in: ['OPEN', 'APPLIED'] } },
+        }),
+      ]);
+      const activeTasks = await tx.warehouseTask.findMany({
+        where: {
+          warehouseId: warehouse.id,
+          id: { in: existing.flatMap(row => {
+            const taskId = toRecord(row.metadata)['moveTaskId'];
+            return row.status === SlottingRecommendationStatus.APPLIED && typeof taskId === 'string' && isUuid(taskId) ? [taskId] : [];
+          }) },
+          status: { in: ['OPEN', 'ASSIGNED', 'IN_PROGRESS', 'BLOCKED'] },
+        },
+        select: { id: true },
+      });
+      const activeTaskIds = new Set(activeTasks.map(task => task.id));
+      const existingKeys = new Set(existing.filter(row => {
+        const taskId = toRecord(row.metadata)['moveTaskId'];
+        return row.status === SlottingRecommendationStatus.OPEN || (typeof taskId === 'string' && activeTaskIds.has(taskId));
+      }).map(recommendationKey));
+      const input = {
+        velocities: velocities.map(toVelocityCandidate),
+        stock: stock.map(toStockCandidate),
+        locations: locations.map(toLocationCandidate),
+        rules,
+        maxRecommendations: clampSlottingLimit(dto.maxRecommendations, 100),
+        minVelocityScore,
+        lowVelocityScore,
+      };
+      const drafts = buildSlottingRecommendations(input);
+      const freshDrafts = drafts.filter(draft => !existingKeys.has(recommendationKey(draft)));
+      const recommendationsSkipped = drafts.length - freshDrafts.length;
+      const created: SlottingRecommendationRecord[] = [];
 
-    const summary = summarizeSlottingCandidates({
-      velocities: velocityCandidates,
-      stock: stockCandidates,
-      locations: locationCandidates,
-      rules: ruleCandidates,
-      maxRecommendations,
-      minVelocityScore: dto.minVelocityScore,
-      lowVelocityScore: dto.lowVelocityScore,
+      if (!dryRun && freshDrafts.length > 0) {
+        for (const draft of freshDrafts) {
+          const recommendation = await tx.slottingRecommendation.create({
+            data: { ...draft, warehouseId: warehouse.id, status: SlottingRecommendationStatus.OPEN },
+          });
+          created.push(recommendation);
+        }
+        await this.writeAudit(tx, actor.id, warehouse.id, 'slotting.evaluated', 'warehouse', warehouse.id, {
+          recommendationsCreated: created.length, recommendationsSkipped,
+        });
+        await this.writeOutbox(tx, 'SLOTTING_EVALUATED', 'warehouse', warehouse.id, {
+          warehouseId: warehouse.id, recommendationsCreated: created.length,
+        });
+      }
+      return {
+        warehouseId: warehouse.id,
+        generatedAt: new Date().toISOString(),
+        dryRun,
+        recommendationsCreated: created.length,
+        recommendationsSkipped,
+        recommendations: dryRun ? freshDrafts.map(draft => toDraftResponse(warehouse.id, draft)) : created.map(toRecommendationResponse),
+        summary: summarizeSlottingCandidates(input),
+      };
     });
-
-    return {
-      warehouseId: warehouse.id,
-      generatedAt: new Date().toISOString(),
-      dryRun,
-      recommendationsCreated: dryRun ? 0 : created.length,
-      recommendationsSkipped: drafts.length - freshDrafts.length,
-      recommendations: dryRun
-        ? freshDrafts.map((draft) => toDraftResponse(warehouse.id, draft))
-        : created.map(toRecommendationResponse),
-      summary,
-    };
   }
 
   async listRecommendations(
@@ -324,37 +280,57 @@ export class SlottingService {
   ): Promise<SlottingRecommendationResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
     return this.transaction(async (tx) => {
-      const recommendation = await this.resolveRecommendationWithClient(
-        tx,
-        warehouse.id,
-        recommendationReference,
-      );
+      await lockPostgresAdvisoryTransaction(tx, 'slotting_evaluation', warehouse.id);
+      const recommendation = await this.lockRecommendation(tx, warehouse.id, recommendationReference);
       if (!canMutateSlottingRecommendation(recommendation.status)) {
         throw new ConflictException(
           `Slotting recommendation cannot be applied from status ${recommendation.status}.`,
         );
       }
 
-      let moveTaskId: string | null = null;
-      if (recommendation.skuId && recommendation.fromLocationId && recommendation.toLocationId) {
-        const task = await tx.warehouseTask.create({
-          data: {
-            warehouseId: warehouse.id,
-            type: 'MOVE',
-            status: 'OPEN',
-            skuId: recommendation.skuId,
-            fromLocationId: recommendation.fromLocationId,
-            toLocationId: recommendation.toLocationId,
-            priority: recommendation.priority,
-            metadata: {
-              slottingRecommendationId: recommendation.id,
-              reason: recommendation.reason,
-              velocityScore: recommendation.velocityScore,
-            },
-          },
-        });
-        moveTaskId = task.id;
+      const { skuId, fromLocationId, toLocationId } = recommendation;
+      if (!skuId || !fromLocationId || !toLocationId || fromLocationId === toLocationId) {
+        throw new ConflictException('A slotting move requires a SKU and different source and destination locations.');
       }
+      const destination = await tx.warehouseLocation.findFirst({ where: { warehouseId: warehouse.id, id: toLocationId } });
+      if (!destination?.isActive) throw new ConflictException('The slotting destination is no longer active.');
+      const { plannedQuantity, sourceQuantId } = toRecord(recommendation.metadata);
+      const requestedQuantity = typeof plannedQuantity === 'number' && Number.isInteger(plannedQuantity) && plannedQuantity > 0
+        ? plannedQuantity : null;
+      const sources = await tx.stockQuant.findMany({
+        where: {
+          warehouseId: warehouse.id, skuId, locationId: fromLocationId, status: 'AVAILABLE',
+          handlingUnitId: null, location: { isActive: true },
+          ...(typeof sourceQuantId === 'string' && isUuid(sourceQuantId) ? { id: sourceQuantId } : {}),
+        },
+        include: { sku: true, location: true },
+        orderBy: [{ expiryDate: { sort: 'asc', nulls: 'last' } }, { createdAt: 'asc' }, { id: 'asc' }],
+      });
+      const source = sources.find(quant => quant.quantity - quant.reservedQuantity >= (requestedQuantity ?? 1));
+      if (!source) throw new ConflictException('The source no longer holds enough movable stock for this recommendation.');
+      const quantity = requestedQuantity ?? (source.quantity - source.reservedQuantity);
+      const ownerClientId = source.ownerClientId ?? null;
+      const active = await tx.warehouseTask.findMany({
+        where: {
+          warehouseId: warehouse.id, skuId, fromLocationId, toLocationId, ownerClientId, type: 'MOVE',
+          status: { in: ['OPEN', 'ASSIGNED', 'IN_PROGRESS', 'BLOCKED'] },
+        },
+        select: { id: true },
+        take: 1,
+      });
+      if (active.length) throw new ConflictException('An active task already moves this SKU between these locations.');
+      const task = await tx.warehouseTask.create({
+        data: {
+          warehouseId: warehouse.id, ownerClientId, type: 'MOVE', status: 'OPEN',
+          skuId, fromLocationId, toLocationId, quantity, priority: recommendation.priority,
+          metadata: {
+            slottingRecommendationId: recommendation.id,
+            reason: recommendation.reason,
+            velocityScore: recommendation.velocityScore,
+          },
+        },
+      });
+      const moveTaskId = task.id;
 
       const updated = await tx.slottingRecommendation.update({
         where: { id: recommendation.id },
@@ -368,24 +344,10 @@ export class SlottingService {
         },
       });
 
-      await tx.auditLog.create({
-        data: {
-          actorUserId: actor.id,
-          warehouseId: warehouse.id,
-          action: 'slotting.recommendation_applied',
-          resourceType: 'slotting_recommendation',
-          resourceId: recommendation.id,
-          metadata: { skuCode: recommendation.skuCode, moveTaskId },
-        },
-      });
-      await tx.outboxEvent.create({
-        data: {
-          type: 'SLOTTING_RECOMMENDATION_APPLIED',
-          aggregateType: 'slotting_recommendation',
-          aggregateId: recommendation.id,
-          payload: { warehouseId: warehouse.id, skuCode: recommendation.skuCode, moveTaskId },
-        },
-      });
+      await this.writeAudit(tx, actor.id, warehouse.id, 'slotting.recommendation_applied', 'slotting_recommendation',
+        recommendation.id, { skuCode: recommendation.skuCode, moveTaskId });
+      await this.writeOutbox(tx, 'SLOTTING_RECOMMENDATION_APPLIED', 'slotting_recommendation',
+        recommendation.id, { warehouseId: warehouse.id, skuCode: recommendation.skuCode, moveTaskId });
 
       return toRecommendationResponse(updated);
     });
@@ -397,43 +359,25 @@ export class SlottingService {
     actor: AuthenticatedUser,
   ): Promise<SlottingRecommendationResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
-    const recommendation = await this.resolveRecommendation(warehouse.id, recommendationReference);
-    if (!canMutateSlottingRecommendation(recommendation.status)) {
-      throw new ConflictException(
-        `Slotting recommendation cannot be dismissed from status ${recommendation.status}.`,
-      );
-    }
-
-    const updated = await this.client.slottingRecommendation.update({
-      where: { id: recommendation.id },
-      data: {
-        status: SlottingRecommendationStatus.DISMISSED,
-        dismissedAt: new Date(),
-        metadata: mergeMetadata(recommendation.metadata, { dismissedByUserId: actor.id }),
-      },
+    return this.transaction(async tx => {
+      const recommendation = await this.lockRecommendation(tx, warehouse.id, recommendationReference);
+      if (!canMutateSlottingRecommendation(recommendation.status)) {
+        throw new ConflictException(`Slotting recommendation cannot be dismissed from status ${recommendation.status}.`);
+      }
+      const updated = await tx.slottingRecommendation.update({
+        where: { id: recommendation.id },
+        data: {
+          status: SlottingRecommendationStatus.DISMISSED,
+          dismissedAt: new Date(),
+          metadata: mergeMetadata(recommendation.metadata, { dismissedByUserId: actor.id }),
+        },
+      });
+      await this.writeAudit(tx, actor.id, warehouse.id, 'slotting.recommendation_dismissed', 'slotting_recommendation',
+        recommendation.id, { skuCode: recommendation.skuCode });
+      await this.writeOutbox(tx, 'SLOTTING_RECOMMENDATION_DISMISSED', 'slotting_recommendation',
+        recommendation.id, { warehouseId: warehouse.id, skuCode: recommendation.skuCode });
+      return toRecommendationResponse(updated);
     });
-
-    await this.writeAudit(
-      actor.id,
-      warehouse.id,
-      'slotting.recommendation_dismissed',
-      'slotting_recommendation',
-      recommendation.id,
-      {
-        skuCode: recommendation.skuCode,
-      },
-    );
-    await this.writeOutbox(
-      'SLOTTING_RECOMMENDATION_DISMISSED',
-      'slotting_recommendation',
-      recommendation.id,
-      {
-        warehouseId: warehouse.id,
-        skuCode: recommendation.skuCode,
-      },
-    );
-
-    return toRecommendationResponse(updated);
   }
 
   private async resolveWarehouse(reference: string): Promise<WarehouseRecord> {
@@ -457,11 +401,14 @@ export class SlottingService {
     return sku;
   }
 
-  private async resolveRecommendation(
+  private async lockRecommendation(
+    client: SlottingTransactionClient,
     warehouseId: string,
     reference: string,
   ): Promise<SlottingRecommendationRecord> {
-    return this.resolveRecommendationWithClient(this.client, warehouseId, reference);
+    const found = await this.resolveRecommendationWithClient(client, warehouseId, reference);
+    await lockPostgresRowById(client, 'slotting_recommendations', found.id);
+    return this.resolveRecommendationWithClient(client, warehouseId, found.id);
   }
 
   private async resolveRecommendationWithClient(
@@ -482,6 +429,7 @@ export class SlottingService {
   }
 
   private async writeAudit(
+    tx: SlottingTransactionClient,
     actorUserId: string,
     warehouseId: string,
     action: string,
@@ -489,18 +437,19 @@ export class SlottingService {
     resourceId: string,
     metadata: Record<string, unknown>,
   ): Promise<void> {
-    await this.client.auditLog.create({
+    await tx.auditLog.create({
       data: { actorUserId, warehouseId, action, resourceType, resourceId, metadata },
     });
   }
 
   private async writeOutbox(
+    tx: SlottingTransactionClient,
     type: string,
     aggregateType: string,
     aggregateId: string,
     payload: Record<string, unknown>,
   ): Promise<void> {
-    await this.client.outboxEvent.create({ data: { type, aggregateType, aggregateId, payload } });
+    await tx.outboxEvent.create({ data: { type, aggregateType, aggregateId, payload } });
   }
 
   private transaction<T>(fn: (tx: SlottingTransactionClient) => Promise<T>): Promise<T> {
@@ -564,7 +513,7 @@ function toRecommendationResponse(
     velocityScore: recommendation.velocityScore,
     expectedTravelSavings: recommendation.expectedTravelSavings,
     message: recommendation.message,
-    metadata: recommendation.metadata,
+    metadata: publicRecommendationMetadata(recommendation.metadata),
     appliedAt: recommendation.appliedAt?.toISOString() ?? null,
     dismissedAt: recommendation.dismissedAt?.toISOString() ?? null,
     createdAt: recommendation.createdAt.toISOString(),
@@ -590,12 +539,19 @@ function toDraftResponse(
     velocityScore: draft.velocityScore,
     expectedTravelSavings: draft.expectedTravelSavings,
     message: draft.message,
-    metadata: draft.metadata,
+    metadata: publicRecommendationMetadata(draft.metadata),
     appliedAt: null,
     dismissedAt: null,
     createdAt: now,
     updatedAt: now,
   };
+}
+
+function publicRecommendationMetadata(metadata: unknown): unknown {
+  if (!Object.hasOwn(toRecord(metadata), 'sourceQuantId')) return metadata;
+  const result = { ...toRecord(metadata) };
+  delete result['sourceQuantId'];
+  return result;
 }
 
 function toVelocityCandidate(velocity: SkuVelocityRecord): SlottingVelocityCandidate {
@@ -623,6 +579,8 @@ function toLocationCandidate(location: LocationRecord): SlottingLocationCandidat
 
 function toStockCandidate(stock: StockQuantWithRelations): SlottingStockCandidate {
   return {
+    id: stock.id,
+    ownerClientId: stock.ownerClientId,
     skuId: stock.skuId,
     skuCode: stock.sku.code,
     locationId: stock.locationId,
@@ -635,19 +593,12 @@ function toStockCandidate(stock: StockQuantWithRelations): SlottingStockCandidat
   };
 }
 
-function recommendationKey(recommendation: SlottingRecommendationRecord): string {
+function recommendationKey(recommendation: Pick<SlottingRecommendationRecord, 'skuCode' | 'fromLocationId' | 'toLocationId'>): string {
   return [
     recommendation.skuCode,
-    recommendation.reason,
     recommendation.fromLocationId ?? '',
     recommendation.toLocationId ?? '',
   ].join('|');
-}
-
-function draftKey(draft: SlottingRecommendationDraft): string {
-  return [draft.skuCode, draft.reason, draft.fromLocationId ?? '', draft.toLocationId ?? ''].join(
-    '|',
-  );
 }
 
 function warehouseWhere(reference: string): Record<string, unknown> {
@@ -689,7 +640,10 @@ interface SlottingPrismaClient extends SlottingTransactionClient {
 
 interface SlottingTransactionClient {
   warehouse: { findFirst(args: Record<string, unknown>): Promise<WarehouseRecord | null> };
-  warehouseLocation: { findMany(args: Record<string, unknown>): Promise<LocationRecord[]> };
+  warehouseLocation: {
+    findFirst(args: Record<string, unknown>): Promise<LocationRecord | null>;
+    findMany(args: Record<string, unknown>): Promise<LocationRecord[]>;
+  };
   sku: { findFirst(args: Record<string, unknown>): Promise<SkuRecord | null> };
   stockQuant: { findMany(args: Record<string, unknown>): Promise<StockQuantWithRelations[]> };
   slottingRule: {
@@ -697,6 +651,7 @@ interface SlottingTransactionClient {
     findMany(args: Record<string, unknown>): Promise<SlottingRuleRecord[]>;
   };
   skuVelocity: {
+    findFirst(args: Record<string, unknown>): Promise<SkuVelocityRecord | null>;
     findMany(args: Record<string, unknown>): Promise<SkuVelocityRecord[]>;
     upsert(args: Record<string, unknown>): Promise<SkuVelocityRecord>;
   };
@@ -706,7 +661,10 @@ interface SlottingTransactionClient {
     findMany(args: Record<string, unknown>): Promise<SlottingRecommendationRecord[]>;
     update(args: Record<string, unknown>): Promise<SlottingRecommendationRecord>;
   };
-  warehouseTask: { create(args: Record<string, unknown>): Promise<{ id: string }> };
+  warehouseTask: {
+    create(args: Record<string, unknown>): Promise<{ id: string }>;
+    findMany(args: Record<string, unknown>): Promise<{ id: string }[]>;
+  };
   auditLog: { create(args: Record<string, unknown>): Promise<unknown> };
   outboxEvent: { create(args: Record<string, unknown>): Promise<unknown> };
 }
@@ -734,6 +692,7 @@ interface LocationRecord {
 interface StockQuantWithRelations {
   id: string;
   warehouseId: string;
+  ownerClientId: string | null;
   locationId: string;
   skuId: string;
   quantity: number;

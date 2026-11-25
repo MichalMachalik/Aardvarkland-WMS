@@ -24,6 +24,7 @@ const SAFE_TABLE_NAMES = new Set([
   'billing_invoices',
   'outbox_events',
   'carrier_labels',
+  'slotting_recommendations',
   'inbox_events',
   'integration_endpoints',
   'scanner_sessions',
@@ -36,6 +37,8 @@ const SAFE_ADVISORY_LOCK_NAMESPACES = new Set([
   'yard_trailer_check_in',
   'carrier_label_request',
   'carrier_tracking_event',
+  'slotting_evaluation',
+  'slotting_velocity',
 ]);
 
 export function canRunRawSql(client: unknown): client is RawSqlClient {

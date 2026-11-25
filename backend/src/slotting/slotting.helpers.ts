@@ -27,6 +27,8 @@ export interface SlottingLocationCandidate {
 }
 
 export interface SlottingStockCandidate {
+  id?: string | null;
+  ownerClientId?: string | null;
   skuId?: string | null;
   skuCode: string;
   locationId: string;
@@ -117,7 +119,7 @@ export function buildSlottingRecommendations(
   const maxRecommendations = clampSlottingLimit(input.maxRecommendations);
   const minVelocityScore = clampNonNegative(input.minVelocityScore ?? DEFAULT_MIN_VELOCITY_SCORE);
   const lowVelocityScore = clampNonNegative(input.lowVelocityScore ?? DEFAULT_LOW_VELOCITY_SCORE);
-  const pickFaces = findTargetPickFaces(input.locations, input.rules);
+  const pickFaces = findTargetPickFaces(input.locations);
   const reserveLocations = findReserveLocations(input.locations);
   const stockBySku = groupStockBySku(input.stock);
   const drafts: SlottingRecommendationDraft[] = [];
@@ -125,70 +127,49 @@ export function buildSlottingRecommendations(
   for (const velocity of input.velocities) {
     const skuStock = stockBySku.get(velocity.skuCode) ?? [];
     const currentPickFaceStock = skuStock.filter((quant) => isPickFace(quant.locationType));
-    const totalPickFaceAvailable = currentPickFaceStock.reduce(
-      (sum, quant) => sum + availableQuantity(quant),
-      0,
-    );
     const bestCurrentPickFace = bestStockCandidate(currentPickFaceStock);
     const bestCurrentReserve = bestStockCandidate(
-      skuStock.filter((quant) => !isPickFace(quant.locationType)),
+      skuStock.filter(quant => quant.locationType.toUpperCase() === 'STORAGE'),
     );
     const matchingRule = findMatchingRule(
       input.rules ?? [],
       velocity,
       bestCurrentPickFace ?? bestCurrentReserve,
     );
-    const targetPickFace = pickBestTargetPickFace(pickFaces, matchingRule, skuStock);
     const targetReserve = pickBestReserveLocation(reserveLocations, skuStock);
     const targetMinPickFaceQuantity = matchingRule?.minPickFaceQuantity ?? 1;
 
-    if (velocity.velocityScore >= minVelocityScore && targetPickFace) {
-      const alreadyInGoodPickFace = currentPickFaceStock.some(
-        (quant) =>
-          quant.locationId === targetPickFace.id &&
-          isGoodPickSequence(quant.pickSequence, matchingRule),
-      );
-      if (!alreadyInGoodPickFace && bestCurrentReserve) {
+    if (velocity.velocityScore >= minVelocityScore && bestCurrentReserve) {
+      const suitable = pickFaces.filter(location => isSuitablePickFace(location, matchingRule));
+      const openFace = suitable.find(location => currentPickFaceStock.some(quant =>
+        quant.locationId === location.id && (quant.ownerClientId ?? null) === (bestCurrentReserve.ownerClientId ?? null),
+      ));
+      const target = openFace ?? suitable[0];
+      const atTarget = target ? currentPickFaceStock.reduce((sum, quant) =>
+        quant.locationId === target.id && (quant.ownerClientId ?? null) === (bestCurrentReserve.ownerClientId ?? null)
+          ? sum + availableQuantity(quant) : sum, 0) : 0;
+      const quantity = Math.min(availableQuantity(bestCurrentReserve), Math.max(0, targetMinPickFaceQuantity - atTarget));
+      if (target && quantity > 0) {
+        const isTopUp = Boolean(openFace);
         drafts.push({
           skuId: velocity.skuId ?? null,
           skuCode: velocity.skuCode,
           fromLocationId: bestCurrentReserve.locationId,
-          toLocationId: targetPickFace.id,
-          reason: SlottingRecommendationReason.HIGH_VELOCITY_TO_PICK_FACE,
-          priority: priorityForVelocity(velocity.velocityScore, 10),
+          toLocationId: target.id,
+          reason: isTopUp ? SlottingRecommendationReason.PICK_FACE_BELOW_MIN : SlottingRecommendationReason.HIGH_VELOCITY_TO_PICK_FACE,
+          priority: priorityForVelocity(velocity.velocityScore, isTopUp ? 20 : 10),
           velocityScore: velocity.velocityScore,
-          expectedTravelSavings: estimateTravelSavings(
-            bestCurrentReserve.pickSequence,
-            targetPickFace.pickSequence,
-          ),
-          message: `Move high-velocity SKU ${velocity.skuCode} closer to the pick path.`,
+          expectedTravelSavings: estimateTravelSavings(bestCurrentReserve.pickSequence, target.pickSequence),
+          message: isTopUp ? `Top up pick face for SKU ${velocity.skuCode}.` : `Move high-velocity SKU ${velocity.skuCode} closer to the pick path.`,
           metadata: {
             abcClass: velocity.abcClass ?? classifyVelocity(velocity.velocityScore),
-            targetLocationCode: targetPickFace.code,
+            targetLocationCode: target.code,
             sourceLocationCode: bestCurrentReserve.locationCode,
-            ruleCode: matchingRule?.code ?? null,
-          },
-        });
-      }
-
-      if (totalPickFaceAvailable < targetMinPickFaceQuantity && bestCurrentReserve) {
-        drafts.push({
-          skuId: velocity.skuId ?? null,
-          skuCode: velocity.skuCode,
-          fromLocationId: bestCurrentReserve.locationId,
-          toLocationId: bestCurrentPickFace?.locationId ?? targetPickFace.id,
-          reason: SlottingRecommendationReason.PICK_FACE_BELOW_MIN,
-          priority: priorityForVelocity(velocity.velocityScore, 20),
-          velocityScore: velocity.velocityScore,
-          expectedTravelSavings: estimateTravelSavings(
-            bestCurrentReserve.pickSequence,
-            targetPickFace.pickSequence,
-          ),
-          message: `Top up pick face for SKU ${velocity.skuCode}.`,
-          metadata: {
-            pickFaceAvailable: totalPickFaceAvailable,
+            pickFaceAvailable: atTarget,
             targetMinPickFaceQuantity,
             ruleCode: matchingRule?.code ?? null,
+            plannedQuantity: quantity,
+            sourceQuantId: bestCurrentReserve.id ?? null,
           },
         });
       }
@@ -209,6 +190,8 @@ export function buildSlottingRecommendations(
           abcClass: velocity.abcClass ?? classifyVelocity(velocity.velocityScore),
           targetLocationCode: targetReserve.code,
           sourceLocationCode: bestCurrentPickFace.locationCode,
+          plannedQuantity: availableQuantity(bestCurrentPickFace),
+          sourceQuantId: bestCurrentPickFace.id ?? null,
         },
       });
     }
@@ -238,7 +221,7 @@ export function summarizeSlottingCandidates(input: BuildSlottingRecommendationsI
     lowVelocitySkus: input.velocities.filter(
       (velocity) => velocity.velocityScore <= lowVelocityScore,
     ).length,
-    targetPickFaces: findTargetPickFaces(input.locations, input.rules).length,
+    targetPickFaces: findTargetPickFaces(input.locations).length,
     reserveLocations: findReserveLocations(input.locations).length,
   };
 }
@@ -260,25 +243,15 @@ function groupStockBySku(stock: SlottingStockCandidate[]): Map<string, SlottingS
   return result;
 }
 
-function findTargetPickFaces(
-  locations: SlottingLocationCandidate[],
-  rules: SlottingRuleCandidate[] | undefined,
-): SlottingLocationCandidate[] {
-  const maxPickSequence = Math.min(
-    ...[
-      DEFAULT_PICK_SEQUENCE_LIMIT,
-      ...(rules ?? []).map((rule) => rule.maxPickSequence).filter(isNumber),
-    ],
-  );
+function findTargetPickFaces(locations: SlottingLocationCandidate[]): SlottingLocationCandidate[] {
   return locations
     .filter((location) => (location.isActive ?? true) && isPickFace(location.type))
-    .filter((location) => clampNonNegative(location.pickSequence) <= maxPickSequence)
     .sort((a, b) => clampNonNegative(a.pickSequence) - clampNonNegative(b.pickSequence));
 }
 
 function findReserveLocations(locations: SlottingLocationCandidate[]): SlottingLocationCandidate[] {
   return locations
-    .filter((location) => (location.isActive ?? true) && !isPickFace(location.type))
+    .filter((location) => (location.isActive ?? true) && location.type.toUpperCase() === 'STORAGE')
     .sort((a, b) => clampNonNegative(b.pickSequence) - clampNonNegative(a.pickSequence));
 }
 
@@ -295,7 +268,7 @@ function isPickFace(type: string): boolean {
 function bestStockCandidate(stock: SlottingStockCandidate[]): SlottingStockCandidate | null {
   if (stock.length === 0) return null;
   return (
-    [...stock].sort((a, b) => {
+    stock.filter(quant => availableQuantity(quant) > 0).sort((a, b) => {
       const availableDiff = availableQuantity(b) - availableQuantity(a);
       if (availableDiff !== 0) return availableDiff;
       return clampNonNegative(a.pickSequence) - clampNonNegative(b.pickSequence);
@@ -303,24 +276,13 @@ function bestStockCandidate(stock: SlottingStockCandidate[]): SlottingStockCandi
   );
 }
 
-function pickBestTargetPickFace(
-  locations: SlottingLocationCandidate[],
+function isSuitablePickFace(
+  location: SlottingLocationCandidate,
   rule: SlottingRuleCandidate | null,
-  skuStock: SlottingStockCandidate[],
-): SlottingLocationCandidate | null {
-  const usedLocationIds = new Set(skuStock.map((stock) => stock.locationId));
-  const candidates = locations.filter((location) => {
-    if (usedLocationIds.has(location.id)) return false;
-    if (rule?.zone && location.zone && location.zone.toUpperCase() !== rule.zone.toUpperCase())
-      return false;
-    if (
-      rule?.targetLocationType &&
-      location.type.toUpperCase() !== rule.targetLocationType.toUpperCase()
-    )
-      return false;
-    return isGoodPickSequence(location.pickSequence, rule);
-  });
-  return candidates[0] ?? locations.find((location) => !usedLocationIds.has(location.id)) ?? null;
+): boolean {
+  return (!rule?.zone || location.zone?.toUpperCase() === rule.zone.toUpperCase())
+    && (!rule?.targetLocationType || location.type.toUpperCase() === rule.targetLocationType.toUpperCase())
+    && isGoodPickSequence(location.pickSequence, rule);
 }
 
 function pickBestReserveLocation(
@@ -338,11 +300,7 @@ function findMatchingRule(
 ): SlottingRuleCandidate | null {
   return (
     rules.find((rule) => {
-      if (
-        rule.zone &&
-        currentStock?.zone &&
-        rule.zone.toUpperCase() !== currentStock.zone.toUpperCase()
-      )
+      if (rule.zone && rule.zone.toUpperCase() !== currentStock?.zone?.toUpperCase())
         return false;
       if (isNumber(rule.minVelocityScore) && velocity.velocityScore < rule.minVelocityScore)
         return false;
