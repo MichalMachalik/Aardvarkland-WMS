@@ -81,6 +81,11 @@ export interface RfInstructionResponse {
     expected: RfExpectedScan;
     errorCode: string | null;
   };
+  remainingSteps: Array<{
+    key: string;
+    instruction: string;
+    expected: RfExpectedScan;
+  }>;
   nextActions: string[];
   metadata: unknown;
 }

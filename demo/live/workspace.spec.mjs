@@ -639,6 +639,61 @@ test('the RF browser uploads stored scans in order and keeps every unconfirmed s
   expect(calls[2].scans.map(scan => scan.idempotencyKey)).toEqual(scans.slice(1).map(scan => scan.idempotencyKey));
 });
 
+test('an open RF count advances without a connection and submits only after reconnecting', async ({ page }) => {
+  test.skip(process.env.WMS_LIVE_UI_WRITE !== 'true', 'Requires a disposable warehouse database.');
+  const warehouse = '/api/warehouses/MAIN';
+  const { accessToken: admin } = await liveApi(page, '/api/auth/login', {
+    data: { email: roles.system.email, password: roles.system.password },
+  });
+  const sku = `RF-OFFLINE-${randomUUID().slice(0, 8).toUpperCase()}`;
+  const own = (path, data) => liveApi(page, warehouse + path, { token: admin, data });
+  const product = await liveApi(page, '/api/products', { token: admin, data: { code: sku, name: 'Offline count product' } });
+  await liveApi(page, '/api/products/skus', { token: admin, data: { productReference: product.id, code: sku, name: 'Offline count SKU' } });
+  await own('/inventory/quants/receive', { skuReference: sku, locationReference: 'A-01-01', quantity: 7 });
+  const plan = await own('/cycle-counts', { code: sku, scopeType: 'SKU', scopeReference: sku });
+  const tasksPath = `/cycle-counts/${plan.id}/tasks`;
+  await own(`/cycle-counts/${plan.id}/release`, {});
+  const [task] = await own(tasksPath);
+
+  await login(page, roles.worker);
+  await desktopNav(page).getByRole('button', { name: 'Skenování', exact: true }).click();
+  await page.locator(`[data-e2e-row="rf-task"][data-e2e-value="${task.warehouseTaskId}"]`).click();
+  await page.locator('[data-e2e-action="rf-start-resume"]').click();
+  const expected = page.getByTestId('rf-expected-scan');
+  const input = page.getByTestId('rf-scan-input');
+  const confirm = page.locator('[data-e2e-action="rf-confirm-scan"]');
+  const sendQueue = page.locator('[data-e2e-action="rf-sync-offline"]');
+  await expect(expected).toHaveText('A-01-01');
+  const scan = async value => {
+    await input.fill(value);
+    await confirm.click();
+    await expect(input).toHaveValue('');
+  };
+  await page.context().setOffline(true);
+  try {
+    await expect(page.locator('[data-e2e-action="rf-toggle-offline"]')).toHaveText('Offline zapnuto');
+    await scan('WRONG-LOCATION');
+    await expect(expected).toHaveText('A-01-01');
+    await scan('A-01-01');
+    await expect(expected).toHaveText(sku);
+    await scan(sku);
+    await expect(page.locator('.rf-quantity-controls')).toBeVisible();
+    await expect(expected).toHaveCount(0);
+    await scan('0');
+    await expect(page.getByRole('heading', { name: 'Všechny kroky jsou uložené v zařízení.' })).toBeVisible();
+    await expect(sendQueue).toContainText('(4)');
+    await expect(sendQueue).toBeDisabled();
+  } finally {
+    await page.context().setOffline(false);
+  }
+  expect((await own(tasksPath))[0].countedQuantity).toBeNull();
+  await expect(page.getByRole('heading', { name: 'Odešlete frontu, abyste mohli pokračovat.' })).toBeVisible();
+  await sendQueue.click();
+  await expect(sendQueue).toContainText('(1)');
+  await expect.poll(async () => (await own(tasksPath))[0]).toMatchObject({ status: 'SUBMITTED', countedQuantity: 0 });
+  await expect(page.getByRole('heading', { name: 'Dokončeno', exact: true })).toBeVisible();
+});
+
 test('cycle counts isolate plans, hide the RF quantity and write only approved counts to stock', async ({ page, browser }) => {
   test.skip(process.env.WMS_LIVE_UI_WRITE !== 'true', 'Enable writes only on a disposable database.');
   test.setTimeout(60000);

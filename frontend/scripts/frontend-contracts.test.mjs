@@ -72,9 +72,9 @@ test('RF offline queue confirms writes and preserves every unacknowledged scan',
   assert.match(queue, /createObjectStore/);
   assert.doesNotMatch(queue, /slice\(0, 500\)/);
   assert.match(queue, /appendRfOfflineScan/);
-  assert.match(queue, /removeRfOfflineScans/);
+  assert.match(queue, /applyRfOfflineResults/);
   assert.match(page, /await appendRfOfflineScan/);
-  assert.match(page, /await removeRfOfflineScans/);
+  assert.match(page, /await applyRfOfflineResults/);
   assert.doesNotMatch(page, /wms-rf-offline-queue-v2/);
 });
 

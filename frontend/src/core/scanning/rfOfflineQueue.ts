@@ -14,6 +14,7 @@ export interface StoredRfOfflineScan {
   quantity?: number;
   recordedAt: string;
   metadata: Record<string, unknown>;
+  replayFailed?: boolean;
 }
 
 // Persist each user-acknowledged scan before indicating success in the scanner UI.
@@ -76,15 +77,18 @@ export function appendRfOfflineScan(
   });
 }
 
-export function removeRfOfflineScans(
+export function applyRfOfflineResults(
   warehouseId: string,
   confirmedIdempotencyKeys: string[],
+  failedIdempotencyKeys: string[] = [],
 ): Promise<StoredRfOfflineScan[]> {
   const normalizedWarehouse = normalizeWarehouse(warehouseId);
   return serializeWarehouse(normalizedWarehouse, async () => {
     const stored = await loadRfOfflineQueue(normalizedWarehouse);
     const confirmed = new Set(confirmedIdempotencyKeys);
-    const next = stored.filter((scan) => !confirmed.has(scan.idempotencyKey));
+    const failed = new Set(failedIdempotencyKeys);
+    const next = stored.filter(scan => !confirmed.has(scan.idempotencyKey))
+      .map(scan => failed.has(scan.idempotencyKey) ? { ...scan, replayFailed: true } : scan);
     await persistWarehouseQueue(normalizedWarehouse, next);
     return next;
   });
@@ -251,6 +255,7 @@ function normalizeScans(value: unknown): StoredRfOfflineScan[] {
       quantity: numberValue(scan['quantity']),
       recordedAt,
       metadata: objectValue(scan['metadata']),
+      replayFailed: scan['replayFailed'] === true || undefined,
     }];
   });
 }

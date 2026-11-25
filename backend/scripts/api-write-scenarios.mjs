@@ -579,6 +579,8 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     await own('POST', `/cycle-counts/${plan.id}/release`, {});
     const [countTask] = await own('GET', `/cycle-counts/${plan.id}/tasks`);
     let count = await asWorker('POST', `${warehouse}/rf/tasks/${countTask.warehouseTaskId}/start`, {});
+    assert.equal(count.remainingSteps[0].key, count.step.key);
+    assert.equal(count.remainingSteps.find(item => item.expected.type === 'QUANTITY').expected.value, null);
     const countPath = `/rf/sessions/${count.sessionId}`;
     for (let step = 0; step < 2 && ['LOCATION', 'SKU'].includes(count.step.expected.type); step += 1) {
       count = await asWorker('POST', `${warehouse}${countPath}/scan`, { scannedValue: count.step.expected.value });

@@ -39,10 +39,11 @@ test('501 offline scans persist and recover without silently dropping the oldest
   assert.ok(loaded.some((item) => item.idempotencyKey === 'key-0'));
   await api.appendRfOfflineScan('MAIN', scan(501));
   assert.equal((await api.loadRfOfflineQueue('MAIN')).length, 502);
-  await api.removeRfOfflineScans('MAIN', ['key-500']);
+  await api.applyRfOfflineResults('MAIN', ['key-500'], ['key-0']);
   const remaining = await api.loadRfOfflineQueue('MAIN');
   assert.equal(remaining.length, 501);
   assert.ok(remaining.some((item) => item.idempotencyKey === 'key-501'));
+  assert.equal(remaining.find(item => item.idempotencyKey === 'key-0').replayFailed, true);
 });
 
 test('no local storage can accept writes: user must receive a persistence error', async () => {

@@ -12,6 +12,7 @@ import { ScanRfStepDto } from './dto/scan-rf-step.dto';
 import { StartRfSessionDto } from './dto/start-rf-session.dto';
 import { SyncRfOfflineQueueDto, RfOfflineScanDto } from './dto/sync-rf-offline-queue.dto';
 import {
+  buildRfStepPlanSequence,
   getInitialStepForTask,
   getNextStepAfterScan,
   isExpectedScan,
@@ -1274,19 +1275,30 @@ export class RfWorkflowsService {
       : ({ type: 'NONE', value: null } as RfExpectedScan);
     const blindQuantity = expected.type === 'QUANTITY' && task?.type === 'COUNT' && task.quantity === null;
     const status = session.status as ScannerSessionStatus;
+    const current = {
+      key: step?.stepKey ?? null,
+      sequence: step?.sequence ?? null,
+      instruction: blindQuantity ? quantityStep(null).instruction : (step?.instruction ?? 'RF workflow dokončen.'),
+      expected: blindQuantity ? { type: 'QUANTITY' as const, value: null } : expected,
+      errorCode: errorCode ?? step?.errorCode ?? null,
+    };
+    const remainingSteps: RfInstructionResponse['remainingSteps'] = [];
+    if (step && status === ScannerSessionStatus.ACTIVE) {
+      remainingSteps.push({ key: step.stepKey, instruction: current.instruction, expected: current.expected });
+      if (task) {
+        const plan = buildRfStepPlanSequence(task);
+        const currentIndex = plan.findIndex(item => item.key === step.stepKey);
+        if (currentIndex >= 0) remainingSteps.push(...plan.slice(currentIndex + 1));
+      }
+    }
 
     return {
       sessionId: session.id,
       status,
       workflow: session.workflow as RfWorkflowType,
       task: task ? toTaskSummary(task) : null,
-      step: {
-        key: step?.stepKey ?? null,
-        sequence: step?.sequence ?? null,
-        instruction: blindQuantity ? quantityStep(null).instruction : (step?.instruction ?? 'RF workflow dokončen.'),
-        expected: blindQuantity ? { type: 'QUANTITY', value: null } : expected,
-        errorCode: errorCode ?? step?.errorCode ?? null,
-      },
+      step: current,
+      remainingSteps,
       nextActions: status === ScannerSessionStatus.ACTIVE ? ['SCAN', 'REPORT_EXCEPTION'] : [],
       metadata: session.metadata ?? null,
     };

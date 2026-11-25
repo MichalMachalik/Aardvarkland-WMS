@@ -16,13 +16,18 @@ import { config } from '../../app/config';
 import {
   loadRfOfflineQueue,
   appendRfOfflineScan,
-  removeRfOfflineScans,
+  applyRfOfflineResults,
   type StoredRfOfflineScan,
 } from '../../core/scanning/rfOfflineQueue';
 import { cx } from '../../core/utils/format';
 import { useWorkspace, type Language } from '../../core/workspace/workspace';
 
 type ExpectedType = 'LOCATION' | 'SKU' | 'HANDLING_UNIT' | 'QUANTITY' | 'NONE';
+interface RfPlannedStep {
+  key: string;
+  instruction: string;
+  expected: { type: ExpectedType; value: string | null; alternatives?: string[] };
+}
 type RfExceptionCode = 'SHORT_PICK' | 'WRONG_ITEM' | 'WRONG_LOCATION' | 'DAMAGED_STOCK' | 'MISSING_HU' | 'BARCODE_NOT_RECOGNIZED';
 interface RfTaskSummary {
   id: string;
@@ -62,6 +67,7 @@ interface RfInstruction {
     expected: { type: ExpectedType; value: string | null; alternatives?: string[] };
     errorCode: string | null;
   };
+  remainingSteps?: RfPlannedStep[];
   nextActions: string[];
   metadata: unknown;
 }
@@ -312,7 +318,32 @@ function isQuantityKey(key: string) {
   return upper.includes('QTY') || upper.includes('QUANTITY');
 }
 
+function matchesRfScan(expected: RfPlannedStep['expected'], value: string): boolean {
+  if (expected.type === 'QUANTITY') return parseScanQuantity(value) !== undefined;
+  if (expected.type === 'NONE') return true;
+  const normalized = value.trim().toUpperCase();
+  return [expected.value, ...(expected.alternatives ?? [])].some(code => code?.trim().toUpperCase() === normalized);
+}
+
+function queuedOfflineProgress(plan: RfPlannedStep[], pending: PendingOfflineScan[], sessionId?: string): number {
+  if (!sessionId || !plan.length) return 0;
+  const ordered = pending.filter(scan => scan.sessionReference === sessionId && !scan.replayFailed)
+    .sort((left, right) => Date.parse(left.recordedAt) - Date.parse(right.recordedAt));
+  let completed = 0;
+  for (const scan of ordered) {
+    const step = plan[completed];
+    if (!step) break;
+    if (step.key === scan.stepKey && matchesRfScan(step.expected, scan.scannedValue)) completed += 1;
+  }
+  return completed;
+}
+
 export function RfPage() {
+  const { warehouseId } = useWorkspace();
+  return <RfWorkspace key={warehouseId} />;
+}
+
+function RfWorkspace() {
   const { warehouseId, roleProfile, language, can, workContext, saveWorkContext, workContextStatus } = useWorkspace();
   const text = pickLanguage(language, { cs: czech, en: english, ua: ukrainian });
   const queueResource = useApiResource({
@@ -338,7 +369,9 @@ export function RfPage() {
   const [selectedTaskId, setSelectedTaskId] = useState<string | undefined>();
   const [session, setSession] = useState<RfInstruction | null>(null);
   const [stepIndex, setStepIndex] = useState(0);
-  const [offline, setOffline] = useState(false);
+  const [manualOffline, setManualOffline] = useState(false);
+  const [online, setOnline] = useState(() => navigator.onLine);
+  const offline = manualOffline || !online;
   const [scanValue, setScanValue] = useState('');
   const [scannerDeviceReference, setScannerDeviceReference] = useState(() => readScannerReference(warehouseId));
   const [pending, setPending] = useState<PendingOfflineScan[]>([]);
@@ -349,24 +382,60 @@ export function RfPage() {
   const queuedTask = selectedTaskId ? tasksQueue.find((task) => task.id === selectedTaskId) : tasksQueue[0];
   const selectedTask = session?.task ? { ...session.task, workflow: session.workflow } : queuedTask;
   const expectedSteps = useMemo(() => toExpectedSteps(selectedTask, language), [selectedTask, language]);
-  const current = getInstructionExpected(session, selectedTask, stepIndex, language);
   const sessionCompleted = session?.status === 'COMPLETED';
-  const progress = sessionCompleted ? 100 : Math.round(((stepIndex + 1) / expectedSteps.length) * 100);
+  const remainingSteps = session?.remainingSteps ?? [];
+  const pendingSteps = queuedOfflineProgress(remainingSteps, pending, session?.sessionId);
+  const offlineStep = offline ? remainingSteps[pendingSteps] : undefined;
+  const offlineFinished = offline && remainingSteps.length > 0 && pendingSteps === remainingSteps.length;
+  const waitingForUpload = !offline && pendingSteps > 0;
+  const baseStep = getInstructionExpected(session, selectedTask, stepIndex, language);
+  let current = baseStep;
+  if (offlineFinished || waitingForUpload || (offline && selectedTask && !offlineStep && !sessionCompleted)) {
+    current = {
+      key: 'offline-status',
+      label: text.offlineQueue,
+      instruction: waitingForUpload ? text.uploadBeforeScanning : offlineFinished ? text.offlineStepsSaved : text.prepareOfflineTask,
+      expectedCode: '',
+      helper: '',
+    };
+  } else if (offlineStep && pendingSteps > 0) {
+    current = {
+      key: offlineStep.key,
+      label: offlineStep.expected.type === 'QUANTITY' ? text.step.quantity : offlineStep.expected.type,
+      instruction: offlineStep.instruction,
+      expectedCode: offlineStep.expected.value ?? '',
+      helper: text.offlineQueue,
+    };
+  }
+  const completedBefore = (session?.step.sequence ?? 1) - 1;
+  const progress = sessionCompleted || offlineFinished ? 100 : remainingSteps.length
+    ? Math.min(100, Math.round(((completedBefore + pendingSteps + 1) / (completedBefore + remainingSteps.length)) * 100))
+    : Math.round(((stepIndex + 1) / expectedSteps.length) * 100);
   const offlineStatus = queueResource.data.offlineQueue ?? fallbackQueue.offlineQueue;
   const exceptionActions = useMemo(() => getExceptionActions(current, selectedTask, text), [current, selectedTask, text]);
   const isQuantityStep = isQuantityKey(current.key);
   const expectedQuantity = parseScanQuantity(current.expectedCode);
   const enteredQuantity = parseScanQuantity(scanValue);
   const quantityCandidate = enteredQuantity ?? expectedQuantity;
-  const canConfirmScan = Boolean(selectedTask && scannerDeviceReference.trim() && scanValue.trim())
-    && !sessionCompleted
-    && (!isQuantityStep || enteredQuantity !== undefined);
+  const scannerReady = Boolean(selectedTask && scannerDeviceReference.trim())
+    && !sessionCompleted && !waitingForUpload && (!offline || Boolean(offlineStep));
+  const canConfirmScan = scannerReady && Boolean(scanValue.trim()) && (!isQuantityStep || enteredQuantity !== undefined);
   const showTestAssist = import.meta.env.DEV || config.enableMocks;
   const activeScanner = scannerResource.data.find((scanner) => scanner.code === scannerDeviceReference);
   const registeredScannerReference = !activeScanner && scannerDeviceReference === defaultScannerReference(warehouseId)
     ? undefined
     : scannerDeviceReference || undefined;
   const rfDisplayMode = workContext?.rfMode ?? 'DESKTOP';
+
+  useEffect(() => {
+    const updateOnline = () => setOnline(navigator.onLine);
+    window.addEventListener('online', updateOnline);
+    window.addEventListener('offline', updateOnline);
+    return () => {
+      window.removeEventListener('online', updateOnline);
+      window.removeEventListener('offline', updateOnline);
+    };
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -429,7 +498,7 @@ export function RfPage() {
     setScanValue(String(Math.min(2_147_483_647, Math.max(0, (quantityCandidate ?? 0) + delta))));
   };
   const startSession = async () => {
-    if (!selectedTask || sessionCompleted) return undefined;
+    if (!online || !selectedTask || sessionCompleted) return undefined;
     const result = await mutation.run(text.actions.startSession, () => session?.status === 'ACTIVE'
       ? resumeRfSession<RfInstruction>(warehouseId, session.sessionId)
       : startRfTask<RfInstruction>(warehouseId, selectedTask.id, {
@@ -453,7 +522,9 @@ export function RfPage() {
     setScanPending(true);
     try {
       const expected = current.expectedCode;
-      const matched = isQuantityStep ? enteredQuantity !== undefined : value.toLowerCase() === expected.toLowerCase();
+      const expectedScan = offlineStep?.expected ?? session?.step.expected;
+      const matched = expectedScan ? matchesRfScan(expectedScan, value)
+        : isQuantityStep ? enteredQuantity !== undefined : value.toUpperCase() === expected.toUpperCase();
       const resolvedScan = !offline ? await resolveScan<ScanResolveResponse>(warehouseId, {
         scannedValue: value,
         metadata: { source: 'rf-ui', stepKey: current.key, taskReference: selectedTask.id },
@@ -482,7 +553,6 @@ export function RfPage() {
           const saved = await appendRfOfflineScan(warehouseId, queued);
           setPending(saved);
           appendLog(`${current.label}: ${text.log.offlineSaved} · ${value}`);
-          if (matched) setStepIndex((index) => Math.min(index + 1, expectedSteps.length - 1));
           setScanValue('');
         } catch {
           setOfflineQueueError(true);
@@ -513,7 +583,7 @@ export function RfPage() {
     }
   };
   const syncPending = async () => {
-    if (!pending.length) return;
+    if (!online || !pending.length) return;
     const ordered = [...pending].sort((left, right) => Date.parse(left.recordedAt) - Date.parse(right.recordedAt));
     const result = await mutation.run(text.actions.syncQueue, async () => {
       const totals = { synced: 0, failed: 0, duplicates: 0 };
@@ -533,9 +603,10 @@ export function RfPage() {
           scans,
         });
         const confirmed = batch.items.filter(item => item.status === 'SYNCED' || item.status === 'DUPLICATE').map(item => item.idempotencyKey);
-        if (confirmed.length) {
+        const failed = batch.items.filter(item => item.status === 'FAILED').map(item => item.idempotencyKey);
+        if (confirmed.length || failed.length) {
           try {
-            setPending(await removeRfOfflineScans(warehouseId, confirmed));
+            setPending(await applyRfOfflineResults(warehouseId, confirmed, failed));
           } catch (error) {
             setOfflineQueueError(true);
             throw error;
@@ -556,7 +627,7 @@ export function RfPage() {
     appendLog(`${text.log.sync}: ${result.synced} ${text.log.synced} · ${result.failed} ${text.log.failed} · ${result.duplicates} ${text.log.duplicates}`);
   };
   const reportProblem = async (action: RfExceptionAction) => {
-    if (!selectedTask || sessionCompleted) return;
+    if (!online || !selectedTask || sessionCompleted) return;
     const shortQuantity = action.code === 'SHORT_PICK' ? Number.parseInt(scanValue.trim(), 10) : NaN;
     const result = await mutation.run(action.label, () => reportRfTaskException<RfExceptionReportResponse>(warehouseId, selectedTask.id, {
       code: action.code,
@@ -593,8 +664,8 @@ export function RfPage() {
             <Button size="sm" type="button" tone={rfDisplayMode === 'MOBILE' ? 'primary' : 'secondary'} onClick={() => { void setRfDisplayMode('MOBILE'); }} disabled={workContextStatus === 'loading'}>{text.rfModes.MOBILE}</Button>
             <Button size="sm" type="button" tone={rfDisplayMode === 'TERMINAL' ? 'primary' : 'secondary'} onClick={() => { void setRfDisplayMode('TERMINAL'); }} disabled={workContextStatus === 'loading'}>{text.rfModes.TERMINAL}</Button>
           </div>
-          <Button data-e2e-action="rf-toggle-offline" disabled={scanPending || offlineQueueError || queueLoadedWarehouse !== warehouseId} onClick={() => setOffline((value) => !value)} tone={offline ? 'primary' : 'secondary'}>{offline ? text.offlineOn : text.goOffline}</Button>
-          {pending.length > 0 && <Button data-e2e-action="rf-sync-offline" onClick={syncPending} disabled={scanPending || offlineQueueError || mutation.status === 'running'}>{text.sendQueue} ({pending.length})</Button>}
+          <Button data-e2e-action="rf-toggle-offline" disabled={!online || scanPending || offlineQueueError || queueLoadedWarehouse !== warehouseId} onClick={() => setManualOffline(value => !value)} tone={offline ? 'primary' : 'secondary'}>{offline ? text.offlineOn : text.goOffline}</Button>
+          {pending.length > 0 && <Button data-e2e-action="rf-sync-offline" onClick={syncPending} disabled={!online || scanPending || offlineQueueError || mutation.status === 'running'}>{text.sendQueue} ({pending.length})</Button>}
         </div>
       </section>
 
@@ -652,7 +723,7 @@ export function RfPage() {
               onSubmitValue={() => scanForm.current?.requestSubmit()}
               placeholder={current.expectedCode}
               inputMode={isQuantityStep ? 'numeric' : 'text'}
-              disabled={!selectedTask || !scannerDeviceReference.trim() || sessionCompleted}
+              disabled={!scannerReady}
               readOnly={scanPending}
               data-testid="rf-scan-input"
             />
@@ -661,7 +732,7 @@ export function RfPage() {
           <div className="scanner-fast-actions">
             {showTestAssist && current.expectedCode && <Button size="sm" data-e2e-action="rf-fill-expected" onClick={() => setScanValue(current.expectedCode)} disabled={!selectedTask}>{text.fillExpected}</Button>}
             <Button size="sm" data-e2e-action="rf-reset-flow" disabled={scanPending} onClick={() => { setStepIndex(0); setSession(null); setScanValue(''); }}>{text.resetFlow}</Button>
-            <Button size="sm" data-e2e-action="rf-start-resume" onClick={() => { void startSession(); }} disabled={scanPending || !selectedTask || sessionCompleted || !scannerDeviceReference.trim() || mutation.status === 'running'}>{text.startOrResume}</Button>
+            <Button size="sm" data-e2e-action="rf-start-resume" onClick={() => { void startSession(); }} disabled={!online || scanPending || !selectedTask || sessionCompleted || !scannerDeviceReference.trim() || mutation.status === 'running'}>{text.startOrResume}</Button>
           </div>
           {!sessionCompleted && <div className="scanner-exception-actions" aria-label={text.exceptionTitle}>
             <span>{text.exceptionHint}</span>
@@ -674,7 +745,7 @@ export function RfPage() {
                   tone={action.code === 'SHORT_PICK' ? 'danger' : 'secondary'}
                   data-e2e-action={index === 0 ? 'rf-report-problem' : `rf-report-${action.code.toLowerCase().replaceAll('_', '-')}`}
                   onClick={() => { void reportProblem(action); }}
-                  disabled={!selectedTask || mutation.status === 'running'}
+                  disabled={!online || !selectedTask || mutation.status === 'running'}
                 >
                   {action.label}
                 </Button>
@@ -709,7 +780,7 @@ export function RfPage() {
             <article><span>{text.offlineStats.syncedToday}</span><strong>{offlineStatus.syncedToday}</strong></article>
           </div>
           {pending.length
-            ? pending.slice(0, 8).map((item) => <article key={item.idempotencyKey}><span>{new Date(item.recordedAt).toLocaleTimeString()} · {item.stepKey}</span><strong>{item.scannedValue}</strong><small>{item.taskReference ?? text.noTask} · {item.idempotencyKey}</small></article>)
+            ? pending.slice(0, 8).map((item) => <article key={item.idempotencyKey}><span>{new Date(item.recordedAt).toLocaleTimeString()} · {item.stepKey}</span><strong>{item.scannedValue}</strong>{item.replayFailed && <small>{text.error}</small>}</article>)
             : <p className="muted-copy">{text.noOfflineScans}</p>}
         </div>
       </Card>
@@ -733,6 +804,9 @@ const czech = {
   offlineOn: 'Offline zapnuto',
   goOffline: 'Přejít offline',
   sendQueue: 'Odeslat frontu',
+  prepareOfflineTask: 'Spusťte úkol při připojení, aby se načetly pokyny pro práci offline.',
+  offlineStepsSaved: 'Všechny kroky jsou uložené v zařízení.',
+  uploadBeforeScanning: 'Odešlete frontu, abyste mohli pokračovat.',
   scanner: 'Skener',
   scannerDevice: 'Skener / pracoviště',
   rfMode: 'RF režim',
@@ -830,6 +904,9 @@ const english = {
   offlineOn: 'Offline on',
   goOffline: 'Go offline',
   sendQueue: 'Send queue',
+  prepareOfflineTask: 'Start the task while connected to load the offline instructions.',
+  offlineStepsSaved: 'All steps are saved on this device.',
+  uploadBeforeScanning: 'Send the queue to continue scanning.',
   scanner: 'Scanner',
   scannerDevice: 'Scanner / workstation',
   rfMode: 'RF mode',
@@ -927,6 +1004,9 @@ const ukrainian = {
   offlineOn: 'Офлайн увімкнено',
   goOffline: 'Перейти офлайн',
   sendQueue: 'Надіслати чергу',
+  prepareOfflineTask: 'Запустіть завдання з підключенням, щоб завантажити інструкції для офлайн-роботи.',
+  offlineStepsSaved: 'Усі кроки збережено на цьому пристрої.',
+  uploadBeforeScanning: 'Надішліть чергу, щоб продовжити сканування.',
   scanner: 'Сканер',
   scannerDevice: 'Сканер / станція',
   rfMode: 'RF режим',
