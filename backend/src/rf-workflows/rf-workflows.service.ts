@@ -397,7 +397,11 @@ export class RfWorkflowsService {
       throw new ConflictException('RF session is not active');
     }
 
+    if (session.taskId) await lockPostgresRowById(tx, 'warehouse_tasks', session.taskId);
     const task = session.taskId ? await this.resolveTaskWithClient(tx, warehouseId, session.taskId) : null;
+    if (task && !['OPEN', 'ASSIGNED', 'IN_PROGRESS'].includes(task.status)) {
+      throw new ConflictException('RF task cannot accept scans in its current status');
+    }
     const step = await this.getOpenStepWithClient(tx, session.id);
     if (!step) {
       throw new ConflictException('RF session has no open step');
@@ -481,9 +485,19 @@ export class RfWorkflowsService {
 
     return this.transaction(async (tx: RfTransactionClient) => {
       const task = await this.resolveTaskWithClient(tx, warehouse.id, taskReference);
+      if (task.outboundOrderId) await lockPostgresRowById(tx, 'outbound_orders', task.outboundOrderId);
       await lockPostgresRowById(tx, 'warehouse_tasks', task.id);
       const lockedTask = await this.resolveTaskWithClient(tx, warehouse.id, task.id);
       const code = dto.code ?? RfExceptionCode.SHORT_PICK;
+      if (!['OPEN', 'ASSIGNED', 'IN_PROGRESS', 'BLOCKED'].includes(lockedTask.status)) {
+        throw new ConflictException('RF task cannot accept an exception in its current status');
+      }
+      const order = lockedTask.outboundOrderId && tx.outboundOrder
+        ? await tx.outboundOrder.findFirst({ where: { id: lockedTask.outboundOrderId, warehouseId: warehouse.id } })
+        : null;
+      if (order && ['SHIPPED', 'CANCELLED'].includes(order.status)) {
+        throw new ConflictException('The order is closed');
+      }
       const taskStatus =
         dto.taskStatus ?? (code === RfExceptionCode.SHORT_PICK ? 'FAILED' : 'BLOCKED');
       const releasedReservedQuantity = await this.releaseTaskReservationIfRequested(
@@ -529,18 +543,20 @@ export class RfWorkflowsService {
       });
 
       let orderStatus: string | null = null;
-      if (lockedTask.outboundOrderId && tx.outboundOrder) {
-        const order = await tx.outboundOrder.update({
-          where: { id: lockedTask.outboundOrderId },
+      if (order && tx.outboundOrder) {
+        const updatedOrder = await tx.outboundOrder.update({
+          where: { id: order.id },
           data: {
             status: 'EXCEPTION',
-            metadata: mergeMetadata(null, {
+            metadata: mergeMetadata(order.metadata, {
+              fulfillmentStatus: 'EXCEPTION',
+              fulfillmentUpdatedAt: new Date().toISOString(),
               lastRfExceptionCode: code,
               lastRfExceptionId: exception.id,
             }),
           },
         });
-        orderStatus = order.status;
+        orderStatus = updatedOrder.status;
       }
 
       await tx.auditLog.create({
@@ -760,6 +776,7 @@ export class RfWorkflowsService {
       throw new ConflictException('Pick quantity must be a positive integer');
     }
 
+    await lockPostgresRowById(tx, 'reservations', task.reservationId);
     const reservation = await tx.reservation.findFirst({ where: { id: task.reservationId } });
 
     if (!reservation || reservation.status !== 'ACTIVE') {
@@ -881,6 +898,7 @@ export class RfWorkflowsService {
       return 0;
     }
 
+    await lockPostgresRowById(tx, 'reservations', task.reservationId);
     const reservation = await tx.reservation.findFirst({ where: { id: task.reservationId } });
 
     if (!reservation || reservation.status !== 'ACTIVE') {
@@ -901,6 +919,9 @@ export class RfWorkflowsService {
 
     if (!stockQuant) {
       throw new NotFoundException('Stock quant was not found for RF reservation release');
+    }
+    if (stockQuant.reservedQuantity < quantityToRelease) {
+      throw new ConflictException('RF release quantity exceeds reserved stock');
     }
 
     await assertNoBlockingStockFreeze(tx, {

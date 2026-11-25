@@ -634,6 +634,44 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     }), 1);
   });
 
+  await scenario('an RF exception releases only the reported quantity and preserves order details', async () => {
+    const { sku } = await createSku('RF-EXCEPTION');
+    await own('POST', '/inventory/quants/receive', { skuReference: sku.code, locationReference: 'A-01-01', quantity: 5 });
+    const order = await own('POST', '/outbound-orders', {
+      orderNumber: `RF-EXCEPTION-${suffix}`, metadata: { channel: 'Test channel' },
+      lines: [{ lineNumber: '10', sku: sku.code, orderedQuantity: 3 }],
+    });
+    const allocation = await own('POST', `/outbound-orders/${order.id}/allocate`, {});
+    const reservationId = allocation.reservations[0].id;
+    await own('POST', `/outbound-orders/${order.id}/release-picking`, {});
+    const [task] = (await own('GET', `/tasks?type=PICK&sku=${sku.code}`)).filter(item => item.outboundOrderId === order.id);
+    const path = `${warehouse}/rf/tasks/${task.id}/report-exception`;
+    const scanner = await asWorker('POST', `${warehouse}/rf/tasks/${task.id}/start`, {});
+    const body = { code: 'SHORT_PICK', shortQuantity: 1, releaseReservation: true };
+    const ledger = () => prisma.reservation.findUniqueOrThrow({ where: { id: reservationId } });
+    const initial = await ledger();
+    const stock = () => prisma.stockQuant.findUniqueOrThrow({ where: { id: initial.stockQuantId } });
+    const reservedBefore = (await stock()).reservedQuantity;
+
+    await asWorker('POST', path, { ...body, taskStatus: 'DONE' }, 400);
+    assert.equal((await ledger()).quantity, 3);
+    const result = await asWorker('POST', path, body);
+    assert.equal(result.releasedReservedQuantity, 1);
+    assert.equal(result.taskStatus, 'FAILED');
+    assert.equal(result.orderStatus, 'EXCEPTION');
+    assert.equal((await ledger()).quantity, 2);
+    assert.equal((await stock()).reservedQuantity, reservedBefore - 1);
+    const currentOrder = await own('GET', `/outbound-orders/${order.id}`);
+    assert.equal(currentOrder.metadata.channel, 'Test channel');
+    assert.equal(currentOrder.metadata.fulfillmentStatus, 'EXCEPTION');
+
+    await asWorker('POST', path, body, 409);
+    await asWorker('POST', `${warehouse}/rf/sessions/${scanner.sessionId}/scan`, { scannedValue: scanner.step.expected.value }, 409);
+    assert.equal((await ledger()).quantity, 2);
+    assert.equal((await stock()).reservedQuantity, reservedBefore - 1);
+    assert.equal(await prisma.auditLog.count({ where: { resourceId: task.id, action: 'rf.exception_reported' } }), 1);
+  });
+
   await scenario('fake print agents claim, finish and replay a job without touching hardware', async () => {
     const printerCode = `TEST-PRINTER-${suffix}`;
     const agentCode = `TEST-AGENT-${suffix}`;

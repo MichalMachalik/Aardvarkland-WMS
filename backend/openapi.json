@@ -19056,6 +19056,10 @@
           },
           "taskStatus": {
             "type": "string",
+            "enum": [
+              "BLOCKED",
+              "FAILED"
+            ],
             "example": "FAILED"
           },
           "metadata": {

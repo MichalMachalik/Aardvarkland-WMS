@@ -3,6 +3,7 @@ import { Type } from 'class-transformer';
 import {
   IsBoolean,
   IsEnum,
+  IsIn,
   IsInt,
   IsObject,
   IsOptional,
@@ -43,10 +44,9 @@ export class ReportRfExceptionDto {
   @IsBoolean()
   releaseReservation?: boolean;
 
-  @ApiPropertyOptional({ example: 'FAILED' })
+  @ApiPropertyOptional({ enum: ['BLOCKED', 'FAILED'], example: 'FAILED' })
   @IsOptional()
-  @IsString()
-  @MaxLength(40)
+  @IsIn(['BLOCKED', 'FAILED'])
   taskStatus?: 'BLOCKED' | 'FAILED';
 
   @ApiPropertyOptional({ example: { scanned: 'WRONG-SKU' } })
