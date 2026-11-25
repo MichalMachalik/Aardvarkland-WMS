@@ -10,6 +10,7 @@ const SAFE_TABLE_NAMES = new Set([
   'reservations',
   'outbound_orders',
   'warehouse_tasks',
+  'warehouse_orders',
   'replenishment_rules',
   'cycle_count_plans',
   'inbound_shipments',

@@ -208,6 +208,67 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.ok(confirmed.completedAt);
   });
 
+  await scenario('warehouse orders release once and close with the quantities recorded by their tasks', async () => {
+    const { sku } = await createSku('WAREHOUSE-ORDER');
+    const orders = '/warehouse-orders';
+    const input = {
+      orderNumber: `COUNT-${suffix}`, orderType: 'COUNT',
+      fromLocationReference: 'A-01-01',
+      lines: [
+        { lineNumber: '1', skuReference: sku.code, requestedQuantity: 2 },
+        { lineNumber: '2', skuReference: sku.id, requestedQuantity: 2 },
+      ],
+    };
+    const work = (method, path, body, status) => asWorker(method, warehouse + path, body, status);
+    await work('POST', orders, { ...input, lines: [] }, 409);
+    await work('POST', orders, { ...input, lines: [input.lines[0], { ...input.lines[1], lineNumber: '1 ' }] }, 409);
+    const draft = await work('POST', orders, input);
+    assert.equal(draft.status, 'DRAFT');
+    assert.equal(draft.lines.length, 2);
+    assert.equal(draft.taskLinks.length, 0);
+    await work('POST', orders, input, 409);
+    const path = `${orders}/${draft.id}`;
+    await work('POST', path + '/complete', {}, 409);
+    const releases = await Promise.all([
+      work('POST', path + '/release', undefined, [201, 409]),
+      work('POST', `${orders}/${draft.orderNumber}/release`, undefined, [201, 409]),
+    ]);
+    assert.equal(releases.filter(item => item.status === 'RELEASED').length, 1);
+    const released = await own('GET', path);
+    assert.equal(released.status, 'RELEASED');
+    assert.equal(released.taskLinks.length, 2);
+    assert.equal(await prisma.auditLog.count({ where: { resourceId: draft.id, action: 'warehouse_order.released' } }), 1);
+
+    const linked = released.lines.map(line => released.taskLinks.find(link => link.warehouseOrderLineId === line.id).warehouseTaskId);
+    await work('POST', path + '/complete', {}, 409);
+    assert.deepEqual(await Promise.all(linked.map(id => own('GET', `/tasks/${id}`).then(task => task.status))), ['OPEN', 'OPEN']);
+    for (const [index, id] of linked.entries()) {
+      await work('POST', `/tasks/${id}/start`, {});
+      await work('POST', `/tasks/${id}/confirm`, { quantity: index === 0 ? 0 : 3 });
+      if (index === 0) await work('POST', path + '/complete', {}, 409);
+    }
+    const closed = await work('POST', path + '/complete', { metadata: { fixture: true } });
+    assert.equal(closed.status, 'COMPLETED');
+    assert.ok(closed.completedAt);
+    assert.deepEqual(closed.lines.map(line => line.completedQuantity), [0, 3]);
+    await work('PATCH', path + '/cancel', { reason: 'Already counted' }, 409);
+
+    const second = await work('POST', orders, { ...input, orderNumber: `CANCEL-${suffix}` });
+    const secondPath = `${orders}/${second.id}`;
+    const secondReleased = await work('POST', secondPath + '/release');
+    const doneId = secondReleased.taskLinks.find(link => link.warehouseOrderLineId === secondReleased.lines[0].id).warehouseTaskId;
+    const openId = secondReleased.taskLinks.find(link => link.warehouseOrderLineId === secondReleased.lines[1].id).warehouseTaskId;
+    await work('POST', `/tasks/${doneId}/start`, {});
+    await work('POST', `/tasks/${doneId}/confirm`, { quantity: 1 });
+    await work('PATCH', secondPath + '/cancel', { reason: '   ' }, 409);
+    const cancelled = await work('PATCH', secondPath + '/cancel', { reason: 'Cancel remaining count' });
+    assert.equal(cancelled.status, 'CANCELLED');
+    assert.deepEqual(cancelled.lines.map(line => [line.status, line.completedQuantity]), [['DONE', 1], ['CANCELLED', 0]]);
+    assert.equal((await own('GET', `/tasks/${doneId}`)).status, 'DONE');
+    assert.equal((await own('GET', `/tasks/${openId}`)).status, 'CANCELLED');
+    await work('POST', secondPath + '/release', undefined, 409);
+  });
+
   await scenario('putaway moves the planned stock exactly once and rejects mismatched confirmations', async () => {
     const { sku } = await createSku('PUTAWAY');
     const { sku: otherSku } = await createSku('PUTAWAY-OTHER');

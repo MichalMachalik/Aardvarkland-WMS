@@ -1,8 +1,8 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 
 import { AuthenticatedUser } from '../access-control';
 import { normalizeOffsetPagination } from '../common';
-import { PrismaService } from '../database';
+import { lockPostgresRowById, PrismaService, withTransactionRetry } from '../database';
 import { evaluateWorkflowTransition } from '../workflow';
 import { Prisma, Sku, Warehouse, WarehouseLocation } from '../generated/prisma/client';
 import { CancelWarehouseOrderDto } from './dto/cancel-warehouse-order.dto';
@@ -79,6 +79,12 @@ interface RawClient {
   $executeRawUnsafe(query: string, ...values: unknown[]): Promise<unknown>;
 }
 
+interface LineTaskProgress {
+  pending: boolean;
+  recorded: boolean;
+  quantity: number;
+}
+
 @Injectable()
 export class WarehouseOrdersService {
   constructor(private readonly prisma: PrismaService) {}
@@ -98,6 +104,7 @@ export class WarehouseOrdersService {
       conditions.push(`order_type = $${values.length}::"WarehouseOrderType"`);
     }
     if (query.ownerClientId) {
+      if (!isUuid(query.ownerClientId)) throw new BadRequestException('Warehouse order owner must be a client ID');
       values.push(query.ownerClientId);
       conditions.push(`owner_client_id = $${values.length}::uuid`);
     }
@@ -131,67 +138,66 @@ export class WarehouseOrdersService {
     }
 
     const warehouse = await this.resolveWarehouse(warehouseReference);
+    const ownerClientId = normalizeNullableString(dto.ownerClientId);
+    if (ownerClientId) {
+      if (!isUuid(ownerClientId)) throw new BadRequestException('Warehouse order owner must be a client ID');
+      const owner = await this.prisma.wmsClient.findUnique({ where: { id: ownerClientId }, select: { id: true } });
+      if (!owner) throw new NotFoundException('Warehouse order owner was not found');
+    }
     const fromLocation = dto.fromLocationReference ? await this.resolveLocation(warehouse.id, dto.fromLocationReference) : null;
     const toLocation = dto.toLocationReference ? await this.resolveLocation(warehouse.id, dto.toLocationReference) : null;
     const lines = await this.resolveLines(warehouse.id, dto.lines);
-    const orderNumber = dto.orderNumber ? normalizeCode(dto.orderNumber) : generateOrderNumber();
+    const orderNumber = normalizeNullableString(dto.orderNumber)?.toUpperCase() ?? generateOrderNumber();
 
-    try {
-      const orderId = await this.prisma.$transaction(async (tx: unknown) => {
-        const client = tx as RawClient;
-        const orderRows = await client.$queryRawUnsafe<WarehouseOrderRow[]>(
+    return this.transaction(async (client) => {
+      const [order] = await client.$queryRawUnsafe<WarehouseOrderRow[]>(
+        `
+          INSERT INTO warehouse_orders
+            (warehouse_id, owner_client_id, order_number, order_type, status, priority, source_type, source_id,
+             from_location_id, to_location_id, due_at, metadata, created_at, updated_at)
+          VALUES
+            ($1::uuid, $2::uuid, $3, $4::"WarehouseOrderType", 'DRAFT', $5, $6, $7, $8::uuid, $9::uuid, $10, $11::jsonb, NOW(), NOW())
+          ON CONFLICT (warehouse_id, order_number) DO NOTHING
+          RETURNING ${ORDER_COLUMNS}
+        `,
+        warehouse.id,
+        ownerClientId,
+        orderNumber,
+        dto.orderType,
+        dto.priority ?? 100,
+        normalizeNullableString(dto.sourceType),
+        normalizeNullableString(dto.sourceId),
+        fromLocation?.id ?? null,
+        toLocation?.id ?? null,
+        dto.dueAt ? new Date(dto.dueAt) : null,
+        JSON.stringify(dto.metadata ?? {}),
+      );
+      if (!order) throw new ConflictException('Warehouse order number already exists in this warehouse');
+
+      for (const line of lines) {
+        await client.$executeRawUnsafe(
           `
-            INSERT INTO warehouse_orders
-              (warehouse_id, owner_client_id, order_number, order_type, status, priority, source_type, source_id,
-               from_location_id, to_location_id, due_at, metadata, created_at, updated_at)
+            INSERT INTO warehouse_order_lines
+              (warehouse_id, owner_client_id, warehouse_order_id, line_number, sku_id, lot_id,
+               requested_quantity, allocated_quantity, completed_quantity, serial_required, status, metadata, created_at, updated_at)
             VALUES
-              ($1::uuid, $2::uuid, $3, $4::"WarehouseOrderType", 'DRAFT', $5, $6, $7, $8::uuid, $9::uuid, $10, $11::jsonb, NOW(), NOW())
-            RETURNING ${ORDER_COLUMNS}
+              ($1::uuid, $2::uuid, $3::uuid, $4, $5::uuid, $6::uuid, $7, 0, 0, $8, 'OPEN', $9::jsonb, NOW(), NOW())
           `,
           warehouse.id,
-          dto.ownerClientId ?? null,
-          orderNumber,
-          dto.orderType,
-          dto.priority ?? 100,
-          normalizeNullableString(dto.sourceType),
-          normalizeNullableString(dto.sourceId),
-          fromLocation?.id ?? null,
-          toLocation?.id ?? null,
-          dto.dueAt ?? null,
-          JSON.stringify(dto.metadata ?? {}),
+          ownerClientId,
+          order.id,
+          line.lineNumber,
+          line.skuId,
+          line.lotId,
+          line.requestedQuantity,
+          line.serialRequired,
+          JSON.stringify(line.metadata),
         );
-        const order = assertSingle(orderRows, 'Warehouse order was not created');
+      }
 
-        for (const line of lines) {
-          await client.$executeRawUnsafe(
-            `
-              INSERT INTO warehouse_order_lines
-                (warehouse_id, owner_client_id, warehouse_order_id, line_number, sku_id, lot_id,
-                 requested_quantity, allocated_quantity, completed_quantity, serial_required, status, metadata, created_at, updated_at)
-              VALUES
-                ($1::uuid, $2::uuid, $3::uuid, $4, $5::uuid, $6::uuid, $7, 0, 0, $8, 'OPEN', $9::jsonb, NOW(), NOW())
-            `,
-            warehouse.id,
-            dto.ownerClientId ?? null,
-            order.id,
-            line.lineNumber,
-            line.skuId,
-            line.lotId,
-            line.requestedQuantity,
-            line.serialRequired,
-            JSON.stringify(line.metadata),
-          );
-        }
-
-        return order.id;
-      });
-
-      await this.writeAudit(actor, warehouse.id, 'warehouse_order.created', String(orderId), { orderNumber });
-      return this.readOrderById(String(orderId));
-    } catch (error: unknown) {
-      if (isUniqueViolation(error)) throw new ConflictException('Warehouse order number already exists in this warehouse');
-      throw error;
-    }
+      await this.writeAudit(client, actor, warehouse.id, 'warehouse_order.created', order.id, { orderNumber });
+      return this.hydrateOrder(order, client);
+    });
   }
 
   async releaseOrder(
@@ -200,23 +206,23 @@ export class WarehouseOrdersService {
     actor: AuthenticatedUser,
   ): Promise<WarehouseOrderResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
-    const order = await this.resolveOrder(warehouse.id, orderReference);
-    this.assertWarehouseOrderTransition(
-      order,
-      'RELEASE',
-      actor,
-      order.status === WarehouseOrderStatus.EXCEPTION ? 'EXCEPTION_RECOVERED' : undefined,
-    );
-    const lines = await this.readOrderLines(order.id);
-
-    await this.prisma.$transaction(async (tx: unknown) => {
-      const client = tx as RawClient;
+    return this.transaction(async (client) => {
+      const order = await this.lockOrder(client, warehouse.id, orderReference);
+      this.assertWarehouseOrderTransition(
+        order,
+        'RELEASE',
+        actor,
+        order.status === WarehouseOrderStatus.EXCEPTION ? 'EXCEPTION_RECOVERED' : undefined,
+      );
+      const lines = await this.readOrderLines(order.id, client);
+      const progress = await this.readTaskProgress(client, order.id);
       await client.$executeRawUnsafe(
         `UPDATE warehouse_orders SET status = 'RELEASED', released_at = COALESCE(released_at, NOW()), updated_at = NOW() WHERE id = $1::uuid`,
         order.id,
       );
 
       for (const line of lines) {
+        if (line.status === WarehouseOrderLineStatus.DONE || progress.has(line.id)) continue;
         const taskRows = await client.$queryRawUnsafe<{ id: string }[]>(
           `
             INSERT INTO warehouse_tasks
@@ -236,7 +242,7 @@ export class WarehouseOrdersService {
           line.requested_quantity,
           order.priority,
           `${order.order_number}:${line.line_number}`,
-          JSON.stringify({ warehouseOrderId: order.id, warehouseOrderLineId: line.id, orderNumber: order.order_number }),
+          JSON.stringify({ warehouseOrderId: order.id, warehouseOrderLineId: line.id, orderNumber: order.order_number, lotId: line.lot_id }),
           order.due_at,
         );
         const task = assertSingle(taskRows, 'Warehouse task was not created');
@@ -258,10 +264,9 @@ export class WarehouseOrdersService {
           line.id,
         );
       }
+      await this.writeAudit(client, actor, warehouse.id, 'warehouse_order.released', order.id, { orderNumber: order.order_number });
+      return this.readOrderById(order.id, client);
     });
-
-    await this.writeAudit(actor, warehouse.id, 'warehouse_order.released', order.id, { orderNumber: order.order_number });
-    return this.readOrderById(order.id);
   }
 
   async completeOrder(
@@ -271,33 +276,32 @@ export class WarehouseOrdersService {
     actor: AuthenticatedUser,
   ): Promise<WarehouseOrderResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
-    const order = await this.resolveOrder(warehouse.id, orderReference);
-    this.assertWarehouseOrderTransition(order, 'COMPLETE', actor);
+    return this.transaction(async (client) => {
+      const order = await this.lockOrder(client, warehouse.id, orderReference);
+      this.assertWarehouseOrderTransition(order, 'COMPLETE', actor);
+      const lines = await this.readOrderLines(order.id, client);
+      const progress = await this.readTaskProgress(client, order.id);
+      const countOnly = isCountOrder(order);
+      if (progress.get(null)?.pending) throw new ConflictException('Warehouse order still has unfinished tasks');
 
-    await this.prisma.$transaction(async (tx: unknown) => {
-      const client = tx as RawClient;
+      for (const line of lines) {
+        const result = progress.get(line.id);
+        if (!result?.recorded || result.pending || (!countOnly && result.quantity !== line.requested_quantity)) {
+          throw new ConflictException(`Warehouse order line ${line.line_number} has unfinished work`);
+        }
+        await client.warehouseOrderLine.update({
+          where: { id: line.id },
+          data: { status: WarehouseOrderLineStatus.DONE, completedQuantity: result.quantity },
+        });
+      }
       await client.$executeRawUnsafe(
         `UPDATE warehouse_orders SET status = 'COMPLETED', completed_at = NOW(), metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb, updated_at = NOW() WHERE id = $1::uuid`,
         order.id,
         JSON.stringify(dto.metadata ?? {}),
       );
-      await client.$executeRawUnsafe(
-        `UPDATE warehouse_order_lines SET status = 'DONE', completed_quantity = requested_quantity, updated_at = NOW() WHERE warehouse_order_id = $1::uuid`,
-        order.id,
-      );
-      await client.$executeRawUnsafe(
-        `
-          UPDATE warehouse_tasks wt
-          SET status = 'DONE', completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
-          FROM warehouse_order_tasks wot
-          WHERE wot.warehouse_task_id = wt.id AND wot.warehouse_order_id = $1::uuid AND wt.status <> 'DONE'
-        `,
-        order.id,
-      );
+      await this.writeAudit(client, actor, warehouse.id, 'warehouse_order.completed', order.id, dto.metadata ?? {});
+      return this.readOrderById(order.id, client);
     });
-
-    await this.writeAudit(actor, warehouse.id, 'warehouse_order.completed', order.id, dto.metadata ?? {});
-    return this.readOrderById(order.id);
   }
 
   async cancelOrder(
@@ -307,36 +311,76 @@ export class WarehouseOrdersService {
     actor: AuthenticatedUser,
   ): Promise<WarehouseOrderResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
-    const order = await this.resolveOrder(warehouse.id, orderReference);
-    this.assertWarehouseOrderTransition(order, 'CANCEL', actor, dto.reason);
-
-    await this.prisma.$transaction(async (tx: unknown) => {
-      const client = tx as RawClient;
+    const reason = normalizeNullableString(dto.reason);
+    return this.transaction(async (client) => {
+      const order = await this.lockOrder(client, warehouse.id, orderReference);
+      this.assertWarehouseOrderTransition(order, 'CANCEL', actor, reason);
       await client.$executeRawUnsafe(
         `UPDATE warehouse_orders SET status = 'CANCELLED', cancelled_at = NOW(), metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb, updated_at = NOW() WHERE id = $1::uuid`,
         order.id,
-        JSON.stringify({ ...(dto.metadata ?? {}), cancellationReason: dto.reason ?? null }),
-      );
-      await client.$executeRawUnsafe(
-        `UPDATE warehouse_order_lines SET status = 'CANCELLED', updated_at = NOW() WHERE warehouse_order_id = $1::uuid AND status <> 'DONE'`,
-        order.id,
+        JSON.stringify({ ...(dto.metadata ?? {}), cancellationReason: reason }),
       );
       await client.$executeRawUnsafe(
         `
           UPDATE warehouse_tasks wt
-          SET status = 'CANCELLED', failure_reason = COALESCE($2, failure_reason), updated_at = NOW()
+          SET status = 'CANCELLED', failure_reason = $2, completed_at = COALESCE(completed_at, NOW()),
+              version = version + 1, updated_at = NOW()
           FROM warehouse_order_tasks wot
           WHERE wot.warehouse_task_id = wt.id AND wot.warehouse_order_id = $1::uuid AND wt.status NOT IN ('DONE', 'CANCELLED')
         `,
         order.id,
-        dto.reason ?? null,
+        reason,
       );
+      const lines = await this.readOrderLines(order.id, client);
+      const progress = await this.readTaskProgress(client, order.id);
+      for (const line of lines) {
+        if (line.status === WarehouseOrderLineStatus.DONE) continue;
+        const result = progress.get(line.id);
+        const completed = result?.recorded && (isCountOrder(order) || result.quantity === line.requested_quantity);
+        await client.warehouseOrderLine.update({
+          where: { id: line.id },
+          data: {
+            status: completed ? WarehouseOrderLineStatus.DONE : WarehouseOrderLineStatus.CANCELLED,
+            completedQuantity: result?.quantity ?? line.completed_quantity,
+          },
+        });
+      }
+      await this.writeAudit(client, actor, warehouse.id, 'warehouse_order.cancelled', order.id, { reason });
+      return this.readOrderById(order.id, client);
     });
-
-    await this.writeAudit(actor, warehouse.id, 'warehouse_order.cancelled', order.id, { reason: dto.reason ?? null });
-    return this.readOrderById(order.id);
   }
 
+  private transaction<T>(run: (client: Prisma.TransactionClient) => Promise<T>): Promise<T> {
+    return withTransactionRetry(() => this.prisma.$transaction(run));
+  }
+
+  private async lockOrder(
+    client: Prisma.TransactionClient, warehouseId: string, orderReference: string,
+  ): Promise<WarehouseOrderRow> {
+    const candidate = await this.resolveOrder(warehouseId, orderReference, client);
+    await lockPostgresRowById(client, 'warehouse_orders', candidate.id);
+    return this.resolveOrder(warehouseId, candidate.id, client);
+  }
+
+  private async readTaskProgress(client: Prisma.TransactionClient, orderId: string) {
+    const links = await client.warehouseOrderTask.findMany({
+      where: { warehouseOrderId: orderId, warehouseTask: { status: { notIn: ['FAILED', 'CANCELLED'] } } },
+      select: { warehouseOrderLineId: true, warehouseTask: { select: { status: true, quantity: true } } },
+    });
+    const progress = new Map<string | null, LineTaskProgress>();
+    for (const link of links) {
+      const line = progress.get(link.warehouseOrderLineId) ?? { pending: false, recorded: false, quantity: 0 };
+      const task = link.warehouseTask;
+      if (task.status === 'DONE' && task.quantity !== null) {
+        line.recorded = true;
+        line.quantity += task.quantity;
+      } else {
+        line.pending = true;
+      }
+      progress.set(link.warehouseOrderLineId, line);
+    }
+    return progress;
+  }
 
   private assertWarehouseOrderTransition(
     order: WarehouseOrderRow,
@@ -344,12 +388,13 @@ export class WarehouseOrdersService {
     actor: AuthenticatedUser,
     reasonCode?: string | null,
   ): void {
+    const permissions = actor.warehouses.find(access => access.warehouseId === order.warehouse_id)?.permissionCodes;
     const evaluation = evaluateWorkflowTransition({
       entity: 'WAREHOUSE_ORDER',
       currentStatus: order.status,
       action,
       reasonCode,
-      actorPermissions: actor.permissions,
+      actorPermissions: permissions?.includes('*') ? undefined : permissions,
     });
 
     if (!evaluation.allowed) {
@@ -388,8 +433,8 @@ export class WarehouseOrdersService {
     return lot;
   }
 
-  private async resolveOrder(warehouseId: string, reference: string): Promise<WarehouseOrderRow> {
-    const rows = await this.prisma.$queryRawUnsafe<WarehouseOrderRow[]>(
+  private async resolveOrder(warehouseId: string, reference: string, client: RawClient = this.prisma): Promise<WarehouseOrderRow> {
+    const rows = await client.$queryRawUnsafe<WarehouseOrderRow[]>(
       `${ORDER_SELECT} WHERE warehouse_id = $1::uuid AND (id::text = $2 OR order_number = $3) LIMIT 1`,
       warehouseId,
       reference,
@@ -402,11 +447,17 @@ export class WarehouseOrdersService {
 
   private async resolveLines(warehouseId: string, lines: CreateWarehouseOrderDto['lines']): Promise<ResolvedOrderLine[]> {
     const resolved: ResolvedOrderLine[] = [];
+    const lineNumbers = new Set<string>();
     for (const line of lines) {
+      const lineNumber = line.lineNumber.trim();
+      if (!lineNumber || lineNumbers.has(lineNumber)) {
+        throw new ConflictException('Warehouse order requires distinct, nonempty line numbers');
+      }
+      lineNumbers.add(lineNumber);
       const sku = line.skuReference ? await this.resolveSku(line.skuReference) : null;
       const lot = line.lotReference ? await this.resolveLot(warehouseId, line.lotReference) : null;
       resolved.push({
-        lineNumber: line.lineNumber.trim(),
+        lineNumber,
         skuId: sku?.id ?? null,
         lotId: lot?.id ?? null,
         requestedQuantity: line.requestedQuantity ?? 1,
@@ -417,15 +468,15 @@ export class WarehouseOrdersService {
     return resolved;
   }
 
-  private async readOrderById(orderId: string): Promise<WarehouseOrderResponse> {
-    const rows = await this.prisma.$queryRawUnsafe<WarehouseOrderRow[]>(`${ORDER_SELECT} WHERE id = $1::uuid`, orderId);
+  private async readOrderById(orderId: string, client: RawClient): Promise<WarehouseOrderResponse> {
+    const rows = await client.$queryRawUnsafe<WarehouseOrderRow[]>(`${ORDER_SELECT} WHERE id = $1::uuid`, orderId);
     const order = assertSingle(rows, 'Warehouse order was not found');
-    return this.hydrateOrder(order);
+    return this.hydrateOrder(order, client);
   }
 
-  private async hydrateOrder(order: WarehouseOrderRow): Promise<WarehouseOrderResponse> {
-    const lines = await this.readOrderLines(order.id);
-    const taskLinks = await this.prisma.$queryRawUnsafe<WarehouseOrderTaskLinkRow[]>(
+  private async hydrateOrder(order: WarehouseOrderRow, client: RawClient = this.prisma): Promise<WarehouseOrderResponse> {
+    const lines = await this.readOrderLines(order.id, client);
+    const taskLinks = await client.$queryRawUnsafe<WarehouseOrderTaskLinkRow[]>(
       `${TASK_LINK_SELECT} WHERE warehouse_order_id = $1::uuid ORDER BY created_at ASC`,
       order.id,
     );
@@ -454,21 +505,22 @@ export class WarehouseOrdersService {
     };
   }
 
-  private async readOrderLines(orderId: string): Promise<WarehouseOrderLineRow[]> {
-    return this.prisma.$queryRawUnsafe<WarehouseOrderLineRow[]>(
+  private async readOrderLines(orderId: string, client: RawClient): Promise<WarehouseOrderLineRow[]> {
+    return client.$queryRawUnsafe<WarehouseOrderLineRow[]>(
       `${LINE_SELECT} WHERE warehouse_order_id = $1::uuid ORDER BY line_number ASC`,
       orderId,
     );
   }
 
   private async writeAudit(
+    client: Prisma.TransactionClient,
     actor: AuthenticatedUser,
     warehouseId: string,
     action: string,
     resourceId: string,
     metadata: unknown,
   ): Promise<void> {
-    await this.prisma.auditLog.create({
+    await client.auditLog.create({
       data: {
         actorUserId: actor.id,
         warehouseId,
@@ -538,6 +590,10 @@ function mapOrderTypeToTaskType(orderType: WarehouseOrderType): string {
   }
 }
 
+function isCountOrder(order: WarehouseOrderRow): boolean {
+  return order.order_type === WarehouseOrderType.COUNT || order.order_type === WarehouseOrderType.ADJUSTMENT;
+}
+
 function warehouseReferenceWhere(reference: string): Prisma.WarehouseWhereInput {
   return isUuid(reference) ? { OR: [{ id: reference }, { code: normalizeCode(reference) }] } : { code: normalizeCode(reference) };
 }
@@ -583,8 +639,4 @@ function assertSingle<T>(rows: T[], message: string): T {
   const row = rows[0];
   if (!row) throw new NotFoundException(message);
   return row;
-}
-
-function isUniqueViolation(error: unknown): boolean {
-  return typeof error === 'object' && error !== null && 'code' in error && (error as { code?: unknown }).code === '23505';
 }
