@@ -8,12 +8,19 @@ const moduleUrl = new URL('queue.js', fixtureUrl);
 const source = await readFile(new URL('../../frontend/src/core/scanning/rfOfflineQueue.ts', import.meta.url), 'utf8');
 const script = stripTypeScriptTypes(source);
 
-for (const useFallback of [false, true]) {
-  test(`two tabs keep offline scans and acknowledgments with ${useFallback ? 'fallback storage' : 'IndexedDB'}`, async ({ browser }) => {
+for (const { storage, useFallback, disableLocks } of [
+  { storage: 'IndexedDB' },
+  { storage: 'IndexedDB without Web Locks', disableLocks: true },
+  { storage: 'fallback storage', useFallback: true },
+]) {
+  test(`two tabs keep offline scans and acknowledgments with ${storage}`, async ({ browser }) => {
     const context = await browser.newContext({ serviceWorkers: 'block' });
     try {
       if (useFallback) {
         await context.addInitScript(() => Object.defineProperty(window, 'indexedDB', { value: undefined }));
+      }
+      if (disableLocks) {
+        await context.addInitScript(() => Object.defineProperty(navigator, 'locks', { value: undefined }));
       }
       await context.route(url => url.pathname.startsWith(fixtureUrl.pathname), route => {
         if (route.request().url() === moduleUrl.href) {

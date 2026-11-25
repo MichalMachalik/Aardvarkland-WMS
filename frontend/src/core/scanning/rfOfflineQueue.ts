@@ -18,6 +18,8 @@ export interface StoredRfOfflineScan {
   replayFailed?: boolean;
 }
 
+type UpdateQueue = (scans: StoredRfOfflineScan[]) => StoredRfOfflineScan[];
+
 // Persist each user-acknowledged scan before indicating success in the scanner UI.
 const warehouseOperations = new Map<string, Promise<void>>();
 
@@ -34,30 +36,39 @@ function serializeWarehouse<T>(warehouseId: string, work: () => Promise<T>): Pro
 
 export function loadRfOfflineQueue(warehouseId: string): Promise<StoredRfOfflineScan[]> {
   const normalizedWarehouse = normalizeWarehouse(warehouseId);
-  return serializeWarehouse(normalizedWarehouse, () => readRfOfflineQueue(normalizedWarehouse));
+  return serializeWarehouse(normalizedWarehouse, () => accessRfOfflineQueue(normalizedWarehouse));
 }
 
-async function readRfOfflineQueue(normalizedWarehouse: string): Promise<StoredRfOfflineScan[]> {
+async function accessRfOfflineQueue(warehouseId: string, update?: UpdateQueue): Promise<StoredRfOfflineScan[]> {
   // Read the fallback first. IndexedDB might recover after the fallback received
   // newer unacknowledged scans; never erase those scans merely because IDB opens.
-  const fallback = loadFallbackQueue(normalizedWarehouse);
+  const fallback = loadFallbackQueue(warehouseId);
+  let pendingWrite: StoredRfOfflineScan[] | undefined;
   try {
     const database = await openDatabase();
     try {
-      await migrateLegacyQueue(database, normalizedWarehouse);
-      const scans = (await readAll(database)).filter((scan) => scan.warehouseId === normalizedWarehouse);
-      const merged = mergeScans(scans, fallback ?? []);
-      if (fallback !== null) {
-        await replaceWarehouseQueue(database, normalizedWarehouse, merged);
-        removeFallbackQueue(normalizedWarehouse);
-      }
-      return merged;
+      await migrateLegacyQueue(database, warehouseId);
+      if (!update && fallback === null) return await transactWarehouseQueue(database, warehouseId);
+
+      const scans = await transactWarehouseQueue(database, warehouseId, stored => {
+        const merged = mergeScans(stored, fallback ?? []);
+        pendingWrite = update ? update(merged) : merged;
+        return pendingWrite;
+      });
+      if (fallback !== null) removeFallbackQueue(warehouseId);
+      return scans;
     } finally {
       database.close();
     }
   } catch (error) {
     // Do not silently create an empty queue when an existing IDB queue might
     // only be temporarily inaccessible.
+    if (update) {
+      const next = pendingWrite ?? (fallback === null ? null : update(fallback));
+      if (next === null) throw error;
+      saveFallbackQueue(warehouseId, next);
+      return next;
+    }
     if (fallback !== null) return fallback;
     throw error;
   }
@@ -77,12 +88,9 @@ export function appendRfOfflineScan(
   scan: StoredRfOfflineScan,
 ): Promise<StoredRfOfflineScan[]> {
   const normalizedWarehouse = normalizeWarehouse(warehouseId);
-  return serializeWarehouse(normalizedWarehouse, async () => {
-    const stored = await readRfOfflineQueue(normalizedWarehouse);
-    const next = mergeScans(stored, [{ ...scan, warehouseId: normalizedWarehouse }]);
-    await persistWarehouseQueue(normalizedWarehouse, next);
-    return next;
-  });
+  return serializeWarehouse(normalizedWarehouse, () =>
+    accessRfOfflineQueue(normalizedWarehouse, stored =>
+      mergeScans(stored, [{ ...scan, warehouseId: normalizedWarehouse }])));
 }
 
 export function applyRfOfflineResults(
@@ -91,22 +99,19 @@ export function applyRfOfflineResults(
   failedIdempotencyKeys: string[] = [],
 ): Promise<StoredRfOfflineScan[]> {
   const normalizedWarehouse = normalizeWarehouse(warehouseId);
-  return serializeWarehouse(normalizedWarehouse, async () => {
-    const stored = await readRfOfflineQueue(normalizedWarehouse);
-    const confirmed = new Set(confirmedIdempotencyKeys);
-    const failed = new Set(failedIdempotencyKeys);
-    const next = stored.filter(scan => !confirmed.has(scan.idempotencyKey))
-      .map(scan => failed.has(scan.idempotencyKey) ? { ...scan, replayFailed: true } : scan);
-    await persistWarehouseQueue(normalizedWarehouse, next);
-    return next;
-  });
+  const confirmed = new Set(confirmedIdempotencyKeys);
+  const failed = new Set(failedIdempotencyKeys);
+  return serializeWarehouse(normalizedWarehouse, () =>
+    accessRfOfflineQueue(normalizedWarehouse, stored => stored
+      .filter(scan => !confirmed.has(scan.idempotencyKey))
+      .map(scan => failed.has(scan.idempotencyKey) ? { ...scan, replayFailed: true } : scan)));
 }
 
 async function persistWarehouseQueue(warehouseId: string, scans: StoredRfOfflineScan[]): Promise<void> {
   let database: IDBDatabase | null = null;
   try {
     database = await openDatabase();
-    await replaceWarehouseQueue(database, warehouseId, scans);
+    await transactWarehouseQueue(database, warehouseId, () => scans);
     removeFallbackQueue(warehouseId);
   } catch {
     // If IndexedDB failed, fallback storage must also acknowledge its write.
@@ -144,45 +149,41 @@ function openDatabase(): Promise<IDBDatabase> {
   });
 }
 
-function readAll(database: IDBDatabase): Promise<StoredRfOfflineScan[]> {
-  return new Promise((resolve, reject) => {
-    const request = database.transaction(STORE_NAME, 'readonly').objectStore(STORE_NAME).getAll();
-    request.onsuccess = () => {
-      const normalized = normalizeScans(request.result);
-      if (normalized.length !== request.result.length) {
-        reject(new Error('RF_OFFLINE_DATABASE_CORRUPT'));
-        return;
-      }
-      resolve(normalized);
-    };
-    request.onerror = () => reject(request.error ?? new Error('Offline queue could not be read'));
-  });
-}
-
-function replaceWarehouseQueue(
+function transactWarehouseQueue(
   database: IDBDatabase,
   warehouseId: string,
-  scans: StoredRfOfflineScan[],
-): Promise<void> {
+  update?: UpdateQueue,
+): Promise<StoredRfOfflineScan[]> {
   return new Promise((resolve, reject) => {
-    const transaction = database.transaction(STORE_NAME, 'readwrite');
+    // Keep the read and write together so another tab cannot replace a stale snapshot.
+    const transaction = database.transaction(STORE_NAME, update ? 'readwrite' : 'readonly');
     const store = transaction.objectStore(STORE_NAME);
-    const index = store.index('warehouseId');
-    const cursor = index.openKeyCursor(IDBKeyRange.only(warehouseId));
+    const request = store.index('warehouseId').getAll(warehouseId);
+    let next: StoredRfOfflineScan[] = [];
+    let updateError: unknown;
 
-    cursor.onsuccess = () => {
-      const current = cursor.result;
-      if (!current) {
-        for (const scan of scans) store.put(scan);
-        return;
+    request.onsuccess = () => {
+      try {
+        const current = normalizeScans(request.result);
+        if (current.length !== request.result.length) throw new Error('RF_OFFLINE_DATABASE_CORRUPT');
+        if (!update) {
+          next = sortAndLimit(current);
+          return;
+        }
+        const prior = new Map(current.map(scan => [scan.idempotencyKey, scan]));
+        next = update(current);
+        for (const scan of next) {
+          if (prior.get(scan.idempotencyKey) !== scan) store.put(scan);
+          prior.delete(scan.idempotencyKey);
+        }
+        for (const key of prior.keys()) store.delete(key);
+      } catch (error) {
+        updateError = error;
+        transaction.abort();
       }
-      store.delete(current.primaryKey);
-      current.continue();
     };
-    cursor.onerror = () => transaction.abort();
-    transaction.oncomplete = () => resolve();
-    transaction.onerror = () => reject(transaction.error ?? new Error('Offline queue could not be saved'));
-    transaction.onabort = () => reject(transaction.error ?? new Error('Offline queue save was aborted'));
+    transaction.oncomplete = () => resolve(next);
+    transaction.onabort = () => reject(updateError ?? transaction.error ?? new Error('Offline queue transaction was aborted'));
   });
 }
 
@@ -200,10 +201,7 @@ async function migrateLegacyQueue(database: IDBDatabase, warehouseId: string): P
 
   const scans = normalizeScans(legacy).map((scan) => ({ ...scan, warehouseId }));
   if (scans.length > 0) {
-    const existing = await readAll(database);
-    const merged = new Map(existing.map((scan) => [scan.idempotencyKey, scan]));
-    for (const scan of scans) merged.set(scan.idempotencyKey, scan);
-    await replaceWarehouseQueue(database, warehouseId, [...merged.values()].filter((scan) => scan.warehouseId === warehouseId));
+    await transactWarehouseQueue(database, warehouseId, current => mergeScans(current, scans));
   }
 
   try {
