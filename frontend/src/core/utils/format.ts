@@ -10,6 +10,10 @@ export function percent(value: number) {
   return `${Math.round(value)} %`;
 }
 
+export function formatOptionalPercent(value: number | null, fallback: string): string {
+  return value === null ? fallback : `${value}%`;
+}
+
 export function initials(name: string) {
   return name
     .split(' ')

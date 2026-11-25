@@ -117,7 +117,7 @@ test('print stations only offer retry after failure and return the job to the qu
   await liveApi(page, api + '/print-agents', {
     token, data: { code: agentCode, name: 'Browser fixture agent', token: agent.token, printerCodes: [printerCode] },
   });
-  await liveApi(page, api + '/scanners', {
+  const savedScanner = await liveApi(page, api + '/scanners', {
     token, data: { code: scannerCode, name: 'Browser fixture scanner', batteryLevel: 0 },
   });
   const job = await liveApi(page, api + '/print-jobs', {
@@ -130,6 +130,22 @@ test('print stations only offer retry after failure and return the job to the qu
   await desktopNav(page).getByRole('button', { name: 'Tiskárny', exact: true }).click();
   const scanner = page.getByRole('row').filter({ has: page.getByRole('cell', { name: scannerCode, exact: true }) });
   await expect(scanner.getByRole('cell', { name: '0% / Nenastaveno', exact: true })).toBeVisible();
+  const scannerPath = `${api}/scanners/${savedScanner.id}`;
+  const telemetry = await page.request.patch(new URL(scannerPath + '/telemetry', base).href, {
+    headers: { Authorization: `Bearer ${token}` },
+    data: { batteryLevel: 65, signalStrength: 91 },
+  });
+  expect(telemetry.ok()).toBe(true);
+  const statusChange = page.waitForResponse(response => response.request().method() === 'PATCH'
+    && new URL(response.url()).pathname === scannerPath);
+  await scanner.getByRole('button', { name: 'Servis', exact: true }).click();
+  const changed = await statusChange;
+  expect(changed.request().postDataJSON()).toEqual({ status: 'MAINTENANCE' });
+  expect(changed.ok()).toBe(true);
+  const scannerBody = await changed.json();
+  const updatedScanner = scannerBody.data ?? scannerBody;
+  expect(updatedScanner).toMatchObject({ status: 'MAINTENANCE', batteryLevel: 65, signalStrength: 91 });
+  await expect(scanner.getByRole('cell', { name: '65% / 91%', exact: true })).toBeVisible();
   const code = page.getByTestId('print-label-code');
   await code.fill(`LABEL-${fixture}`);
   const previews = page.locator('.barcode-preview-grid');

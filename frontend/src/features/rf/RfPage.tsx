@@ -11,6 +11,7 @@ import { ProgressBar } from '../../components/ui/ProgressBar';
 import { StatusPill } from '../../components/ui/StatusPill';
 import { useApiMutation } from '../../core/api/useApiMutation';
 import { useApiResource } from '../../core/api/useApiResource';
+import { mapScanners, type ScannerView } from '../../core/api/scanner-view';
 import { getRfQueue, getRfSession, listScanners, reportRfTaskException, resolveScan, resumeRfSession, scanRfSession, startRfTask, syncRfOfflineQueue, updateScannerTelemetry } from '../../core/api/wms';
 import { config } from '../../app/config';
 import {
@@ -19,9 +20,8 @@ import {
   applyRfOfflineResults,
   type StoredRfOfflineScan,
 } from '../../core/scanning/rfOfflineQueue';
-import { cx } from '../../core/utils/format';
+import { cx, formatOptionalPercent } from '../../core/utils/format';
 import { useWorkspace, type Language } from '../../core/workspace/workspace';
-import { asRecord as record, finiteNumber as numberValue, nonBlankText as nullableString } from '../../core/api/response-values';
 
 type ExpectedType = 'LOCATION' | 'SKU' | 'HANDLING_UNIT' | 'QUANTITY' | 'NONE';
 interface RfPlannedStep {
@@ -96,16 +96,6 @@ interface RfExceptionReportResponse {
   taskStatus: string | null;
   releasedReservedQuantity: number;
 }
-interface ScannerRow {
-  id: string;
-  code: string;
-  name: string;
-  status: string;
-  assignedZone: string | null;
-  batteryLevel: number | null;
-  signalStrength: number | null;
-  lastActivityAt: string | null;
-}
 interface RfExceptionAction {
   code: RfExceptionCode;
   label: string;
@@ -119,7 +109,7 @@ interface RfExceptionCopy {
   exceptionDescriptions: Record<RfExceptionCopyKey, string>;
 }
 
-const emptyScanners: ScannerRow[] = [];
+const emptyScanners: ScannerView[] = [];
 
 const scannerStorageKey = 'wms-rf-scanner-device-reference';
 
@@ -225,28 +215,6 @@ function badgeTone(value: string) {
   return 'neutral' as const;
 }
 
-function mapScanners(payload: unknown): ScannerRow[] {
-  const rows = Array.isArray(payload) ? payload : [];
-  return rows.map((value) => {
-    const row = value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
-    const code = typeof row['code'] === 'string' ? row['code'] : '';
-    return {
-      id: typeof row['id'] === 'string' ? row['id'] : code,
-      code,
-      name: typeof row['name'] === 'string' ? row['name'] : code,
-      status: typeof row['status'] === 'string' ? row['status'] : 'INACTIVE',
-      assignedZone: typeof row['assignedZone'] === 'string' ? row['assignedZone'] : null,
-      batteryLevel: numberValue(row['batteryLevel'] ?? record(row['metadata'])['batteryLevel']),
-      signalStrength: numberValue(row['signalStrength'] ?? record(row['metadata'])['signalStrength']),
-      lastActivityAt: nullableString(row['lastActivityAt'] ?? row['lastSeenAt']),
-    };
-  }).filter((scanner) => scanner.code);
-}
-
-function formatPercent(value: number | null, fallback: string): string {
-  return typeof value === 'number' ? `${value}%` : fallback;
-}
-
 function formatShortDate(value: string | null, language: Language): string {
   if (!value) return '';
   const date = new Date(value);
@@ -343,7 +311,7 @@ function RfWorkspace() {
     dependencies: [warehouseId],
     refreshOnRealtime: true,
   });
-  const scannerResource = useApiResource<ScannerRow[]>({
+  const scannerResource = useApiResource<ScannerView[]>({
     fallback: emptyScanners,
     productionFallback: emptyScanners,
     enabled: can('scanner.read'),
@@ -673,8 +641,8 @@ function RfWorkspace() {
           </div>
           {activeScanner && (
             <div className="rf-device-health" aria-label={text.deviceHealth}>
-              <article><span>{text.battery}</span><strong>{formatPercent(activeScanner.batteryLevel, text.notSet)}</strong></article>
-              <article><span>{text.signal}</span><strong>{formatPercent(activeScanner.signalStrength, text.notSet)}</strong></article>
+              <article><span>{text.battery}</span><strong>{formatOptionalPercent(activeScanner.batteryLevel, text.notSet)}</strong></article>
+              <article><span>{text.signal}</span><strong>{formatOptionalPercent(activeScanner.signalStrength, text.notSet)}</strong></article>
               <article><span>{text.lastActivity}</span><strong>{formatShortDate(activeScanner.lastActivityAt, language) || text.notSet}</strong></article>
             </div>
           )}

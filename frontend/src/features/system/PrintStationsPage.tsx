@@ -7,6 +7,7 @@ import { DataTable, type Column } from '../../components/ui/DataTable';
 import { ResourceFreshness } from '../../components/ui/ResourceFreshness';
 import { useApiMutation } from '../../core/api/useApiMutation';
 import { useApiResource } from '../../core/api/useApiResource';
+import { mapScanners, type ScannerView } from '../../core/api/scanner-view';
 import {
   cancelRuntimePrintJob,
   createRuntimePrintJob,
@@ -21,6 +22,7 @@ import {
   upsertPrintAgent,
   upsertPrinter,
 } from '../../core/api/wms';
+import { formatOptionalPercent } from '../../core/utils/format';
 import { useWorkspace, type Language } from '../../core/workspace/workspace';
 import { asArray as array, asRecord as record, finiteNumber as numberValue, nonBlankText as nullableString, textOr as stringValue } from '../../core/api/response-values';
 
@@ -50,19 +52,6 @@ interface AgentRow {
   lastSeenAt: string | null;
 }
 
-interface ScannerRow {
-  id: string;
-  code: string;
-  name: string;
-  status: string;
-  assignedZone: string | null;
-  lastSeenAt: string | null;
-  lastActivityAt: string | null;
-  batteryLevel: number | null;
-  signalStrength: number | null;
-  assignedWorkerId: string | null;
-}
-
 interface JobRow {
   id: string;
   printerCode: string | null;
@@ -89,7 +78,7 @@ interface PreviewResult {
 }
 
 const emptyPrintConsole: PrintConsole = { printers: [], queue: [], agents: [], templates: [] };
-const emptyScanners: ScannerRow[] = [];
+const emptyScanners: ScannerView[] = [];
 
 const defaultLayout = {
   widthMm: 100,
@@ -129,7 +118,7 @@ export function PrintStationsPage() {
   const canOperatePrintJobs = can('label.queue.manage') && roleProfile.id !== 'WAREHOUSE_WORKER';
   const canViewScanners = can('scanner.read') && roleProfile.id !== 'WAREHOUSE_WORKER';
   const canAdministerScanners = can('scanner.manage') && roleProfile.id !== 'WAREHOUSE_WORKER';
-  const scannerResource = useApiResource<ScannerRow[]>({
+  const scannerResource = useApiResource<ScannerView[]>({
     fallback: emptyScanners,
     productionFallback: emptyScanners,
     enabled: canViewScanners,
@@ -160,7 +149,7 @@ export function PrintStationsPage() {
   const failedJobs = resource.data.queue.filter((job) => job.status === 'FAILED').length;
   const lowBatteryScanners = scannerResource.data.filter((scanner) => typeof scanner.batteryLevel === 'number' && scanner.batteryLevel <= 20).length;
   const weakSignalScanners = scannerResource.data.filter((scanner) => typeof scanner.signalStrength === 'number' && scanner.signalStrength <= 30).length;
-  const staleScanners = scannerResource.data.filter((scanner) => isStaleScanner(scanner.lastActivityAt ?? scanner.lastSeenAt)).length;
+  const staleScanners = scannerResource.data.filter((scanner) => isStaleScanner(scanner.lastActivityAt)).length;
   const queueColumns: Column<JobRow>[] = [
     { key: 'created', label: text.columns.created, render: (row) => formatDate(row.createdAt) },
     { key: 'printer', label: text.columns.printer, render: (row) => row.printerCode || text.notSet },
@@ -187,14 +176,14 @@ export function PrintStationsPage() {
     { key: 'agentPrinters', label: text.columns.agentPrinters, render: (row) => row.printerCodes.length ? row.printerCodes.join(', ') : text.allPrinters },
     { key: 'status', label: text.columns.status, render: (row) => agentStatusLabel(row.status, language) },
   ];
-  const scannerColumns: Column<ScannerRow>[] = [
+  const scannerColumns: Column<ScannerView>[] = [
     { key: 'code', label: text.columns.code, render: (row) => <strong>{row.code}</strong> },
     { key: 'name', label: text.columns.name, render: (row) => row.name },
     { key: 'status', label: text.columns.status, render: (row) => scannerStatusLabel(row.status, language) },
     { key: 'zone', label: text.columns.zone, render: (row) => row.assignedZone || text.notSet },
-    { key: 'health', label: text.columns.health, render: (row) => `${formatPercent(row.batteryLevel, text.notSet)} / ${formatPercent(row.signalStrength, text.notSet)}` },
+    { key: 'health', label: text.columns.health, render: (row) => `${formatOptionalPercent(row.batteryLevel, text.notSet)} / ${formatOptionalPercent(row.signalStrength, text.notSet)}` },
     { key: 'worker', label: text.columns.worker, render: (row) => row.assignedWorkerId || text.notSet },
-    { key: 'lastSeen', label: text.columns.lastSeen, render: (row) => formatDate(row.lastActivityAt ?? row.lastSeenAt ?? '') || text.notSet },
+    { key: 'lastSeen', label: text.columns.lastSeen, render: (row) => formatDate(row.lastActivityAt ?? '') || text.notSet },
     {
       key: 'action',
       label: text.columns.action,
@@ -277,15 +266,8 @@ export function PrintStationsPage() {
     }
   };
 
-  async function setScannerStatus(scanner: ScannerRow, status: string) {
-    const result = await mutation.run(text.actions.updateScanner, () => updateScanner(warehouseId, scanner.id || scanner.code, {
-      status,
-      assignedZone: scanner.assignedZone,
-      assignedWorkerId: scanner.assignedWorkerId,
-      batteryLevel: scanner.batteryLevel,
-      signalStrength: scanner.signalStrength,
-      metadata: { source: 'storage-ui' },
-    }));
+  async function setScannerStatus(scanner: ScannerView, status: string) {
+    const result = await mutation.run(text.actions.updateScanner, () => updateScanner(warehouseId, scanner.id, { status }));
     if (result) {
       scannerResource.refresh();
     }
@@ -577,26 +559,6 @@ function mapPrintConsole(payload: unknown): PrintConsole {
   };
 }
 
-function mapScanners(payload: unknown): ScannerRow[] {
-  const rows = Array.isArray(payload) ? payload : array(record(payload)['data']);
-  return rows.map((value) => {
-    const row = record(value);
-    const metadata = record(row['metadata']);
-    return {
-      id: stringValue(row['id'], stringValue(row['code'], '')),
-      code: stringValue(row['code'], ''),
-      name: stringValue(row['name'], ''),
-      status: stringValue(row['status'], 'INACTIVE'),
-      assignedZone: nullableString(row['assignedZone']),
-      lastSeenAt: nullableString(row['lastSeenAt']),
-      lastActivityAt: nullableString(row['lastActivityAt'] ?? metadata['lastActivityAt']),
-      batteryLevel: numberValue(row['batteryLevel'] ?? metadata['batteryLevel']),
-      signalStrength: numberValue(row['signalStrength'] ?? metadata['signalStrength']),
-      assignedWorkerId: nullableString(row['assignedWorkerId'] ?? metadata['assignedWorkerId']),
-    };
-  }).filter((scanner) => scanner.code);
-}
-
 function mapPrinter(value: unknown): PrinterRow {
   const row = record(value);
   return {
@@ -675,10 +637,6 @@ function formatDate(value: string): string {
   if (!value) return '';
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
-}
-
-function formatPercent(value: number | null, fallback: string): string {
-  return typeof value === 'number' ? `${value}%` : fallback;
 }
 
 function parsePercentInput(value: string): number | undefined {
