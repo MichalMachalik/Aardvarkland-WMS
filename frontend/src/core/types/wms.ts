@@ -49,6 +49,7 @@ export interface WarehouseTask {
   from: string;
   to: string;
   status: 'Open' | 'Claimed' | 'In progress' | 'Exception' | 'Done';
+  apiStatus?: string;
   priority: number;
   quantity: number;
   sku: string;

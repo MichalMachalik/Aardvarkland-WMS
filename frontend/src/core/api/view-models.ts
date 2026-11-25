@@ -189,12 +189,13 @@ export function mapWarehouseTasks(payload: unknown): WarehouseTask[] {
   return array(payload).map((item, index) => {
     const row = record(item);
     return {
-      id: stringValue(row.externalReference ?? row.id, `T-${index + 1}`),
+      id: stringValue(row.id ?? row.externalReference, `T-${index + 1}`),
       type: typeTask(row.type),
       assignee: stringValue(nested(row, 'assignedUser').displayName ?? row.assignedUserId, '—'),
       from: stringValue(nested(row, 'fromLocation').code ?? row.fromLocationId, '—'),
       to: stringValue(nested(row, 'toLocation').code ?? row.toLocationId, '—'),
       status: statusTask(row.status),
+      apiStatus: stringValue(row.status, ''),
       priority: numberValue(row.priority ?? record(row.metadata).priority, 0),
       quantity: numberValue(row.quantity, 1),
       sku: stringValue(nested(row, 'sku').code ?? row.sku ?? row.skuCode ?? row.skuId, '—'),

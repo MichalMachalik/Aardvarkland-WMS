@@ -173,7 +173,10 @@ export function createWarehouseLocation<T>(warehouseId: string, body: MutationBo
 export function updateWarehouseLocation<T>(warehouseId: string, locationId: string, body: MutationBody) { return patch<T>(endpoints.location(warehouseId, locationId), body, createWmsIdempotencyKey(`location-update-${locationId}`)); }
 export function suggestPutaway<T>(warehouseId: string, body: MutationBody) { return post<T>(endpoints.putawaySuggest(warehouseId), body, createWmsIdempotencyKey(`putaway-suggest-${warehouseId}`)); }
 export function createPutawayTask<T>(warehouseId: string, body: MutationBody) { return post<T>(endpoints.putawayTasks(warehouseId), body, createWmsIdempotencyKey(`putaway-task-${warehouseId}`)); }
-export function confirmPutawayTask<T>(warehouseId: string, taskId: string, body: MutationBody) { return post<T>(endpoints.putawayConfirmTask(warehouseId, taskId), body, createWmsIdempotencyKey(`putaway-confirm-${taskId}`)); }
+export function confirmPutawayTask<T>(warehouseId: string, taskId: string, body: MutationBody) {
+  const idempotencyKey = String(body.idempotencyKey ?? `putaway-confirm-${taskId}`);
+  return post<T>(endpoints.putawayConfirmTask(warehouseId, taskId), { ...body, idempotencyKey }, idempotencyKey);
+}
 export function listReturns<T>(warehouseId: string, options?: ReadOptions) { return get<T>(endpoints.returns(warehouseId), undefined, options); }
 export function createReturn<T>(warehouseId: string, body: MutationBody) { return post<T>(endpoints.returns(warehouseId), body, `return-${String(body.rmaNumber ?? createWmsIdempotencyKey('return'))}`); }
 export function receiveReturnLine<T>(warehouseId: string, returnId: string, lineId: string, body: MutationBody) { return post<T>(endpoints.returnLineReceive(warehouseId, returnId, lineId), body, createWmsIdempotencyKey(`return-receive-${lineId}`)); }

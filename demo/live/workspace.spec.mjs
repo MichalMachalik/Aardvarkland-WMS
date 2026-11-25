@@ -580,7 +580,54 @@ test('packing keeps orders separate and resumes packages, labels and dispatch fr
   expect((await shipments(pickup))[0].status).toBe('SHIPPED');
 });
 
-test('the RF browser uploads stored scans in order and keeps every unconfirmed scan after an interrupted batch', async ({ page }) => {
+test('the tasks page confirms putaway by moving the planned stock', async ({ page }) => {
+  test.skip(process.env.WMS_LIVE_UI_WRITE !== 'true', 'Requires a disposable warehouse database.');
+  const { accessToken: admin } = await liveApi(page, '/api/auth/login', {
+    data: { email: roles.system.email, password: roles.system.password },
+  });
+  const own = (path, data) => liveApi(page, '/api/warehouses/MAIN' + path, { token: admin, data });
+  const code = `UI-PUTAWAY-${randomUUID().slice(0, 8).toUpperCase()}`;
+  const product = await liveApi(page, '/api/products', { token: admin, data: { code, name: 'Putaway test product' } });
+  await liveApi(page, '/api/products/skus', { token: admin, data: { code, productReference: product.id, name: 'Putaway test SKU' } });
+  const location = await own('/locations', { code, name: 'Putaway test target', type: 'STORAGE', parentReference: 'A-01' });
+  const { quant: source } = await own('/inventory/quants/receive', {
+    skuReference: code, locationReference: 'A-01-01', quantity: 6,
+  });
+  const { task } = await own('/putaway/tasks', { stockQuantReference: source.id, toLocationReference: location.id, quantity: 2 });
+
+  await login(page, roles.worker);
+  await desktopNav(page).getByRole('button', { name: 'Úkoly', exact: true }).click();
+  const taskRow = page.locator(`[data-e2e-row="task"][data-e2e-value="${task.id}"]`);
+  await taskRow.check();
+  const start = page.locator('[data-e2e-action="task-start-selected"]');
+  const confirm = page.locator('[data-e2e-action="task-confirm-selected"]');
+  await expect(confirm).toBeDisabled();
+  await start.click();
+  await expect(confirm).toBeEnabled();
+  await page.getByRole('button', { name: 'Hotové', exact: true }).click();
+  await expect(taskRow).toHaveCount(0);
+  await expect(confirm).toBeDisabled();
+  await page.getByRole('button', { name: 'Otevřené', exact: true }).click();
+  await expect(taskRow).toBeChecked();
+  await expect(confirm).toBeEnabled();
+
+  const confirmation = page.waitForResponse(response =>
+    new URL(response.url()).pathname.endsWith(`/putaway/tasks/${task.id}/confirm`));
+  await confirm.click();
+  const response = await confirmation;
+  expect(response.status()).toBe(201);
+  const body = await response.json();
+  const data = body.data ?? body;
+  expect(data.task.status).toBe('DONE');
+  expect(data.movement).toMatchObject({ quantity: 2, toLocationId: location.id, taskId: task.id });
+  expect((await own(`/inventory/quants/${source.id}`)).quantity).toBe(4);
+  expect((await own(`/inventory/quants/${data.targetQuant.id}`)).quantity).toBe(2);
+  await expect(taskRow).toHaveCount(0);
+});
+
+// The service worker can handle these requests before Playwright intercepts them.
+const interceptedTest = test.extend({ serviceWorkers: 'block' });
+interceptedTest('the RF browser uploads stored scans in order and keeps every unconfirmed scan after an interrupted batch', async ({ page }) => {
   test.skip(process.env.WMS_LIVE_UI_WRITE !== 'true', 'Requires a disposable warehouse database.');
   const warehouse = '/api/warehouses/MAIN';
   const { accessToken: worker } = await liveApi(page, '/api/auth/login', {

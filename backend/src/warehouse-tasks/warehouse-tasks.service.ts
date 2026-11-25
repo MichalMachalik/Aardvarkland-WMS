@@ -216,7 +216,7 @@ export class WarehouseTasksService {
           assignedUserId,
           assignedAt: new Date(),
           version: { increment: 1 },
-          ...(body.metadata === undefined ? {} : { metadata: toJsonInput(body.metadata) }),
+          metadata: mergeTaskMetadata(task.metadata, body.metadata),
         }),
         include: warehouseTaskInclude,
       });
@@ -261,7 +261,7 @@ export class WarehouseTasksService {
           assignedUserId,
           assignedAt: task.assignedAt ?? new Date(),
           version: { increment: 1 },
-          ...(body.metadata === undefined ? {} : { metadata: toJsonInput(body.metadata) }),
+          metadata: mergeTaskMetadata(task.metadata, body.metadata),
         }),
         include: warehouseTaskInclude,
       });
@@ -298,7 +298,7 @@ export class WarehouseTasksService {
         assignedAt: task.assignedAt ?? new Date(),
         startedAt: task.startedAt ?? new Date(),
         version: { increment: 1 },
-        ...(body.metadata === undefined ? {} : { metadata: toJsonInput(body.metadata) }),
+        metadata: mergeTaskMetadata(task.metadata, body.metadata),
       });
       const updatedTask = await this.getTaskDelegate(db).update({
         where: { id: task.id },
@@ -327,6 +327,9 @@ export class WarehouseTasksService {
       const task = await this.lockTaskForTransition(
         db, warehouse.id, taskReference, WarehouseTaskStatus.DONE,
       );
+      if (task.type === WarehouseTaskType.PUTAWAY) {
+        throw new ConflictException('Use putaway confirmation to complete this task and move stock');
+      }
       assertValidTaskQuantity(task.type, body.quantity);
 
       const fromLocationId = body.fromLocationReference
@@ -348,7 +351,7 @@ export class WarehouseTasksService {
         ...(skuId === undefined ? {} : { skuId }),
         ...(body.quantity === undefined ? {} : { quantity: body.quantity }),
         ...(handlingUnitId === undefined ? {} : { handlingUnitId }),
-        ...(body.metadata === undefined ? {} : { metadata: toJsonInput(body.metadata) }),
+        metadata: mergeTaskMetadata(task.metadata, body.metadata),
       };
       const updatedTask = await this.getTaskDelegate(db).update({
         where: { id: task.id },
@@ -397,7 +400,7 @@ export class WarehouseTasksService {
           failureReason: reason,
           completedAt: new Date(),
           version: { increment: 1 },
-          ...(dto.metadata === undefined ? {} : { metadata: toJsonInput(dto.metadata) }),
+        metadata: mergeTaskMetadata(task.metadata, dto.metadata),
         }),
         include: warehouseTaskInclude,
       });
@@ -432,7 +435,7 @@ export class WarehouseTasksService {
           status: WarehouseTaskStatus.CANCELLED,
           failureReason: reason,
           version: { increment: 1 },
-          ...(body.metadata === undefined ? {} : { metadata: toJsonInput(body.metadata) }),
+        metadata: mergeTaskMetadata(task.metadata, body.metadata),
         }),
         include: warehouseTaskInclude,
       });
@@ -819,6 +822,15 @@ function toJsonInput(
   }
 
   return value as Prisma.InputJsonValue;
+}
+
+function mergeTaskMetadata(
+  current: unknown,
+  updates: Record<string, unknown> | undefined,
+): Prisma.InputJsonValue | undefined {
+  if (!updates) return undefined;
+  const existing = current && typeof current === 'object' && !Array.isArray(current) ? current : {};
+  return { ...existing, ...updates } as Prisma.InputJsonValue;
 }
 
 function isUuid(value: string): boolean {

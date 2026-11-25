@@ -12,21 +12,16 @@ import { SegmentedControl } from '../../components/ui/SegmentedControl';
 import { useWorkspace, type Language } from '../../core/workspace/workspace';
 import { useApiMutation } from '../../core/api/useApiMutation';
 import { useApiResource } from '../../core/api/useApiResource';
-import { claimNextWarehouseTask, confirmPickTask, confirmWarehouseTask, listTasks, startWarehouseTask } from '../../core/api/wms';
+import { claimNextWarehouseTask, confirmPickTask, confirmPutawayTask, confirmWarehouseTask, listTasks, startWarehouseTask } from '../../core/api/wms';
 import { mapWarehouseTasks } from '../../core/api/view-models';
 import type { WarehouseTask } from '../../core/types/wms';
 
 const emptyTasks: WarehouseTask[] = [];
 
-function apiTaskType(type: WarehouseTask['type']) {
-  const map: Record<WarehouseTask['type'], string> = { Pick: 'PICK', Putaway: 'PUTAWAY', Move: 'MOVE', Replenishment: 'REPLENISH', 'Cycle count': 'COUNT' };
-  return map[type];
-}
-
 function taskIdFromResult(result: unknown): string | undefined {
   if (!result || typeof result !== 'object') return undefined;
   const row = result as Record<string, unknown>;
-  for (const key of ['externalReference', 'taskReference', 'id']) {
+  for (const key of ['id', 'taskReference', 'externalReference']) {
     const id = row[key];
     if (typeof id === 'string' && id.length > 0) return id;
   }
@@ -41,21 +36,22 @@ function taskTypeLabel(type: WarehouseTask['type'], language: Language) {
 }
 
 export function TasksPage() {
-  const { warehouseId, language, currentUser } = useWorkspace();
+  const { warehouseId, language } = useWorkspace();
   const text = pickLanguage(language, { cs: czech, en: english, ua: ukrainian });
   const resource = useApiResource({ fallback: emptyTasks, productionFallback: emptyTasks, loader: () => listTasks<unknown[]>(warehouseId), map: mapWarehouseTasks, dependencies: [warehouseId] });
   const mutation = useApiMutation();
   const sourceRows = resource.data;
   const [filter, setFilter] = useState('open');
-  const [selectedId, setSelectedId] = useState(sourceRows[0]?.id ?? '');
-  const selected = sourceRows.find((task) => task.id === selectedId) ?? sourceRows[0];
-  const actorReference = currentUser?.email ?? currentUser?.displayName ?? 'operator';
+  const [selectedId, setSelectedId] = useState('');
 
   const rows = useMemo(() => {
     if (filter === 'all') return sourceRows;
     if (filter === 'done') return sourceRows.filter((task) => task.status === 'Done');
     return sourceRows.filter((task) => task.status !== 'Done');
   }, [filter, sourceRows]);
+  const selected = rows.find((task) => task.id === selectedId) ?? rows[0];
+  const canStart = selected && ['OPEN', 'ASSIGNED', 'BLOCKED'].includes(selected.apiStatus ?? '');
+  const canConfirm = selected?.apiStatus === 'IN_PROGRESS';
 
   const columns: Column<WarehouseTask>[] = [
     { key: 'select', label: '', render: (row) => <input type="radio" name="task" data-e2e-row="task" data-e2e-value={row.id} checked={selected?.id === row.id} onChange={() => setSelectedId(row.id)} /> },
@@ -74,12 +70,15 @@ export function TasksPage() {
     if (nextId) setSelectedId(nextId);
     if (result) resource.refresh();
   };
-  const claimNext = () => void mutation.run(text.actions.claim, () => claimNextWarehouseTask(warehouseId, { type: selected ? apiTaskType(selected.type) : 'PICK', assignedUserReference: actorReference, metadata: { source: 'storage-ui' } })).then(refreshOnSuccess);
-  const startSelected = () => selected && void mutation.run(text.actions.start, () => startWarehouseTask(warehouseId, selected.id, { assignedUserReference: actorReference, metadata: { source: 'storage-ui' } })).then(refreshOnSuccess);
+  const claimNext = () => void mutation.run(text.actions.claim, () => claimNextWarehouseTask(warehouseId)).then((result) => {
+    if (result) setFilter('open');
+    refreshOnSuccess(result);
+  });
+  const startSelected = () => selected && void mutation.run(text.actions.start, () => startWarehouseTask(warehouseId, selected.id)).then(refreshOnSuccess);
   const confirmSelected = () => selected && void mutation.run(text.actions.confirm, () => {
-    const body = { quantity: Math.max(1, selected.quantity), metadata: { source: 'storage-ui' } };
-    if (selected.type === 'Pick') return confirmPickTask(warehouseId, selected.id, body);
-    return confirmWarehouseTask(warehouseId, selected.id, { ...body, fromLocationReference: selected.from, toLocationReference: selected.to });
+    if (selected.type === 'Putaway') return confirmPutawayTask(warehouseId, selected.id, {});
+    if (selected.type === 'Pick') return confirmPickTask(warehouseId, selected.id, {});
+    return confirmWarehouseTask(warehouseId, selected.id);
   }).then(refreshOnSuccess);
 
   return (
@@ -101,8 +100,8 @@ export function TasksPage() {
         </div>
         <div className="action-panel">
           <Button tone="primary" data-e2e-action="task-claim-next" disabled={mutation.status === 'running'} onClick={claimNext}>{text.buttons.claim}</Button>
-          <Button tone="secondary" data-e2e-action="task-start-selected" disabled={!selected || mutation.status === 'running'} onClick={startSelected}>{text.buttons.start}</Button>
-          <Button tone="secondary" data-e2e-action="task-confirm-selected" disabled={!selected || mutation.status === 'running'} onClick={confirmSelected}>{text.buttons.confirm}</Button>
+          <Button tone="secondary" data-e2e-action="task-start-selected" disabled={!canStart || mutation.status === 'running'} onClick={startSelected}>{text.buttons.start}</Button>
+          <Button tone="secondary" data-e2e-action="task-confirm-selected" disabled={!canConfirm || mutation.status === 'running'} onClick={confirmSelected}>{text.buttons.confirm}</Button>
           <ActionStatus mutation={mutation} />
         </div>
       </Card>

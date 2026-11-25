@@ -152,6 +152,72 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.ok(confirmed.completedAt);
   });
 
+  await scenario('putaway moves the planned stock exactly once and rejects mismatched confirmations', async () => {
+    const { sku } = await createSku('PUTAWAY');
+    const { sku: otherSku } = await createSku('PUTAWAY-OTHER');
+    const sourceLocation = await own('POST', '/locations', {
+      code: `PA-SOURCE-${suffix}`, name: 'Putaway fixture source', type: 'STORAGE', parentReference: 'A-01',
+    });
+    const target = await own('POST', '/locations', {
+      code: `PA-TARGET-${suffix}`, name: 'Putaway fixture target', type: 'STORAGE', parentReference: 'A-01',
+    });
+    const receive = (skuReference, locationReference, quantity) =>
+      own('POST', '/inventory/quants/receive', { skuReference, locationReference, quantity });
+    const source = (await receive(sku.code, sourceLocation.code, 6)).quant;
+    const wrongStock = (await receive(otherSku.code, sourceLocation.code, 6)).quant;
+    const targetStock = (await receive(sku.code, target.code, 2)).quant;
+    const input = { stockQuantReference: source.id, quantity: 3 };
+    await own('POST', '/putaway/suggest', {}, 409);
+    const suggestion = await own('POST', '/putaway/suggest', input);
+    assert.equal(suggestion.suggestedLocationId, target.id);
+    await own('POST', '/putaway/tasks', { ...input, toLocationReference: sourceLocation.code }, 409);
+    await own('POST', '/putaway/tasks', { ...input, quantity: 7 }, 409);
+    const created = await own('POST', '/putaway/tasks', input);
+    const task = created.task;
+    assert.equal(task.toLocationId, target.id);
+    assert.equal(task.status, 'OPEN');
+    const started = await own('POST', `/tasks/${task.id}/start`, { metadata: { station: 'TEST' } });
+    assert.equal(started.metadata.stockQuantId, source.id);
+    assert.equal(started.metadata.station, 'TEST');
+    await own('POST', `/tasks/${task.id}/confirm`, {}, 409);
+    const confirm = `/putaway/tasks/${task.id}/confirm`;
+    await own('POST', confirm, { stockQuantReference: wrongStock.id }, 409);
+    await own('POST', confirm, { fromLocationReference: target.code }, 409);
+    await own('POST', confirm, { quantity: 7 }, 409);
+    for (const scope of [{ stockQuantId: source.id }, { locationId: target.id }]) {
+      const freeze = await prisma.stockFreeze.create({
+        data: { warehouseId: task.warehouseId, reason: 'Putaway test freeze', ...scope },
+      });
+      try {
+        await own('POST', confirm, {}, 409);
+      } finally {
+        await prisma.stockFreeze.delete({ where: { id: freeze.id } });
+      }
+    }
+    assert.equal((await own('GET', `/tasks/${task.id}`)).status, 'IN_PROGRESS');
+    assert.equal((await own('GET', `/inventory/quants/${wrongStock.id}`)).quantity, 6);
+    assert.equal((await own('GET', `/inventory/quants/${source.id}`)).quantity, 6);
+
+    const idempotencyKey = randomUUID();
+    const [completed, replay] = await Promise.all([
+      own('POST', confirm, { idempotencyKey }),
+      own('POST', confirm, { idempotencyKey }),
+    ]);
+    assert.equal(completed.task.status, 'DONE');
+    assert.equal(completed.task.version, started.version + 1);
+    assert.equal(replay.movement.id, completed.movement.id);
+    assert.equal(completed.targetQuant.id, targetStock.id);
+    assert.equal((await own('GET', `/inventory/quants/${source.id}`)).quantity, 3);
+    assert.equal((await own('GET', `/inventory/quants/${targetStock.id}`)).quantity, 5);
+    assert.equal(await prisma.stockMovement.count({ where: { taskId: task.id, type: 'PUTAWAY' } }), 1);
+    await own('POST', confirm, { idempotencyKey, quantity: 1 }, 409);
+    await own('POST', confirm, {}, 409);
+
+    const next = await own('POST', '/putaway/tasks', input);
+    await own('POST', `/putaway/tasks/${next.task.id}/confirm`, { idempotencyKey }, 409);
+    assert.equal((await own('GET', `/tasks/${next.task.id}`)).status, 'OPEN');
+  });
+
   await scenario('inbound shipment changes roll back when any line is invalid', async () => {
     const { sku } = await createSku('INBOUND');
     const shipment = await own('POST', '/inbound-shipments', {
