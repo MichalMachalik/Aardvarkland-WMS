@@ -19,6 +19,7 @@ import {
 } from '../generated/prisma/client';
 import { ConfirmPickDto } from './dto/confirm-pick.dto';
 import { PackOrderDto, ReleasePickingDto, ShipOrderDto } from './dto/fulfillment-action.dto';
+import { requirePickingReservations } from './picking-reservations.helpers';
 import {
   ConfirmPickResponse,
   FulfillmentActionResponse,
@@ -502,23 +503,7 @@ export class FulfillmentService {
         status: 'ACTIVE',
       },
     }) ?? [];
-    const reservationsByLine = new Map<string, Reservation[]>();
-    for (const reservation of reservations) {
-      if (!reservation.outboundOrderLineId) continue;
-      const lineReservations = reservationsByLine.get(reservation.outboundOrderLineId);
-      if (lineReservations) lineReservations.push(reservation);
-      else reservationsByLine.set(reservation.outboundOrderLineId, [reservation]);
-    }
-    for (const line of order.lines) {
-      const remaining = line.orderedQuantity - line.pickedQuantity;
-      const reserved = (reservationsByLine.get(line.id) ?? []).reduce((sum, reservation) => sum + reservation.quantity, 0);
-      if (reserved !== remaining) {
-        throw new ConflictException(
-          `Outbound line ${line.lineNumber} needs ${remaining} units for picking and has ${reserved} reserved.`,
-        );
-      }
-    }
-    return reservationsByLine;
+    return requirePickingReservations(order.lines, reservations);
   }
 
   private async createPickTasks(

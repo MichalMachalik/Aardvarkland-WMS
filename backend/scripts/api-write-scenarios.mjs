@@ -161,6 +161,73 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.equal(picked.lines[0].pickedQuantity, 5);
   });
 
+  await scenario('pick waves roll back a release when any order lacks stock and then link the correct tasks', async () => {
+    async function orderWithStock(group) {
+      const { sku } = await createSku(group);
+      const receipt = { skuReference: sku.code, locationReference: 'A-01-01', quantity: 2 };
+      await own('POST', '/inventory/quants/receive', receipt);
+      const order = await own('POST', '/outbound-orders', {
+        orderNumber: `ORDER-${group}-${suffix}`, lines: [{ lineNumber: '10', sku: sku.code, orderedQuantity: 2 }],
+      });
+      const path = `/outbound-orders/${order.id}`;
+      await own('POST', `${path}/allocate`, {});
+      return { order, path, receipt };
+    }
+    const first = await orderWithStock('WAVE-A');
+    const second = await orderWithStock('WAVE-B');
+    const wave = await own('POST', '/pick-waves', {
+      waveNumber: `TEST-WAVE-${suffix}`, outboundOrderReferences: [first.order.id, second.order.id],
+    });
+    const path = `/pick-waves/${wave.id}`;
+    assert.equal(wave.status, 'PLANNED');
+    assert.equal(wave.orders.length, 2);
+    await own('PATCH', second.path, { lines: [{ lineReference: '10', orderedQuantity: 3 }] });
+
+    await own('POST', `${path}/release`, {}, 409);
+    const stillPlanned = await own('GET', path);
+    assert.equal(stillPlanned.status, 'PLANNED');
+    assert.equal(stillPlanned.tasks.length, 0);
+    assert.equal((await own('GET', first.path)).status, 'ALLOCATED');
+    assert.equal((await own('GET', second.path)).status, 'ALLOCATED');
+
+    await own('POST', '/inventory/quants/receive', { ...second.receipt, quantity: 1 });
+    await own('POST', `${second.path}/allocate`, {});
+    const outcomes = await Promise.all([
+      own('POST', `${path}/release`, {}, [201, 409]),
+      own('POST', `${path}/release`, {}, [201, 409]),
+    ]);
+    const releases = outcomes.filter(result => result.wave);
+    assert.equal(releases.length, 1);
+    const [released] = releases;
+    assert.equal(released.wave.status, 'RELEASED');
+    assert.equal(released.ordersReleased, 2);
+    assert.equal(released.tasksLinked, 3);
+    assert.equal(released.tasksCreated, 0);
+    await own('POST', `${path}/release`, {}, 409);
+    await own('POST', `${path}/complete`, {}, 409);
+    const tasks = (await own('GET', path)).tasks;
+    assert.equal(new Set(tasks.map(task => task.warehouseTaskId)).size, 3);
+    const expectedTasks = new Set(tasks.map(task => task.warehouseTaskId));
+    for (const item of [first, second]) {
+      assert.equal((await own('GET', item.path)).status, 'PICKING');
+      const skuTasks = await own('GET', `/tasks?type=PICK&sku=${item.receipt.skuReference}`);
+      for (const task of skuTasks) {
+        assert.ok(expectedTasks.delete(task.id));
+        await own('POST', `/tasks/${task.id}/confirm-pick`, { orderReference: item.order.id, quantity: task.quantity });
+      }
+      assert.equal((await own('GET', item.path)).status, 'PICKED');
+    }
+    assert.equal(expectedTasks.size, 0);
+    const completions = await Promise.all([
+      own('POST', `${path}/complete`, {}, [201, 409]),
+      own('POST', `${path}/complete`, {}, [201, 409]),
+    ]);
+    assert.equal(completions.filter(result => result.status === 'COMPLETED').length, 1);
+    const finished = await own('GET', path);
+    assert.equal(finished.status, 'COMPLETED');
+    assert.ok(finished.orders.every(item => item.status === 'PICKED'));
+  });
+
   await scenario('parcels, tracking, operational exceptions and notifications can be updated', async () => {
     const parcelBody = { trackingNumber: `PARCEL-${suffix}`, currentLocationReference: 'A-01-01' };
     const parcel = await own('POST', '/parcels', parcelBody);

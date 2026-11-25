@@ -13,6 +13,7 @@ const SAFE_TABLE_NAMES = new Set([
   'inbound_shipments',
   'shipments',
   'return_orders',
+  'pick_waves',
 ]);
 const SAFE_ADVISORY_LOCK_NAMESPACES = new Set([
   'stock_quant_identity',
@@ -43,6 +44,15 @@ export async function lockPostgresRowById(
   }
 
   await client.$queryRawUnsafe(`SELECT id FROM ${tableName} WHERE id = $1::uuid FOR UPDATE`, id);
+}
+
+export async function lockPostgresRowsById(client: unknown, tableName: string, ids: string[]): Promise<void> {
+  if (!SAFE_TABLE_NAMES.has(tableName)) {
+    throw new ConflictException(`Unsafe lock target: ${tableName}`);
+  }
+  if (!ids.length || !canRunRawSql(client)) return;
+
+  await client.$queryRawUnsafe(`SELECT id FROM ${tableName} WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE`, ids);
 }
 
 export async function lockPostgresAdvisoryTransaction(

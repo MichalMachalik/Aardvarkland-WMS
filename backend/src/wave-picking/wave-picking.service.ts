@@ -3,7 +3,8 @@ import { ConflictException, Injectable, NotFoundException } from '@nestjs/common
 import { AuthenticatedUser } from '../access-control/types';
 import { OwnerClientRecord, OwnerScopePrismaClient, OwnerScopeService } from '../clients/owner-scope.service';
 import { normalizeOffsetPagination } from '../common';
-import { PrismaService, withTransactionRetry } from '../database';
+import { lockPostgresRowById, lockPostgresRowsById, PrismaService, withTransactionRetry } from '../database';
+import { requirePickingReservations } from '../fulfillment/picking-reservations.helpers';
 import { AssignPickCartDto } from './dto/assign-pick-cart.dto';
 import { CreatePickCartDto } from './dto/create-pick-cart.dto';
 import { CreatePickToteDto } from './dto/create-pick-tote.dto';
@@ -164,16 +165,25 @@ export class WavePickingService {
   ): Promise<PickWaveReleaseSummary> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
     return this.transaction(async (tx) => {
-      const wave = await this.resolveWaveWithClient(tx, warehouse.id, waveReference, {
-        orders: { include: { outboundOrder: { include: { lines: true } } }, orderBy: { sequence: 'asc' } },
-        tasks: true,
+      const candidate = await this.resolveWaveWithClient(tx, warehouse.id, waveReference);
+      await lockPostgresRowById(tx, 'pick_waves', candidate.id);
+      const wave = await this.resolveWaveWithClient(tx, warehouse.id, candidate.id, {
+        orders: { orderBy: { sequence: 'asc' } },
       });
       if (!canReleaseWave(wave.status)) {
         throw new ConflictException(`Pick wave cannot be released from status ${String(wave.status)}.`);
       }
+      const waveOrders = asArray<PickWaveOrderWithOrder>(wave.orders);
+      const orderIds = waveOrders.map(order => order.outboundOrderId);
+      await lockPostgresRowsById(tx, 'outbound_orders', orderIds);
+      const orders = await tx.outboundOrder.findMany({
+        where: { warehouseId: warehouse.id, id: { in: orderIds } },
+        include: { lines: true },
+      });
+      const ordersById = new Map(orders.map(order => [order.id, order]));
       const owner = await this.resolveOperationOwner(tx, warehouse.id, null, [
         { resourceType: 'PICK_WAVE', resourceId: wave.id },
-        ...asArray<PickWaveOrderWithOrder>(wave.orders).map((order) => ({
+        ...waveOrders.map((order) => ({
           resourceType: 'OUTBOUND_ORDER',
           resourceId: order.outboundOrderId,
         })),
@@ -186,7 +196,21 @@ export class WavePickingService {
 
       const taskRecords: WarehouseTaskRecord[] = [];
       let tasksCreated = 0;
-      for (const waveOrder of asArray<PickWaveOrderWithOrder>(wave.orders)) {
+      for (const waveOrder of waveOrders) {
+        const order = ordersById.get(waveOrder.outboundOrderId);
+        if (!order || !['ALLOCATED', 'PICKING'].includes(order.status)) {
+          throw new ConflictException(`Outbound order ${order?.orderNumber ?? waveOrder.outboundOrderId} is no longer ready for picking.`);
+        }
+        const reservations = await tx.reservation.findMany({
+          where: {
+            warehouseId: warehouse.id,
+            outboundOrderId: order.id,
+            status: 'ACTIVE',
+          },
+          include: { stockQuant: true },
+          orderBy: { createdAt: 'asc' },
+        });
+        requirePickingReservations(order.lines ?? [], reservations);
         const existingTasks = await tx.warehouseTask.findMany({
           where: {
             warehouseId: warehouse.id,
@@ -199,16 +223,7 @@ export class WavePickingService {
         taskRecords.push(...existingTasks);
 
         if (existingTasks.length === 0 && dto.createMissingPickTasks !== false) {
-          const reservations = await tx.reservation.findMany({
-            where: {
-              warehouseId: warehouse.id,
-              outboundOrderId: waveOrder.outboundOrderId,
-              status: 'ACTIVE',
-            },
-            include: { stockQuant: true },
-            orderBy: { createdAt: 'asc' },
-          });
-          for (const reservation of asArray<ReservationWithQuant>(reservations)) {
+          for (const reservation of reservations) {
             const created = await tx.warehouseTask.create({
               data: {
                 warehouseId: warehouse.id,
@@ -321,7 +336,7 @@ export class WavePickingService {
 
       return {
         wave: toWaveResponse(released),
-        ordersReleased: asArray<PickWaveOrderWithOrder>(wave.orders).length,
+        ordersReleased: waveOrders.length,
         tasksLinked: orderedTaskIds.length,
         tasksCreated,
         cartAssigned,
@@ -373,7 +388,9 @@ export class WavePickingService {
   ): Promise<PickWaveResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
     return this.transaction(async (tx) => {
-      const wave = await this.resolveWaveWithClient(tx, warehouse.id, waveReference, {
+      const candidate = await this.resolveWaveWithClient(tx, warehouse.id, waveReference);
+      await lockPostgresRowById(tx, 'pick_waves', candidate.id);
+      const wave = await this.resolveWaveWithClient(tx, warehouse.id, candidate.id, {
         tasks: { include: { warehouseTask: true } },
       });
       const taskLinks = asArray<PickWaveTaskWithTask>(wave.tasks);
@@ -764,7 +781,7 @@ interface WaveTransactionClient {
 }
 
 interface WarehouseRecord { id: string; code: string; }
-interface OutboundOrderRecord { id: string; orderNumber: string; status: string; carrier?: string | null; serviceLevel?: string | null; shipBy?: Date | string | null; createdAt?: Date | string | null; metadata?: unknown; }
+interface OutboundOrderRecord { id: string; orderNumber: string; status: string; carrier?: string | null; serviceLevel?: string | null; shipBy?: Date | string | null; createdAt?: Date | string | null; metadata?: unknown; lines?: Array<{ id: string; lineNumber: string; orderedQuantity: number; pickedQuantity: number }>; }
 interface PickWaveRecord { id: string; warehouseId: string; waveNumber: string; status: string; priority: number; strategy: string; carrier?: string | null; serviceLevel?: string | null; zone?: string | null; cutoffAt?: Date | string | null; metadata?: unknown; releasedAt?: Date | string | null; completedAt?: Date | string | null; createdAt: Date | string; updatedAt: Date | string; orders?: unknown; tasks?: unknown; carts?: unknown; totes?: unknown; _count?: { orders?: number; tasks?: number; carts?: number; totes?: number }; }
 interface PickWaveOrderWithOrder { id: string; waveId: string; outboundOrderId: string; status: string; sequence: number; pickedAt?: Date | string | null; outboundOrder?: { orderNumber: string; status: string; lines?: unknown[] }; }
 interface PickWaveTaskWithTask { id: string; waveId: string; warehouseTaskId: string; status: string; sequence: number; zone?: string | null; warehouseTask?: { id: string; type: string; status: string; priority: number }; }
