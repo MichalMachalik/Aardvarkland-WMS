@@ -172,8 +172,8 @@ export function PrintStationsPage() {
       align: 'right',
       render: (row) => canOperatePrintJobs ? (
         <div className="inline-actions">
-          <Button size="sm" type="button" onClick={() => retryJob(row)} disabled={mutation.status === 'running' || row.status === 'PRINTED'}>{text.actions.retryJob}</Button>
-          <Button size="sm" type="button" onClick={() => reassignJob(row)} disabled={mutation.status === 'running' || row.status === 'PRINTED'}>{text.actions.reassignJob}</Button>
+          <Button size="sm" type="button" onClick={() => retryJob(row)} disabled={mutation.status === 'running' || row.status !== 'FAILED'}>{text.actions.retryJob}</Button>
+          <Button size="sm" type="button" onClick={() => reassignJob(row)} disabled={mutation.status === 'running' || !['QUEUED', 'FAILED'].includes(row.status)}>{text.actions.reassignJob}</Button>
           <Button size="sm" type="button" onClick={() => reprintJob(row)} disabled={mutation.status === 'running'}>{text.actions.reprintJob}</Button>
           <Button size="sm" type="button" onClick={() => cancelJob(row)} disabled={mutation.status === 'running' || row.status === 'PRINTED' || row.status === 'CANCELLED'}>{text.actions.cancelJob}</Button>
         </div>
@@ -882,7 +882,7 @@ const czech = {
     updateScanner: 'Upravit skener',
     pauseScanner: 'Servis',
     activateScanner: 'Aktivovat',
-    retryJob: 'Retry',
+    retryJob: 'Opakovat tisk',
     cancelJob: 'Zrušit',
     reassignJob: 'Přesměrovat',
     reprintJob: 'Dotisk',

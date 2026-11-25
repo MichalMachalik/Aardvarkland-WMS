@@ -101,6 +101,49 @@ for (const [name, role] of Object.entries(roles)) {
   });
 }
 
+test('print stations only offer retry after failure and return the job to the queue', async ({ page }) => {
+  const api = '/api/warehouses/MAIN';
+  const { email, password } = roles.system;
+  const auth = await liveApi(page, '/api/auth/login', { data: { email, password } });
+  const token = auth.accessToken;
+  const fixture = randomUUID().slice(0, 8).toUpperCase();
+  const printerCode = `UI-PRINTER-${fixture}`;
+  const agentCode = `UI-AGENT-${fixture}`;
+  const agent = { agentCode, token: randomUUID() };
+  await liveApi(page, api + '/printers', {
+    token, data: { code: printerCode, name: 'Browser fixture printer', protocol: 'WINDOWS_RAW', windowsPrinterName: 'Test-only printer' },
+  });
+  await liveApi(page, api + '/print-agents', {
+    token, data: { code: agentCode, name: 'Browser fixture agent', token: agent.token, printerCodes: [printerCode] },
+  });
+  const job = await liveApi(page, api + '/print-jobs', {
+    token, data: { printerCode, agentCode, maxAttempts: 1, renderedZpl: '^XA^FO40,40^FDFixture^FS^XZ' },
+  });
+  const claimed = await liveApi(page, api + '/print-agent/jobs/claim', { data: agent });
+  expect(claimed.jobs.map(item => item.id)).toEqual([job.id]);
+
+  await login(page, roles.system);
+  await desktopNav(page).getByRole('button', { name: 'Tiskárny', exact: true }).click();
+  const row = page.getByRole('row').filter({ has: page.getByRole('cell', { name: printerCode, exact: true }) });
+  const retry = row.getByRole('button', { name: 'Opakovat tisk' });
+  const reassign = row.getByRole('button', { name: 'Přesměrovat' });
+  await expect(retry).toBeDisabled();
+  await expect(reassign).toBeDisabled();
+  await liveApi(page, `${api}/print-agent/jobs/${job.id}/result`, {
+    data: { ...agent, status: 'FAILED', errorMessage: 'Fixture failure' },
+  });
+  await page.reload();
+  await expect(retry).toBeEnabled();
+  const retried = page.waitForResponse(response => response.request().method() === 'POST'
+    && new URL(response.url()).pathname.endsWith(`/print-jobs/${job.id}/retry`));
+  await retry.click();
+  expect((await retried).ok()).toBe(true);
+  await expect(retry).toBeDisabled();
+  await expect(reassign).toBeEnabled();
+  await expect(row.getByRole('cell', { name: '0/1', exact: true })).toBeVisible();
+  expect((await liveApi(page, api + '/print-agent/jobs/claim', { data: agent })).jobs.map(item => item.id)).toEqual([job.id]);
+});
+
 test('Base.com gives actionable feedback for import and dispatch on a phone', async ({ page }) => {
   let imported = false;
   let dispatched = false;

@@ -2272,6 +2272,67 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.equal((await own('POST', `/print-jobs/${reprint.id}/cancel`, {})).status, 'CANCELLED');
   });
 
+  await scenario('label templates validate blank content and preview a layout without scheduling a print job', async () => {
+    const path = '/label-templates';
+    const body = { code: `LABEL-${suffix}`, name: 'Fixture label', type: 'PARCEL', content: '^XA^FO40,40^FD{{trackingNumber}}^FS^XZ' };
+    await asWorker('POST', warehouse + path, body, 403);
+    const saved = await own('POST', path, body);
+    assert.equal(saved.code, body.code);
+    assert.equal(saved.content, body.content);
+    await own('POST', path, body, 409);
+    assert.ok((await own('GET', path)).some(template => template.id === saved.id));
+    const queuedBefore = await own('GET', '/print-jobs');
+    const preview = await own('POST', `${path}/${saved.code}/render-preview`, {
+      layout: { widthMm: 100, heightMm: 150, dpi: 203, fields: [{ type: 'text', x: 6, y: 10, binding: 'title' }] },
+      payload: { title: 'Fixture parcel' },
+    });
+    assert.ok(preview.zpl.startsWith('^XA') && preview.zpl.endsWith('^XZ'));
+    assert.ok(preview.zpl.includes('Fixture parcel'));
+    assert.deepEqual(await own('GET', '/print-jobs'), queuedBefore);
+    await own('POST', path, { ...body, code: body.code + '-EMPTY', content: '   ' }, 400);
+  });
+
+  await scenario('print retry releases a failed job for a fresh attempt while reassignment respects claims', async () => {
+    const jobs = '/print-jobs';
+    const connect = async name => {
+      const printerCode = `RETRY-${name}-${suffix}`;
+      const agentCode = `AGENT-${name}-${suffix}`;
+      const token = randomUUID();
+      await own('POST', '/printers', { code: printerCode, name: 'Fixture printer', protocol: 'WINDOWS_RAW', windowsPrinterName: 'Test-only printer' });
+      await own('POST', '/print-agents', { code: agentCode, name: 'Fixture agent', token, printerCodes: [printerCode] });
+      const credentials = { agentCode, token };
+      return {
+        printerCode, agentCode,
+        claim: async () => (await request('POST', warehouse + '/print-agent/jobs/claim', { body: credentials, expected: 201 })).data.jobs,
+        report: async (id, status) => (await request('POST', `${warehouse}/print-agent/jobs/${id}/result`, {
+          body: { ...credentials, status, ...(status === 'FAILED' ? { errorMessage: 'Fixture printer offline' } : {}) }, expected: 201,
+        })).data,
+      };
+    };
+    const first = await connect('FIRST');
+    const second = await connect('SECOND');
+    const body = { printerCode: first.printerCode, agentCode: first.agentCode, renderedZpl: '^XA^FO40,40^FDFixture^FS^XZ', maxAttempts: 1 };
+    const job = await own('POST', jobs, body);
+    const action = `${jobs}/${job.id}`;
+    assert.deepEqual((await first.claim()).map(item => item.id), [job.id]);
+    await own('POST', action + '/retry', {}, 409);
+    await own('POST', action + '/reassign', { printerCode: second.printerCode, agentCode: second.agentCode }, 409);
+    assert.equal((await first.report(job.id, 'FAILED')).status, 'FAILED');
+    const restarted = await own('POST', action + '/retry', {});
+    assert.deepEqual([restarted.status, restarted.attempts, restarted.errorMessage], ['QUEUED', 0, null]);
+    assert.deepEqual((await first.claim()).map(item => item.id), [job.id]);
+    assert.equal((await first.report(job.id, 'PRINTED')).status, 'PRINTED');
+    await own('POST', action + '/retry', {}, 409);
+    const queued = await own('POST', jobs, body);
+    const reroute = `${jobs}/${queued.id}/reassign`;
+    await own('POST', reroute, { printerCode: second.printerCode, agentCode: first.agentCode }, 409);
+    const reassigned = await own('POST', reroute, { printerCode: second.printerCode, agentCode: second.agentCode });
+    assert.deepEqual([reassigned.id, reassigned.printerCode, reassigned.agentCode], [queued.id, second.printerCode, second.agentCode]);
+    assert.equal((await first.claim()).length, 0);
+    assert.deepEqual((await second.claim()).map(item => item.id), [queued.id]);
+    assert.equal((await second.report(queued.id, 'PRINTED')).status, 'PRINTED');
+  });
+
   await scenario('legacy print metrics count failed jobs from PostgreSQL', async () => {
     const parcel = await own('POST', '/parcels', { trackingNumber: `PRINT-${suffix}` });
     const before = await own('GET', '/analytics/overview');

@@ -262,6 +262,9 @@ export class LabelsService {
     actor: AuthenticatedUser,
   ): Promise<LabelTemplateResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
+    if (!dto.code.trim() || !dto.name.trim() || !dto.content.trim()) {
+      throw new BadRequestException('Label template code, name and content must not be blank');
+    }
 
     try {
       const template = await this.db.labelTemplate.create({
@@ -606,9 +609,17 @@ export class LabelsService {
     if (job.status === 'PRINTED') {
       throw new ConflictException('Printed jobs cannot be retried; use reprint instead');
     }
+    if (job.status !== 'FAILED' && job.status !== 'QUEUED') {
+      throw new ConflictException('Only a failed print job can be retried');
+    }
 
-    const nextPrinterCode = normalizeNullableString(dto.printerCode) ?? job.printer_code;
-    const nextAgentCode = normalizeNullableString(dto.agentCode) ?? job.agent_code;
+    const { printerCode: nextPrinterCode, agentCode: nextAgentCode } = printJobRouting(job, dto);
+    if (job.status === 'QUEUED') {
+      if (job.printer_code === nextPrinterCode && job.agent_code === nextAgentCode) {
+        return toRuntimePrintJobResponse(job);
+      }
+      throw new ConflictException('Use reassignment to change a queued job');
+    }
     if (nextPrinterCode) {
       await this.assertRuntimePrinterExists(warehouse.id, nextPrinterCode);
     }
@@ -621,19 +632,27 @@ export class LabelsService {
        SET status = 'QUEUED',
            printer_code = NULLIF($3, ''),
            agent_code = NULLIF($4, ''),
+           attempts = 0,
            error_message = NULL,
            claimed_at = NULL,
            claim_expires_at = NULL,
            printed_at = NULL,
            updated_at = now()
-       WHERE id = $1::uuid AND warehouse_id = $2::uuid
+       WHERE id = $1::uuid AND warehouse_id = $2::uuid AND status = 'FAILED'
        RETURNING *`,
       job.id,
       warehouse.id,
       nextPrinterCode ?? '',
       nextAgentCode ?? '',
     );
-    const updated = required(rows, 'Print job retry was not stored');
+    const updated = rows[0];
+    if (!updated) {
+      const current = await this.resolveRuntimePrintJobRow(warehouse.id, job.id);
+      if (current.status === 'QUEUED' && current.printer_code === nextPrinterCode && current.agent_code === nextAgentCode) {
+        return toRuntimePrintJobResponse(current);
+      }
+      throw new ConflictException('Print job changed state while being retried');
+    }
     await this.writeRuntimeAudit(actor, warehouse.id, 'runtime_print_job.retry', 'runtime_print_job', updated.id, {
       printerCode: updated.printer_code,
       agentCode: updated.agent_code,
@@ -687,17 +706,19 @@ export class LabelsService {
     await this.ensureHardwareTables();
     const warehouse = await this.resolveWarehouse(warehouseReference);
     const job = await this.resolveRuntimePrintJobRow(warehouse.id, jobId);
-    if (job.status === 'PRINTED' || job.status === 'PRINTING' || job.status === 'CLAIMED') {
-      throw new ConflictException('An already claimed, printing or printed job must be reconciled before reassignment');
+    if (job.status !== 'QUEUED' && job.status !== 'FAILED') {
+      throw new ConflictException('Only queued or failed print jobs can be reassigned');
     }
 
-    const printerCode = normalizeNullableString(dto.printerCode);
-    const agentCode = normalizeNullableString(dto.agentCode);
+    const { printerCode, agentCode } = printJobRouting(job, dto);
     if (printerCode) {
       await this.assertRuntimePrinterExists(warehouse.id, printerCode);
     }
     if (agentCode) {
       await this.assertRuntimeAgentCanServePrinter(warehouse.id, agentCode, printerCode);
+    }
+    if (job.status === 'QUEUED' && job.printer_code === printerCode && job.agent_code === agentCode) {
+      return toRuntimePrintJobResponse(job);
     }
 
     const rows = await this.query<RuntimePrintJobRow>(
@@ -705,18 +726,20 @@ export class LabelsService {
        SET status = 'QUEUED',
            printer_code = NULLIF($3, ''),
            agent_code = NULLIF($4, ''),
+           attempts = CASE WHEN status = 'FAILED' THEN 0 ELSE attempts END,
            error_message = NULL,
            claimed_at = NULL,
            claim_expires_at = NULL,
            printed_at = NULL,
            updated_at = now()
        WHERE id = $1::uuid AND warehouse_id = $2::uuid
-         AND status NOT IN ('CLAIMED', 'PRINTING', 'PRINTED')
+         AND status = $5
        RETURNING *`,
       job.id,
       warehouse.id,
       printerCode ?? '',
       agentCode ?? '',
+      job.status,
     );
     if (!rows[0]) {
       throw new ConflictException('Print job changed state while being reassigned');
@@ -888,6 +911,7 @@ export class LabelsService {
              updated_at = now()
          WHERE id = $1::uuid
           AND warehouse_id = $2::uuid
+          AND printer_code IS NOT DISTINCT FROM $5::text
           AND attempts < max_attempts
           AND ${activeLabel}
           AND (
@@ -899,6 +923,7 @@ export class LabelsService {
         warehouse.id,
         agent.code,
         PRINT_JOB_LEASE_SECONDS,
+        job.printer_code,
       );
       if (rows[0]) {
         claimed.push(rows[0]);
@@ -1987,6 +2012,17 @@ function normalizeCode(value: string): string {
 
 function normalizeTrackingNumber(value: string): string {
   return value.trim().toUpperCase();
+}
+
+function printJobRouting(job: RuntimePrintJobRow, input: RuntimePrintJobActionDto): {
+  printerCode: string | null;
+  agentCode: string | null;
+} {
+  const printerCode = input.printerCode === undefined ? job.printer_code : normalizeNullableString(input.printerCode);
+  const agentCode = input.agentCode === undefined
+    ? (printerCode === job.printer_code ? job.agent_code : null)
+    : normalizeNullableString(input.agentCode);
+  return { printerCode, agentCode };
 }
 
 function normalizeNullableString(value: string | null | undefined): string | null {
