@@ -1,11 +1,12 @@
 import { Module } from '@nestjs/common';
 
 import { DatabaseModule } from '../database';
+import { LabelsModule } from '../labels/labels.module';
 import { OperationsRuntimeController } from './operations-runtime.controller';
 import { OperationsRuntimeService } from './operations-runtime.service';
 
 @Module({
-  imports: [DatabaseModule],
+  imports: [DatabaseModule, LabelsModule],
   controllers: [OperationsRuntimeController],
   providers: [OperationsRuntimeService],
   exports: [OperationsRuntimeService],

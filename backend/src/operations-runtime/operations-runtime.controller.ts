@@ -1,7 +1,9 @@
 import { Body, Controller, Get, Param, Post, Query } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 
+import { CurrentUser } from '../access-control/decorators/current-user.decorator';
 import { RequireWarehousePermissions } from '../access-control/decorators/require-warehouse-permissions.decorator';
+import { AuthenticatedUser } from '../access-control/types';
 import { OperationsRuntimeService } from './operations-runtime.service';
 import { RuntimeRuleType } from './operations-runtime.types';
 import {
@@ -104,8 +106,9 @@ export class OperationsRuntimeController {
   testPrintLabel(
     @Param('warehouseId') warehouseId: string,
     @Body() dto: RuntimePrintLabelTestDto,
+    @CurrentUser() actor: AuthenticatedUser,
   ) {
-    return this.operationsRuntimeService.testPrintLabel(warehouseId, dto);
+    return this.operationsRuntimeService.testPrintLabel(warehouseId, dto, actor);
   }
 
 

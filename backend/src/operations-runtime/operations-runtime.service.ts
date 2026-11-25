@@ -1,8 +1,12 @@
-import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { createHash } from 'node:crypto';
+import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { isUUID } from 'class-validator';
 
+import { AuthenticatedUser } from '../access-control/types';
 import { PrismaService, withTransactionRetry } from '../database';
 import type { Prisma } from '../generated/prisma/client';
+import { LabelsService } from '../labels/labels.service';
+import { escapeZplFieldData } from '../labels/zpl-renderer.helpers';
 import {
   RuntimeConnector,
   RuntimeIntegrationCommandCenter,
@@ -128,7 +132,10 @@ interface OperationRuleRow {
 
 @Injectable()
 export class OperationsRuntimeService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly labels: LabelsService,
+  ) {}
 
   async getRfConsole(warehouseId: string): Promise<RuntimeRfConsole> {
     await this.ensureTables();
@@ -426,21 +433,22 @@ export class OperationsRuntimeService {
     const connectorCode = dto.connectorCode.trim().toUpperCase();
     const flow = dto.flow.trim();
     const externalId = dto.externalId.trim();
+    if (!connectorCode || !flow || !externalId) {
+      throw new BadRequestException('Connector code, flow, and external ID must not be blank');
+    }
     const state = normalizeIntegrationState(dto.state);
     const rows = await this.query<IntegrationEventRow>(
       `INSERT INTO ops_integration_events
         (warehouse_id, connector_code, flow, state, external_id, attempts, max_attempts, retry_after, payload, last_error)
        VALUES ($1, $2, $3, $4, $5, 0, $6, CASE WHEN $4 IN ('WAITING','RETRYING') THEN now() ELSE NULL END, $7::jsonb, NULL)
        ON CONFLICT (warehouse_id, connector_code, flow, external_id) DO UPDATE SET
-         state = CASE
-           WHEN ops_integration_events.state = 'APPLIED' THEN ops_integration_events.state
-           ELSE EXCLUDED.state
-         END,
+         state = EXCLUDED.state,
          max_attempts = EXCLUDED.max_attempts,
          retry_after = EXCLUDED.retry_after,
          payload = EXCLUDED.payload,
          last_error = NULL,
          updated_at = now()
+       WHERE ops_integration_events.state <> 'APPLIED'
        RETURNING *`,
       warehouseId,
       connectorCode,
@@ -455,7 +463,8 @@ export class OperationsRuntimeService {
       }),
     );
 
-    return toIntegrationEvent(required(rows, 'Integration event was not ingested'));
+    const event = rows[0] ?? await this.findIntegrationEventByExternalId(warehouseId, connectorCode, flow, externalId);
+    return toIntegrationEvent(event);
   }
 
   async applyIntegrationEvent(
@@ -463,6 +472,7 @@ export class OperationsRuntimeService {
     eventId: string,
     dto: RuntimeIntegrationEventApplyDto,
   ): Promise<RuntimeIntegrationEvent> {
+    this.assertIntegrationEventId(eventId);
     await this.ensureTables();
     const rows = await this.query<IntegrationEventRow>(
       `UPDATE ops_integration_events
@@ -472,7 +482,7 @@ export class OperationsRuntimeService {
            last_error = NULL,
            payload = COALESCE(payload, '{}'::jsonb) || $3::jsonb,
            updated_at = now()
-       WHERE warehouse_id = $1 AND id = $2::uuid
+       WHERE warehouse_id = $1 AND id = $2::uuid AND state <> 'APPLIED'
        RETURNING *`,
       warehouseId,
       eventId,
@@ -483,69 +493,133 @@ export class OperationsRuntimeService {
       }),
     );
 
-    if (!rows[0]) throw new NotFoundException('Integration event was not found');
-    return toIntegrationEvent(rows[0]);
+    return toIntegrationEvent(rows[0] ?? await this.findIntegrationEvent(warehouseId, eventId));
   }
 
-  async testPrintLabel(warehouseId: string, dto: RuntimePrintLabelTestDto): Promise<{
+  async testPrintLabel(warehouseId: string, dto: RuntimePrintLabelTestDto, actor: AuthenticatedUser): Promise<{
     event: RuntimeIntegrationEvent;
     dryRun: boolean;
     stationCode: string;
     zplPreview: string;
     instruction: string;
+    printJobId: string | null;
   }> {
     await this.ensureTables();
+    const dryRun = dto.dryRun !== false;
+    const flow = dryRun ? 'label.print.preview' : 'label.print';
     const connectorCode = dto.connectorCode?.trim().toUpperCase() || 'PRINT';
     const stationCode = dto.stationCode?.trim().toUpperCase() || 'PACK-01';
     const reference = dto.reference?.trim() || `PRINT-TEST-${Date.now()}`;
     const templateCode = dto.templateCode?.trim().toUpperCase() || 'SAMPLE_ZPL';
-    const zplPreview = `^XA^FO40,40^A0N,34,34^FDWMS TEST ${reference}^FS^FO40,95^BY2^BCN,80,Y,N,N^FD${reference}^FS^XZ`;
+    const printableReference = escapeZplFieldData(reference);
+    const zplPreview = `^XA^FO40,40^A0N,34,34^FDWMS TEST ${printableReference}^FS^FO40,95^BY2^BCN,80,Y,N,N^FD${printableReference}^FS^XZ`;
+    let printJobId: string | null = null;
+    if (!dryRun) {
+      const permissions = actor.warehouses.find(item => item.warehouseId === warehouseId || item.warehouseCode === warehouseId)?.permissionCodes;
+      if (!permissions?.some(permission => permission === 'label.print' || permission === '*')) {
+        throw new ForbiddenException('Missing required warehouse print permission');
+      }
+      const jobKey = createHash('sha256').update(json([connectorCode, reference])).digest('hex');
+      const job = await this.labels.createRuntimePrintJob(warehouseId, {
+        printerCode: stationCode,
+        templateCode,
+        renderedZpl: zplPreview,
+        idempotencyKey: `integration-print-test-${jobKey}`,
+        payload: { connectorCode, reference },
+      }, actor);
+      printJobId = job.id;
+    }
     const rows = await this.query<IntegrationEventRow>(
       `INSERT INTO ops_integration_events
         (warehouse_id, connector_code, flow, state, external_id, attempts, max_attempts, payload, last_error)
-       VALUES ($1, $2, 'label.print', $3, $4, 1, 3, $5::jsonb, NULL)
+       VALUES ($1, $2, $3, $4, $5, 1, 3, $6::jsonb, NULL)
        ON CONFLICT (warehouse_id, connector_code, flow, external_id) DO UPDATE SET
          state = EXCLUDED.state,
          attempts = ops_integration_events.attempts + 1,
          payload = EXCLUDED.payload,
          updated_at = now(),
          last_error = NULL
+       WHERE ops_integration_events.payload IS DISTINCT FROM EXCLUDED.payload
        RETURNING *`,
       warehouseId,
       connectorCode,
-      dto.dryRun === false ? RuntimeIntegrationState.WAITING : RuntimeIntegrationState.APPLIED,
+      flow,
+      dryRun ? RuntimeIntegrationState.APPLIED : RuntimeIntegrationState.WAITING,
       reference,
-      json({ stationCode, templateCode, dryRun: dto.dryRun !== false, zplPreview }),
+      json({ stationCode, templateCode, dryRun, zplPreview, printJobId }),
     );
 
+    const event = rows[0] ?? await this.findIntegrationEventByExternalId(warehouseId, connectorCode, flow, reference);
     return {
-      event: toIntegrationEvent(required(rows, 'Print test event was not stored')),
-      dryRun: dto.dryRun !== false,
+      event: toIntegrationEvent(event),
+      dryRun,
       stationCode,
       zplPreview,
-      instruction: dto.dryRun === false
-        ? 'Print test was queued for the configured print adapter.'
-        : 'Dry-run label rendered and stored without sending data to a physical printer.',
+      printJobId,
+      instruction: dryRun
+        ? 'Dry-run label rendered and stored without sending data to a physical printer.'
+        : 'Print test was queued for the configured printer.',
     };
   }
 
   async retryIntegrationEvent(warehouseId: string, eventId: string): Promise<RuntimeIntegrationEvent> {
+    this.assertIntegrationEventId(eventId);
     await this.ensureTables();
     const rows = await this.query<IntegrationEventRow>(
-      `UPDATE ops_integration_events
-       SET state = CASE WHEN attempts + 1 >= max_attempts THEN 'DEAD_LETTER' ELSE 'RETRYING' END,
-           attempts = attempts + 1,
-           retry_after = now() + interval '2 minutes',
+      `WITH retry AS (
+         SELECT id, max_attempts,
+           CASE WHEN state = 'DEAD_LETTER' THEN 1 ELSE LEAST(attempts::bigint + 1, max_attempts)::integer END AS attempts
+         FROM ops_integration_events
+         WHERE warehouse_id = $1 AND id = $2::uuid AND state <> 'APPLIED'
+         FOR UPDATE
+       )
+       UPDATE ops_integration_events AS event
+       SET attempts = retry.attempts,
+           state = CASE WHEN retry.attempts >= retry.max_attempts THEN 'DEAD_LETTER' ELSE 'RETRYING' END,
+           retry_after = CASE WHEN retry.attempts < retry.max_attempts THEN now() + interval '2 minutes' ELSE NULL END,
            updated_at = now(),
-           last_error = CASE WHEN attempts + 1 >= max_attempts THEN last_error ELSE NULL END
-       WHERE warehouse_id = $1 AND id = $2::uuid
-       RETURNING *`,
+           last_error = CASE WHEN retry.attempts >= retry.max_attempts THEN event.last_error ELSE NULL END
+       FROM retry WHERE event.id = retry.id
+       RETURNING event.*`,
       warehouseId,
       eventId,
     );
 
-    if (!rows[0]) throw new NotFoundException('Integration event was not found');
+    if (!rows[0]) {
+      await this.findIntegrationEvent(warehouseId, eventId);
+      throw new ConflictException('An applied integration event cannot be retried');
+    }
     return toIntegrationEvent(rows[0]);
+  }
+
+  private assertIntegrationEventId(eventId: string): void {
+    if (!isUUID(eventId)) throw new BadRequestException('Integration event ID must be a UUID');
+  }
+
+  private async findIntegrationEvent(warehouseId: string, eventId: string): Promise<IntegrationEventRow> {
+    const rows = await this.query<IntegrationEventRow>(
+      'SELECT * FROM ops_integration_events WHERE warehouse_id = $1 AND id = $2::uuid',
+      warehouseId,
+      eventId,
+    );
+    return required(rows, 'Integration event was not found');
+  }
+
+  private async findIntegrationEventByExternalId(
+    warehouseId: string,
+    connectorCode: string,
+    flow: string,
+    externalId: string,
+  ): Promise<IntegrationEventRow> {
+    const rows = await this.query<IntegrationEventRow>(
+      `SELECT * FROM ops_integration_events
+       WHERE warehouse_id = $1 AND connector_code = $2 AND flow = $3 AND external_id = $4`,
+      warehouseId,
+      connectorCode,
+      flow,
+      externalId,
+    );
+    return required(rows, 'Integration event was not found');
   }
 
   async runReconciliation(warehouseId: string, dto: RuntimeReconciliationRunDto): Promise<{
@@ -558,12 +632,15 @@ export class OperationsRuntimeService {
     createdAt: string;
   }> {
     await this.ensureTables();
+    const connectorCode = dto.connectorCode?.trim().toUpperCase() || null;
+    const flow = dto.flow?.trim() || null;
     const events = await this.query<IntegrationEventRow>(
       `SELECT * FROM ops_integration_events
        WHERE warehouse_id = $1 AND ($2::text IS NULL OR connector_code = $2)
-       ORDER BY updated_at DESC`,
+         AND ($3::text IS NULL OR flow = $3)`,
       warehouseId,
-      dto.connectorCode?.trim().toUpperCase() || null,
+      connectorCode,
+      flow,
     );
     const dead = events.filter((event) => event.state === RuntimeIntegrationState.DEAD_LETTER).length;
     const waiting = events.filter((event) => event.state === RuntimeIntegrationState.WAITING || event.state === RuntimeIntegrationState.RETRYING).length;
@@ -571,7 +648,7 @@ export class OperationsRuntimeService {
     const status = mismatches > 2 ? 'ATTENTION_REQUIRED' : mismatches > 0 ? 'WATCH' : 'MATCHED';
     const summary = {
       dryRun: dto.dryRun ?? true,
-      flow: dto.flow ?? 'all',
+      flow: flow ?? 'all',
       checked: events.length,
       deadLetters: dead,
       waiting,
@@ -583,7 +660,7 @@ export class OperationsRuntimeService {
        VALUES ($1, $2, $3, $4, $5::jsonb)
        RETURNING *`,
       warehouseId,
-      dto.connectorCode?.trim().toUpperCase() || null,
+      connectorCode,
       status,
       mismatches,
       json(summary),
@@ -649,7 +726,8 @@ export class OperationsRuntimeService {
   ): Promise<RuntimeRuleEvaluation> {
     const rules = await this.listRules(warehouseId);
     const allowedTypes = new Set(dto.ruleTypes ?? Object.values(RuntimeRuleType));
-    const matchedRules = rules.filter((rule) => rule.enabled && allowedTypes.has(rule.type) && matchesContext(rule.conditions, dto.context));
+    const matchedRules = rules.filter((rule) => rule.enabled && allowedTypes.has(rule.type)
+      && matchesContext(rule.scope, dto.context) && matchesContext(rule.conditions, dto.context));
 
     return {
       warehouseId,
@@ -901,18 +979,29 @@ function matchesContext(conditions: Record<string, unknown>, context: Record<str
   if (!entries.length) return true;
 
   return entries.every(([key, expected]) => {
+    if (!Object.hasOwn(context, key)) return false;
     const actual = context[key];
-    if (Array.isArray(expected)) return expected.map(String).includes(String(actual));
-    if (expected && typeof expected === 'object' && 'min' in expected) {
-      const min = Number((expected as { min?: unknown }).min);
-      return Number(actual) >= min;
+    if (Array.isArray(expected)) return expected.some(value => sameContextValue(actual, value));
+    if (expected && typeof expected === 'object' && ('min' in expected || 'max' in expected)) {
+      const value = contextNumber(actual);
+      const min = 'min' in expected ? contextNumber(expected.min) : -Infinity;
+      const max = 'max' in expected ? contextNumber(expected.max) : Infinity;
+      return value >= min && value <= max;
     }
-    if (expected && typeof expected === 'object' && 'max' in expected) {
-      const max = Number((expected as { max?: unknown }).max);
-      return Number(actual) <= max;
-    }
-    return String(actual) === String(expected);
+    return sameContextValue(actual, expected);
   });
+}
+
+function sameContextValue(actual: unknown, expected: unknown): boolean {
+  if (actual == null || expected == null) return actual === expected;
+  if (typeof actual === 'object' || typeof expected === 'object') return false;
+  return String(actual) === String(expected);
+}
+
+function contextNumber(value: unknown): number {
+  if (typeof value !== 'number' && (typeof value !== 'string' || !value.trim())) return NaN;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : NaN;
 }
 
 function isExpected(scanned: string, expected?: string): boolean {

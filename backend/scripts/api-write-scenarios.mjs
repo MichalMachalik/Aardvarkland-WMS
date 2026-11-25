@@ -1759,6 +1759,114 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     }
   });
 
+  await scenario('operations integration preserves applied events and tracks retries up to the configured limit', async () => {
+    const events = '/operations-runtime/integrations/events';
+    const input = { connectorCode: `OPS-${suffix}`, flow: 'order.import', externalId: 'APPLY', maxAttempts: 2 };
+    const original = await own('POST', events, input);
+    assert.equal(original.state, 'WAITING');
+    assert.equal(original.attempts, 0);
+    const path = `${events}/${original.id}`;
+    const applications = await Promise.all([
+      own('POST', path + '/apply', { mapping: { result: 'first' } }),
+      own('POST', path + '/apply', { mapping: { result: 'second' } }),
+    ]);
+    assert.deepEqual(applications.map(item => [item.state, item.attempts]), [['APPLIED', 1], ['APPLIED', 1]]);
+    assert.equal(applications[0].updatedAt, applications[1].updatedAt);
+    const duplicate = await own('POST', events, { ...input, maxAttempts: 7 });
+    assert.deepEqual(duplicate, applications[0]);
+    await own('POST', path + '/retry', {}, 409);
+    await own('POST', `${events}/${randomUUID()}/apply`, {}, 404);
+    await own('POST', events + '/invalid/retry', {}, 400);
+    await own('POST', events, { ...input, externalId: '  ' }, 400);
+
+    const failed = await own('POST', events, { ...input, externalId: 'FAIL' });
+    const retryPath = `${events}/${failed.id}/retry`;
+    const scheduled = await own('POST', retryPath, {});
+    assert.equal(scheduled.state, 'RETRYING');
+    assert.equal(scheduled.attempts, 1);
+    assert.ok(Date.parse(scheduled.retryAfter) > Date.now());
+    const exhausted = await own('POST', retryPath, {});
+    assert.equal(exhausted.state, 'DEAD_LETTER');
+    assert.equal(exhausted.attempts, 2);
+    assert.equal(exhausted.retryAfter, null);
+    const restarted = await own('POST', retryPath, {});
+    assert.deepEqual([restarted.state, restarted.attempts], ['RETRYING', 1]);
+  });
+
+  await scenario('operations reconciliation counts only the requested connector and flow', async () => {
+    const integrations = '/operations-runtime/integrations';
+    const connectorCode = `OPS-RECON-${suffix}`;
+    const event = (flow, state, externalId, code = connectorCode) =>
+      own('POST', integrations + '/events', { connectorCode: code, flow, state, externalId });
+    await event('order.import', 'APPLIED', 'APPLIED');
+    await event('order.import', 'DEAD_LETTER', 'DEAD');
+    await event('inventory.publish', 'DEAD_LETTER', 'OTHER-FLOW');
+    await event('order.import', 'DEAD_LETTER', 'OTHER-CONNECTOR', `${connectorCode}-OTHER`);
+    const run = await own('POST', integrations + '/reconciliation-runs', {
+      connectorCode: connectorCode.toLowerCase(), flow: 'order.import',
+    });
+    assert.equal(run.connectorCode, connectorCode);
+    assert.equal(run.summary.checked, 2);
+    assert.equal(run.summary.deadLetters, 1);
+    assert.equal(run.summary.flow, 'order.import');
+    assert.equal(run.mismatches, 1);
+    const saved = (await own('GET', integrations + '/command-center')).reconciliation;
+    assert.deepEqual([saved.lastRunAt, saved.status, saved.mismatches], [run.createdAt, run.status, run.mismatches]);
+  });
+
+  await scenario('operations rules apply scope and both bounds without matching disabled rules', async () => {
+    const rules = '/operations-runtime/configuration/rules';
+    const code = `OPS-RULE-${suffix}`;
+    const input = { code, name: 'Fixture routing', type: 'CARRIER_ROUTING', priority: 71,
+      scope: { client: 'FIXTURE' }, conditions: { quantity: { min: 2, max: 10 } }, actions: { route: 'FIXTURE' } };
+    await asWorker('POST', warehouse + rules, input, 403);
+    const main = await own('POST', rules, input);
+    const disabled = await own('POST', rules, { ...input, code: code + '-OFF', enabled: false });
+    const evaluate = async context => {
+      const result = await own('POST', rules + '/evaluate', { ruleTypes: ['CARRIER_ROUTING'], context });
+      assert.ok(!result.matchedRules.some(rule => rule.id === disabled.id));
+      return result.recommendedActions.find(item => item.ruleCode === code);
+    };
+    assert.deepEqual(await evaluate({ client: 'FIXTURE', quantity: 10 }), { ruleCode: code, action: input.actions });
+    assert.equal(await evaluate({ client: 'FIXTURE', quantity: 11 }), undefined);
+    assert.equal(await evaluate({ client: 'OTHER', quantity: 5 }), undefined);
+    assert.equal(await evaluate({ client: 'FIXTURE', quantity: null }), undefined);
+    const updated = await own('POST', rules, { ...input, name: 'Updated routing' });
+    assert.equal(updated.id, main.id);
+    assert.equal(updated.name, 'Updated routing');
+  });
+
+  await scenario('operations labels sanitize printable data and queue real tests once for configured printers', async () => {
+    const path = '/operations-runtime/integrations/print/test-label';
+    const reference = `FIXTURE-${suffix} ^ ~ printable`;
+    const jobsBefore = await own('GET', '/print-jobs');
+    const printed = await own('POST', path, { stationCode: 'pack-01', reference });
+    assert.equal(printed.dryRun, true);
+    assert.equal(printed.event.state, 'APPLIED');
+    assert.equal(printed.stationCode, 'PACK-01');
+    assert.ok(printed.zplPreview.startsWith('^XA') && printed.zplPreview.endsWith('^XZ'));
+    assert.ok(!printed.zplPreview.includes('^ ~'));
+    assert.equal(printed.printJobId, null);
+    const jobsAfter = await own('GET', '/print-jobs');
+    assert.deepEqual(jobsAfter, jobsBefore);
+
+    const stationCode = `OPS-PRINTER-${suffix}`;
+    const agentCode = `OPS-PRINT-AGENT-${suffix}`;
+    const token = randomUUID();
+    const test = { stationCode, reference, dryRun: false };
+    await own('POST', path, test, 404);
+    await own('POST', '/printers', { code: stationCode, name: 'Test printer', protocol: 'WINDOWS_RAW', windowsPrinterName: 'Test-only printer' });
+    await own('POST', '/print-agents', { code: agentCode, name: 'Test agent', token, printerCodes: [stationCode] });
+    const queued = await own('POST', path, test);
+    assert.equal(queued.dryRun, false);
+    assert.equal(queued.event.state, 'WAITING');
+    assert.ok(queued.printJobId);
+    assert.deepEqual(await own('POST', path, test), queued);
+    const claimed = await request('POST', warehouse + '/print-agent/jobs/claim', { body: { agentCode, token }, expected: 201 });
+    assert.deepEqual(claimed.data.jobs.map(job => job.id), [queued.printJobId]);
+    assert.equal(claimed.data.jobs[0].renderedZpl, printed.zplPreview);
+  });
+
   await scenario('reconciliation reports orphan and missing mappings inside the requested warehouse and owner', async () => {
     const external = '/api/integrations/enterprise';
     const system = await asAdmin('POST', external + '/external-systems', {
