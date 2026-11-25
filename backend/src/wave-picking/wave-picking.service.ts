@@ -35,6 +35,8 @@ import {
   PickWaveTaskResponse,
 } from './wave-picking.types';
 
+const closedWaveStatuses: string[] = [PickWaveStatus.COMPLETED, PickWaveStatus.CANCELLED];
+
 @Injectable()
 export class WavePickingService {
   constructor(private readonly prisma: PrismaService, private readonly ownerScope: OwnerScopeService) {}
@@ -304,11 +306,7 @@ export class WavePickingService {
 
       let cartAssigned = false;
       if (dto.pickCartReference) {
-        const cart = await this.resolvePickCartWithClient(tx, warehouse.id, dto.pickCartReference);
-        await tx.pickCart.update({
-          where: { id: cart.id },
-          data: { waveId: wave.id, status: PickCartStatus.ASSIGNED, assignedUserId: actor.id },
-        });
+        const cart = await this.assignCartToWave(tx, warehouse.id, wave, dto.pickCartReference, actor.id);
         if (owner) {
           await this.linkOwnerResources(tx, warehouse.id, owner, [
             { resourceType: 'PICK_CART', resourceId: cart.id, metadata: { source: 'wave.release.assign_cart', pickWaveId: wave.id } },
@@ -352,33 +350,28 @@ export class WavePickingService {
     actor: AuthenticatedUser,
   ): Promise<PickCartResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
-    const wave = await this.resolveWave(warehouse.id, waveReference);
-    const cart = await this.resolvePickCart(warehouse.id, dto.pickCartReference);
-    const updated = await this.client.pickCart.update({
-      where: { id: cart.id },
-      data: {
-        waveId: wave.id,
-        status: PickCartStatus.ASSIGNED,
-        assignedUserId: dto.assignedUserId ?? actor.id,
-      },
-      include: { _count: { select: { totes: true } } },
-    });
-    const owner = await this.ownerScope.findResourceOwner({
-      warehouseId: warehouse.id,
-      resourceType: 'PICK_WAVE',
-      resourceId: wave.id,
-      client: this.client as unknown as OwnerScopePrismaClient,
-    });
-    if (owner) {
-      await this.linkOwnerResources(this.client, warehouse.id, owner, [
-        { resourceType: 'PICK_CART', resourceId: cart.id, metadata: { source: 'wave.assign_cart', pickWaveId: wave.id } },
+    return this.transaction(async (tx) => {
+      const candidate = await this.resolveWaveWithClient(tx, warehouse.id, waveReference);
+      await lockPostgresRowById(tx, 'pick_waves', candidate.id);
+      const wave = await this.resolveWaveWithClient(tx, warehouse.id, candidate.id);
+      const cart = await this.assignCartToWave(
+        tx, warehouse.id, wave, dto.pickCartReference, dto.assignedUserId ?? actor.id,
+      );
+      const owner = await this.resolveOperationOwner(tx, warehouse.id, null, [
+        { resourceType: 'PICK_WAVE', resourceId: wave.id },
+        { resourceType: 'PICK_CART', resourceId: cart.id },
       ]);
-    }
-    await this.writeAudit(actor.id, warehouse.id, 'pick_cart.assigned_to_wave', 'pick_cart', cart.id, {
-      waveId: wave.id,
-      waveNumber: wave.waveNumber,
+      if (owner) {
+        await this.linkOwnerResources(tx, warehouse.id, owner, [
+          { resourceType: 'PICK_CART', resourceId: cart.id, metadata: { source: 'wave.assign_cart', pickWaveId: wave.id } },
+        ]);
+      }
+      await this.writeAuditWithClient(tx, actor.id, warehouse.id, 'pick_cart.assigned_to_wave', 'pick_cart', cart.id, {
+        waveId: wave.id,
+        waveNumber: wave.waveNumber,
+      });
+      return toCartResponse(cart);
     });
-    return toCartResponse(updated);
   }
 
   async completeWave(
@@ -446,35 +439,46 @@ export class WavePickingService {
     actor: AuthenticatedUser,
   ): Promise<PickToteResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
-    const cart = dto.pickCartReference ? await this.resolvePickCart(warehouse.id, dto.pickCartReference) : null;
-    const wave = dto.waveReference ? await this.resolveWave(warehouse.id, dto.waveReference) : null;
-    const order = dto.outboundOrderReference
-      ? await this.resolveOutboundOrder(warehouse.id, dto.outboundOrderReference)
-      : null;
-    const owner = await this.resolveOperationOwner(this.client, warehouse.id, dto.ownerClientReference, [
-      { resourceType: 'PICK_CART', resourceId: cart?.id },
-      { resourceType: 'PICK_WAVE', resourceId: wave?.id },
-      { resourceType: 'OUTBOUND_ORDER', resourceId: order?.id },
-    ]);
-    const tote = await this.client.pickTote.create({
-      data: {
-        warehouseId: warehouse.id,
-        pickCartId: cart?.id ?? null,
-        waveId: wave?.id ?? null,
-        outboundOrderId: order?.id ?? null,
-        code: normalizeCode(dto.code),
-        status: order || wave || cart ? PickToteStatus.ASSIGNED : PickToteStatus.EMPTY,
-        capacityUnits: dto.capacityUnits ?? null,
-        metadata: dto.metadata ?? undefined,
-      },
-    });
-    if (owner) {
-      await this.linkOwnerResources(this.client, warehouse.id, owner, [
-        { resourceType: 'PICK_TOTE', resourceId: tote.id, metadata: { source: 'wave.create_tote', pickCartId: cart?.id ?? null, pickWaveId: wave?.id ?? null, outboundOrderId: order?.id ?? null } },
+    return this.transaction(async (tx) => {
+      const cart = dto.pickCartReference ? await this.lockPickCart(tx, warehouse.id, dto.pickCartReference) : null;
+      const waveReference = dto.waveReference ?? cart?.waveId;
+      const wave = waveReference ? await this.resolveWaveWithClient(tx, warehouse.id, waveReference, {
+        orders: { select: { outboundOrderId: true } },
+      }) : null;
+      if (cart?.waveId && wave && cart.waveId !== wave.id) {
+        throw new ConflictException(`Pick cart ${cart.code} belongs to another wave.`);
+      }
+      const order = dto.outboundOrderReference
+        ? await this.resolveOutboundOrder(tx, warehouse.id, dto.outboundOrderReference)
+        : null;
+      if (order && wave && !asArray<{ outboundOrderId: string }>(wave.orders).some(member => member.outboundOrderId === order.id)) {
+        throw new ConflictException(`Outbound order ${order.orderNumber} does not belong to wave ${wave.waveNumber}.`);
+      }
+      const owner = await this.resolveOperationOwner(tx, warehouse.id, dto.ownerClientReference, [
+        { resourceType: 'PICK_CART', resourceId: cart?.id },
+        { resourceType: 'PICK_WAVE', resourceId: wave?.id },
+        { resourceType: 'OUTBOUND_ORDER', resourceId: order?.id },
       ]);
-    }
-    await this.writeAudit(actor.id, warehouse.id, 'pick_tote.created', 'pick_tote', tote.id, { code: tote.code });
-    return toToteResponse(tote);
+      const tote = await tx.pickTote.create({
+        data: {
+          warehouseId: warehouse.id,
+          pickCartId: cart?.id ?? null,
+          waveId: wave?.id ?? null,
+          outboundOrderId: order?.id ?? null,
+          code: normalizeCode(dto.code),
+          status: order || wave || cart ? PickToteStatus.ASSIGNED : PickToteStatus.EMPTY,
+          capacityUnits: dto.capacityUnits ?? null,
+          metadata: dto.metadata ?? undefined,
+        },
+      });
+      if (owner) {
+        await this.linkOwnerResources(tx, warehouse.id, owner, [
+          { resourceType: 'PICK_TOTE', resourceId: tote.id, metadata: { source: 'wave.create_tote', pickCartId: cart?.id ?? null, pickWaveId: wave?.id ?? null, outboundOrderId: order?.id ?? null } },
+        ]);
+      }
+      await this.writeAuditWithClient(tx, actor.id, warehouse.id, 'pick_tote.created', 'pick_tote', tote.id, { code: tote.code });
+      return toToteResponse(tote);
+    });
   }
 
   private async findWaveCandidateOrders(
@@ -553,8 +557,48 @@ export class WavePickingService {
     return wave;
   }
 
-  private async resolvePickCart(warehouseId: string, reference: string): Promise<PickCartRecord> {
-    return this.resolvePickCartWithClient(this.client, warehouseId, reference);
+  private async lockPickCart(tx: WaveTransactionClient, warehouseId: string, reference: string): Promise<PickCartRecord> {
+    const candidate = await this.resolvePickCartWithClient(tx, warehouseId, reference);
+    await lockPostgresRowById(tx, 'pick_carts', candidate.id);
+    return this.resolvePickCartWithClient(tx, warehouseId, candidate.id);
+  }
+
+  private async assignCartToWave(
+    tx: WaveTransactionClient,
+    warehouseId: string,
+    wave: PickWaveRecord,
+    cartReference: string,
+    assignedUserId: string,
+  ): Promise<PickCartRecord> {
+    if (closedWaveStatuses.includes(wave.status)) {
+      throw new ConflictException(`Pick wave ${wave.waveNumber} is closed.`);
+    }
+    const cart = await this.lockPickCart(tx, warehouseId, cartReference);
+    if (cart.status === PickCartStatus.MAINTENANCE || cart.status === PickCartStatus.RETIRED) {
+      throw new ConflictException(`Pick cart ${cart.code} is unavailable.`);
+    }
+    if (cart.waveId && cart.waveId !== wave.id) {
+      const priorWave = await this.resolveWaveWithClient(tx, warehouseId, cart.waveId);
+      if (!closedWaveStatuses.includes(priorWave.status)) {
+        throw new ConflictException(`Pick cart ${cart.code} belongs to active wave ${priorWave.waveNumber}.`);
+      }
+    }
+    const incompatibleTote = await tx.pickTote.findFirst({
+      where: {
+        warehouseId,
+        pickCartId: cart.id,
+        status: { in: [PickToteStatus.ASSIGNED, PickToteStatus.FULL] },
+        wave: { is: { id: { not: wave.id }, status: { notIn: closedWaveStatuses } } },
+      },
+    });
+    if (incompatibleTote) {
+      throw new ConflictException(`Pick cart ${cart.code} carries a tote from another active wave.`);
+    }
+    return tx.pickCart.update({
+      where: { id: cart.id },
+      data: { waveId: wave.id, status: PickCartStatus.ASSIGNED, assignedUserId },
+      include: { _count: { select: { totes: true } } },
+    });
   }
 
   private async resolvePickCartWithClient(tx: WaveTransactionClient, warehouseId: string, reference: string): Promise<PickCartRecord> {
@@ -567,8 +611,8 @@ export class WavePickingService {
     return cart;
   }
 
-  private async resolveOutboundOrder(warehouseId: string, reference: string): Promise<OutboundOrderRecord> {
-    const order = await this.client.outboundOrder.findFirst({
+  private async resolveOutboundOrder(tx: WaveTransactionClient, warehouseId: string, reference: string): Promise<OutboundOrderRecord> {
+    const order = await tx.outboundOrder.findFirst({
       where: { warehouseId, OR: referenceToWhereOptions(reference, 'orderNumber') },
     });
     if (!order) {
@@ -773,7 +817,7 @@ interface WaveTransactionClient {
   pickWaveOrder: { update(args: Record<string, unknown>): Promise<unknown>; updateMany(args: Record<string, unknown>): Promise<unknown> };
   pickWaveTask: { upsert(args: Record<string, unknown>): Promise<{ id: string }> };
   pickCart: { findMany(args: Record<string, unknown>): Promise<PickCartRecord[]>; findFirst(args: Record<string, unknown>): Promise<PickCartRecord | null>; create(args: Record<string, unknown>): Promise<PickCartRecord>; update(args: Record<string, unknown>): Promise<PickCartRecord> };
-  pickTote: { create(args: Record<string, unknown>): Promise<PickToteRecord> };
+  pickTote: { create(args: Record<string, unknown>): Promise<PickToteRecord>; findFirst(args: Record<string, unknown>): Promise<PickToteRecord | null> };
   warehouseTask: { findMany(args: Record<string, unknown>): Promise<WarehouseTaskRecord[]>; create(args: Record<string, unknown>): Promise<WarehouseTaskRecord> };
   reservation: { findMany(args: Record<string, unknown>): Promise<ReservationWithQuant[]> };
   auditLog: { create(args: Record<string, unknown>): Promise<unknown> };

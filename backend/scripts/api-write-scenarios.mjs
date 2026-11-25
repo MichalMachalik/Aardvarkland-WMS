@@ -228,6 +228,68 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.ok(finished.orders.every(item => item.status === 'PICKED'));
   });
 
+  await scenario('pick carts and totes stay with their assigned wave and orders', async () => {
+    const { sku } = await createSku('CART');
+    await own('POST', '/inventory/quants/receive', {
+      skuReference: sku.code, locationReference: 'A-01-01', quantity: 2,
+    });
+    async function plan(code) {
+      const order = await own('POST', '/outbound-orders', {
+        orderNumber: `CART-${code}-${suffix}`, lines: [{ lineNumber: '10', sku: sku.code, orderedQuantity: 1 }],
+      });
+      await own('POST', `/outbound-orders/${order.id}/allocate`, {});
+      const wave = await own('POST', '/pick-waves', {
+        waveNumber: `CART-WAVE-${code}-${suffix}`, outboundOrderReferences: [order.id],
+      });
+      return { order, wave, path: `/pick-waves/${wave.id}` };
+    }
+    const first = await plan('A');
+    const second = await plan('B');
+    const cartBody = { code: `CART-${suffix}` };
+    await asWorker('POST', `${warehouse}/pick-carts`, cartBody, 403);
+    const cart = await own('POST', '/pick-carts', cartBody);
+    assert.equal(cart.status, 'AVAILABLE');
+    const selectCart = { pickCartReference: cart.code };
+    const assigned = await own('POST', `${first.path}/assign-cart`, selectCart);
+    assert.equal(assigned.waveId, first.wave.id);
+    assert.equal(assigned.status, 'ASSIGNED');
+
+    const tote = { code: `TOTE-${suffix}`, ...selectCart, capacityUnits: 60 };
+    await own('POST', '/pick-totes', { ...tote, waveReference: second.wave.id, outboundOrderReference: second.order.id }, 409);
+    await own('POST', '/pick-totes', { ...tote, waveReference: first.wave.id, outboundOrderReference: second.order.id }, 409);
+    const saved = await own('POST', '/pick-totes', { ...tote, outboundOrderReference: first.order.id });
+    assert.equal(saved.pickCartId, cart.id);
+    assert.equal(saved.waveId, first.wave.id);
+    assert.equal(saved.outboundOrderId, first.order.id);
+    assert.equal(saved.capacityUnits, 60);
+    await own('POST', `${second.path}/assign-cart`, selectCart, 409);
+    await own('POST', `${second.path}/release`, selectCart, 409);
+    const currentFirst = await own('GET', first.path);
+    const currentSecond = await own('GET', second.path);
+    assert.deepEqual(currentFirst.totes.map(item => item.id), [saved.id]);
+    assert.deepEqual(currentFirst.carts.map(item => item.id), [cart.id]);
+    assert.equal(currentSecond.status, 'PLANNED');
+    assert.equal(currentSecond.tasks.length, 0);
+    assert.equal((await own('GET', `/outbound-orders/${second.order.id}`)).status, 'ALLOCATED');
+
+    const spare = await own('POST', '/pick-carts', { code: `SPARE-${suffix}` });
+    const staged = await own('POST', '/pick-totes', {
+      code: `STAGED-${suffix}`, pickCartReference: spare.code, waveReference: second.wave.id,
+    });
+    assert.equal(staged.waveId, second.wave.id);
+    await own('POST', `${first.path}/assign-cart`, { pickCartReference: spare.code }, 409);
+    assert.equal((await own('POST', `${second.path}/assign-cart`, { pickCartReference: spare.code })).waveId, second.wave.id);
+
+    await own('POST', `${first.path}/release`, selectCart);
+    const [task] = (await own('GET', `/tasks?type=PICK&sku=${sku.code}`)).filter(item => item.outboundOrderId === first.order.id);
+    await own('POST', `/tasks/${task.id}/confirm-pick`, { orderReference: first.order.id, quantity: task.quantity });
+    await own('POST', `${first.path}/complete`, {});
+    const reused = await own('POST', `${second.path}/assign-cart`, selectCart);
+    assert.equal(reused.waveId, second.wave.id);
+    assert.equal((await own('GET', first.path)).totes[0].waveId, first.wave.id);
+
+  });
+
   await scenario('parcels, tracking, operational exceptions and notifications can be updated', async () => {
     const parcelBody = { trackingNumber: `PARCEL-${suffix}`, currentLocationReference: 'A-01-01' };
     const parcel = await own('POST', '/parcels', parcelBody);
