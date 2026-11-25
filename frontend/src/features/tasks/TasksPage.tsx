@@ -46,6 +46,7 @@ export function TasksPage() {
   const sourceRows = resource.data;
   const [filter, setFilter] = useState('open');
   const [selectedId, setSelectedId] = useState('');
+  const [countEntry, setCountEntry] = useState({ taskId: '', value: '' });
 
   const rows = useMemo(() => {
     if (filter === 'all') return sourceRows;
@@ -53,9 +54,13 @@ export function TasksPage() {
     return sourceRows.filter((task) => task.status !== 'Done');
   }, [filter, sourceRows]);
   const selected = rows.find((task) => task.id === selectedId) ?? rows[0];
-  const canStart = selected && ['OPEN', 'ASSIGNED', 'BLOCKED'].includes(selected.apiStatus ?? '');
+  const isCount = selected?.type === 'Cycle count';
+  const value = selected?.id === countEntry.taskId ? countEntry.value : '';
+  const counted = /^\d+$/.test(value) && Number(value) <= 2_147_483_647 ? Number(value) : undefined;
+  const canStart = selected && !selected.linkedCountPlan && ['OPEN', 'ASSIGNED', 'BLOCKED'].includes(selected.apiStatus ?? '');
   const canConfirm = selected?.apiStatus === 'IN_PROGRESS'
-    && (selected.type !== 'Replenishment' || can('replenishment.manage'));
+    && (selected.type !== 'Replenishment' || can('replenishment.manage'))
+    && (!isCount || (!selected.linkedCountPlan && counted !== undefined));
 
   const columns: Column<WarehouseTask>[] = [
     { key: 'select', label: '', render: (row) => <input type="radio" name="task" data-e2e-row="task" data-e2e-value={row.id} checked={selected?.id === row.id} onChange={() => setSelectedId(row.id)} /> },
@@ -79,11 +84,11 @@ export function TasksPage() {
     refreshOnSuccess(result);
   });
   const startSelected = () => selected && void mutation.run(text.actions.start, () => startWarehouseTask(warehouseId, selected.id)).then(refreshOnSuccess);
-  const confirmSelected = () => selected && void mutation.run(text.actions.confirm, () => {
+  const confirmSelected = () => selected && canConfirm && void mutation.run(text.actions.confirm, () => {
     if (selected.type === 'Putaway') return confirmPutawayTask(warehouseId, selected.id, {});
     if (selected.type === 'Replenishment') return confirmReplenishmentTask(warehouseId, selected.id);
     if (selected.type === 'Pick') return confirmPickTask(warehouseId, selected.id, {});
-    return confirmWarehouseTask(warehouseId, selected.id);
+    return confirmWarehouseTask(warehouseId, selected.id, isCount ? { quantity: counted } : undefined);
   }).then(refreshOnSuccess);
 
   return (
@@ -106,6 +111,12 @@ export function TasksPage() {
         <div className="action-panel">
           <Button tone="primary" data-e2e-action="task-claim-next" disabled={mutation.status === 'running'} onClick={claimNext}>{text.buttons.claim}</Button>
           <Button tone="secondary" data-e2e-action="task-start-selected" disabled={!canStart || mutation.status === 'running'} onClick={startSelected}>{text.buttons.start}</Button>
+          {isCount && selected.linkedCountPlan && <a href="#/rf">{text.scanner}</a>}
+          {isCount && !selected.linkedCountPlan && selected.apiStatus === 'IN_PROGRESS' && (
+            <label>{text.countedQuantity}
+              <input inputMode="numeric" value={value} onChange={event => setCountEntry({ taskId: selected.id, value: event.target.value })} />
+            </label>
+          )}
           <Button tone="secondary" data-e2e-action="task-confirm-selected" disabled={!canConfirm || mutation.status === 'running'} onClick={confirmSelected}>{text.buttons.confirm}</Button>
           <ActionStatus mutation={mutation} />
         </div>
@@ -119,6 +130,8 @@ const czech = {
   tableTitle: 'Úkoly',
   tableEyebrow: 'živá fronta práce',
   controlTitle: 'Vybraný úkol',
+  countedQuantity: 'Spočítané množství',
+  scanner: 'Skener',
   controlEyebrow: 'převzít · spustit · potvrdit',
   queueTitle: 'Fronta pro skener',
   queueEyebrow: 'úkoly pro pracovní tok',
@@ -137,6 +150,8 @@ const english = {
   tableTitle: 'Tasks',
   tableEyebrow: 'live work queue',
   controlTitle: 'Selected task',
+  countedQuantity: 'Counted quantity',
+  scanner: 'Scanner',
   controlEyebrow: 'claim · start · confirm',
   queueTitle: 'Scanner queue',
   queueEyebrow: 'workflow tasks',
@@ -155,6 +170,8 @@ const ukrainian = {
   tableTitle: 'Завдання',
   tableEyebrow: 'жива черга роботи',
   controlTitle: 'Вибране завдання',
+  countedQuantity: 'Підрахована кількість',
+  scanner: 'Сканер',
   controlEyebrow: 'прийняти · почати · підтвердити',
   queueTitle: 'Черга для сканера',
   queueEyebrow: 'завдання для процесу',

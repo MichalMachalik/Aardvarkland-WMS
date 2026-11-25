@@ -293,6 +293,7 @@ export class WarehouseTasksService {
       const task = await this.lockTaskForTransition(
         db, warehouse.id, taskReference, WarehouseTaskStatus.IN_PROGRESS,
       );
+      await this.assertStandaloneCount(db, warehouse.id, task);
 
       const assignedUserId = body.assignedUserReference
         ? (await this.resolveUser(body.assignedUserReference, db)).id
@@ -337,6 +338,12 @@ export class WarehouseTasksService {
       }
       if (task.type === WarehouseTaskType.REPLENISH) {
         throw new ConflictException('Use replenishment confirmation to complete this task and move stock');
+      }
+      if (task.type === WarehouseTaskType.COUNT) {
+        await this.assertStandaloneCount(db, warehouse.id, task);
+        if (typeof body.quantity !== 'number') {
+          throw new ConflictException('A counted quantity is required to complete a count task');
+        }
       }
       assertValidTaskQuantity(task.type, body.quantity);
 
@@ -616,6 +623,17 @@ export class WarehouseTasksService {
         `Cannot transition warehouse task from ${currentStatus} to ${nextStatus}`,
       );
     }
+  }
+
+  private async assertStandaloneCount(
+    db: WarehouseTaskPrismaClient, warehouseId: string, task: WarehouseTaskRecord,
+  ): Promise<void> {
+    if (task.type !== WarehouseTaskType.COUNT) return;
+    const linked = await (db as unknown as Prisma.TransactionClient).cycleCountTask.findFirst({
+      where: { warehouseId, warehouseTaskId: task.id },
+      select: { id: true },
+    });
+    if (linked) throw new ConflictException('Use the inventory plan or RF scanner for this count task');
   }
 
   private async writeAuditWithClient(

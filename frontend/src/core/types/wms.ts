@@ -50,6 +50,7 @@ export interface WarehouseTask {
   to: string;
   status: 'Open' | 'Claimed' | 'In progress' | 'Exception' | 'Done';
   apiStatus?: string;
+  linkedCountPlan?: boolean;
   priority: number;
   quantity: number;
   sku: string;

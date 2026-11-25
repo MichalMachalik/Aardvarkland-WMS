@@ -196,6 +196,7 @@ export function mapWarehouseTasks(payload: unknown): WarehouseTask[] {
       to: stringValue(nested(row, 'toLocation').code ?? row.toLocationId, '—'),
       status: statusTask(row.status),
       apiStatus: stringValue(row.status, ''),
+      linkedCountPlan: typeof record(row.metadata).cycleCountPlanId === 'string',
       priority: numberValue(row.priority ?? record(row.metadata).priority, 0),
       quantity: numberValue(row.quantity, 1),
       sku: stringValue(nested(row, 'sku').code ?? row.sku ?? row.skuCode ?? row.skuId, '—'),

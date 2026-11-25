@@ -659,6 +659,37 @@ test('the tasks page moves the planned stock to its destination', async ({ page 
   expect(destination[0]).toMatchObject({ quantity: 2, batch: 'UI-MOVE' });
 });
 
+test('the tasks page records an explicit zero when confirming a count order', async ({ page }) => {
+  test.skip(process.env.WMS_LIVE_UI_WRITE !== 'true', 'Requires a disposable warehouse database.');
+  const { accessToken: admin } = await liveApi(page, '/api/auth/login', {
+    data: { email: roles.system.email, password: roles.system.password },
+  });
+  const own = (path, data) => liveApi(page, '/api/warehouses/MAIN' + path, { token: admin, data });
+  const order = await own('/warehouse-orders', {
+    orderType: 'COUNT', orderNumber: `UI-COUNT-${randomUUID().slice(0, 8)}`,
+    fromLocationReference: 'A-01-01', lines: [{ lineNumber: '1', requestedQuantity: 5 }],
+  });
+  const orderPath = `/warehouse-orders/${order.id}`;
+  const released = await own(orderPath + '/release', {});
+  const taskId = released.taskLinks[0].warehouseTaskId;
+  await login(page, roles.worker);
+  await desktopNav(page).getByRole('button', { name: 'Úkoly', exact: true }).click();
+  await page.locator(`[data-e2e-row="task"][data-e2e-value="${taskId}"]`).check();
+  await page.locator('[data-e2e-action="task-start-selected"]').click();
+  const count = page.getByLabel('Spočítané množství');
+  const confirm = page.locator('[data-e2e-action="task-confirm-selected"]');
+  await expect(count).toBeVisible();
+  await expect(count).toHaveValue('');
+  await expect(confirm).toBeDisabled();
+  await count.fill('-1');
+  await expect(confirm).toBeDisabled();
+  await count.fill('0');
+  await confirm.click();
+  await expect.poll(() => own(`/tasks/${taskId}`)).toMatchObject({ status: 'DONE', quantity: 0 });
+  const closed = await own(orderPath + '/complete', {});
+  expect(closed.lines[0].completedQuantity).toBe(0);
+});
+
 // The service worker can handle these requests before Playwright intercepts them.
 const interceptedTest = test.extend({ serviceWorkers: 'block' });
 interceptedTest('the RF browser uploads stored scans in order and keeps every unconfirmed scan after an interrupted batch', async ({ page }) => {

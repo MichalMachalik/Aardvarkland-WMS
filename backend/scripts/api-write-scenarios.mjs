@@ -246,6 +246,7 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.deepEqual(await Promise.all(linked.map(id => own('GET', `/tasks/${id}`).then(task => task.status))), ['OPEN', 'OPEN']);
     for (const [index, id] of linked.entries()) {
       await work('POST', `/tasks/${id}/start`, {});
+      await work('POST', `/tasks/${id}/confirm`, {}, 409);
       await work('POST', `/tasks/${id}/confirm`, { quantity: index === 0 ? 0 : 3 });
       if (index === 0) await work('POST', path + '/complete', {}, 409);
     }
@@ -1095,7 +1096,9 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     const plan = await own('POST', '/cycle-counts', { code: `OFFLINE-COUNT-${suffix}`, scopeType: 'SKU', scopeReference: countedSku.code });
     await own('POST', `/cycle-counts/${plan.id}/release`, {});
     const [countTask] = await own('GET', `/cycle-counts/${plan.id}/tasks`);
+    await own('POST', `/tasks/${countTask.warehouseTaskId}/start`, {}, 409);
     let count = await asWorker('POST', `${warehouse}/rf/tasks/${countTask.warehouseTaskId}/start`, {});
+    await own('POST', `/tasks/${countTask.warehouseTaskId}/confirm`, { quantity: 0 }, 409);
     assert.equal(count.remainingSteps[0].key, count.step.key);
     assert.equal(count.remainingSteps.find(item => item.expected.type === 'QUANTITY').expected.value, null);
     const countPath = `/rf/sessions/${count.sessionId}`;
