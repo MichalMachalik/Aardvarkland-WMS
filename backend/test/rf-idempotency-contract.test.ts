@@ -38,5 +38,4 @@ test('operations-runtime RF service currently deduplicates offlineId only, not D
   const source = readFileSync(join(cwd(), 'src', 'operations-runtime', 'operations-runtime.service.ts'), 'utf8');
   assert.doesNotMatch(source, /dto\.idempotencyKey/);
   assert.match(source, /dto\.offlineId/);
-  assert.match(source, /result:\s*RuntimeRfResult\.DUPLICATE/);
 });

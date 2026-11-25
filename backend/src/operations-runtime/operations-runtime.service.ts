@@ -1,6 +1,8 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { isUUID } from 'class-validator';
 
-import { PrismaService } from '../database';
+import { PrismaService, withTransactionRetry } from '../database';
+import type { Prisma } from '../generated/prisma/client';
 import {
   RuntimeConnector,
   RuntimeIntegrationCommandCenter,
@@ -57,6 +59,15 @@ interface RfScanRow {
   metadata: unknown;
   created_at: Date | string;
 }
+
+interface RfScanOutcome {
+  result: RuntimeRfResult;
+  accepted: boolean;
+  instruction: string;
+  event: RuntimeRfScanEvent;
+}
+
+const mismatchInstruction = 'Scan mismatch. Show exception choices: retry scan, short-pick, supervisor override.';
 
 interface RfExceptionRow {
   id: string;
@@ -167,7 +178,7 @@ export class OperationsRuntimeService {
         queued,
         replayable: queued + recentScans.filter((scan) => scan.result === RuntimeRfResult.MISMATCH).length,
         duplicateProtected: true,
-        policy: 'One idempotency key per device + offline action. Duplicates are accepted as DUPLICATE, not applied twice.',
+        policy: 'An offline scan is stored once per device and action ID. Repeat submissions retain the original outcome.',
       },
     };
   }
@@ -191,78 +202,90 @@ export class OperationsRuntimeService {
     return toRfSession(required(rows, 'RF session was not created'));
   }
 
-  async submitRfScan(warehouseId: string, dto: RuntimeRfScanDto): Promise<{
-    result: RuntimeRfResult;
-    accepted: boolean;
-    instruction: string;
-    event: RuntimeRfScanEvent;
-  }> {
+  async submitRfScan(warehouseId: string, dto: RuntimeRfScanDto): Promise<RfScanOutcome> {
     await this.ensureTables();
-    const duplicate = dto.offlineId
-      ? await this.query<RfScanRow>(
-          `SELECT * FROM ops_rf_scan_events WHERE warehouse_id = $1 AND device_code = $2 AND offline_id = $3 LIMIT 1`,
-          warehouseId,
-          dto.deviceCode.trim(),
-          dto.offlineId.trim(),
-        )
-      : [];
+    return withTransactionRetry(() => this.prisma.$transaction(tx => this.storeRfScan(tx, warehouseId, dto)));
+  }
 
-    if (duplicate[0]) {
-      return {
-        result: RuntimeRfResult.DUPLICATE,
-        accepted: true,
-        instruction: 'Duplicate offline scan ignored safely. Continue scanning.',
-        event: toRfScanEvent(duplicate[0]),
-      };
-    }
-
+  private async storeRfScan(tx: Prisma.TransactionClient, warehouseId: string, dto: RuntimeRfScanDto): Promise<RfScanOutcome> {
+    const deviceCode = dto.deviceCode.trim();
+    const sessionId = await this.lockRfSession(tx, warehouseId, deviceCode, dto.sessionId);
+    const taskReference = dto.taskReference || null;
+    const stepKey = dto.stepKey.trim();
+    const scannedValue = dto.scannedValue.trim();
+    const expectedValue = dto.expectedValue || null;
+    const offlineId = dto.offlineId || null;
+    const quantity = dto.quantity ?? null;
     const result = isExpected(dto.scannedValue, dto.expectedValue)
       ? RuntimeRfResult.ACCEPTED
       : RuntimeRfResult.MISMATCH;
 
-    const rows = await this.query<RfScanRow>(
+    const rows = await tx.$queryRawUnsafe<RfScanRow[]>(
       `INSERT INTO ops_rf_scan_events
         (warehouse_id, session_id, device_code, task_reference, step_key, scanned_value, expected_value, result, offline_id, quantity, metadata)
-       VALUES ($1, NULLIF($2, '')::uuid, $3, NULLIF($4, ''), $5, $6, NULLIF($7, ''), $8, NULLIF($9, ''), $10, $11::jsonb)
+       VALUES ($1, $2::uuid, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
+       ON CONFLICT (warehouse_id, device_code, offline_id) WHERE offline_id IS NOT NULL DO NOTHING
        RETURNING *`,
       warehouseId,
-      dto.sessionId ?? '',
-      dto.deviceCode.trim(),
-      dto.taskReference ?? '',
-      dto.stepKey.trim(),
-      dto.scannedValue.trim(),
-      dto.expectedValue ?? '',
+      sessionId,
+      deviceCode,
+      taskReference,
+      stepKey,
+      scannedValue,
+      expectedValue,
       result,
-      dto.offlineId ?? '',
-      dto.quantity ?? null,
+      offlineId,
+      quantity,
       json(dto.metadata),
     );
-    const event = toRfScanEvent(required(rows, 'RF scan was not stored'));
 
-    if (dto.sessionId) {
-      await this.exec(
+    const stored = rows[0];
+    if (!stored) {
+      const existing = required(await tx.$queryRawUnsafe<RfScanRow[]>(
+        `SELECT * FROM ops_rf_scan_events WHERE warehouse_id = $1 AND device_code = $2 AND offline_id = $3`,
+        warehouseId, deviceCode, offlineId,
+      ), 'Offline scan was not found');
+      if (existing.session_id !== sessionId || existing.task_reference !== taskReference
+        || existing.step_key !== stepKey || existing.scanned_value !== scannedValue
+        || existing.expected_value !== expectedValue || existing.quantity !== quantity) {
+        throw new ConflictException('This offline scan ID belongs to a different scan.');
+      }
+      const accepted = existing.result === RuntimeRfResult.ACCEPTED;
+      return {
+        result: accepted ? RuntimeRfResult.DUPLICATE : existing.result,
+        accepted,
+        instruction: accepted ? 'This offline scan has already been recorded.' : mismatchInstruction,
+        event: toRfScanEvent(existing),
+      };
+    }
+
+    const event = toRfScanEvent(stored);
+    if (sessionId) {
+      await tx.$executeRawUnsafe(
         `UPDATE ops_rf_sessions
-         SET last_seen_at = now(), current_step = $3, last_error = $4
+         SET last_seen_at = now(),
+             current_step = CASE WHEN state <> 'BLOCKED' AND current_step = $3 AND $4::text IS NULL THEN $5 ELSE current_step END,
+             last_error = CASE WHEN state = 'BLOCKED' THEN last_error ELSE $4 END
          WHERE warehouse_id = $1 AND id = $2::uuid`,
         warehouseId,
-        dto.sessionId,
-        nextRfStep(dto.stepKey, result),
+        sessionId,
+        stepKey,
         result === RuntimeRfResult.MISMATCH ? 'SCAN_MISMATCH' : null,
+        nextRfStep(stepKey, result),
       );
     }
 
     if (result === RuntimeRfResult.MISMATCH) {
-      await this.query<RfExceptionRow>(
+      await tx.$executeRawUnsafe(
         `INSERT INTO ops_rf_exceptions
           (warehouse_id, session_id, device_code, task_reference, code, title, status, severity, metadata)
-         VALUES ($1, NULLIF($2, '')::uuid, $3, NULLIF($4, ''), 'SCAN_MISMATCH', $5, 'OPEN', 'HIGH', $6::jsonb)
-         RETURNING *`,
+         VALUES ($1, $2::uuid, $3, $4, 'SCAN_MISMATCH', $5, 'OPEN', 'HIGH', $6::jsonb)`,
         warehouseId,
-        dto.sessionId ?? '',
-        dto.deviceCode.trim(),
-        dto.taskReference ?? '',
-        `Expected ${dto.expectedValue ?? 'configured value'}, scanned ${dto.scannedValue}`,
-        json({ scanEventId: event.id, stepKey: dto.stepKey }),
+        sessionId,
+        deviceCode,
+        taskReference,
+        `Expected ${expectedValue ?? 'configured value'}, scanned ${scannedValue}`,
+        json({ scanEventId: event.id, stepKey }),
       );
     }
 
@@ -271,8 +294,8 @@ export class OperationsRuntimeService {
       accepted: result === RuntimeRfResult.ACCEPTED,
       instruction:
         result === RuntimeRfResult.ACCEPTED
-          ? `${nextRfStep(dto.stepKey, result)} ready. Continue.`
-          : 'Scan mismatch. Show exception choices: retry scan, short-pick, supervisor override.',
+          ? `${nextRfStep(stepKey, result)} ready. Continue.`
+          : mismatchInstruction,
       event,
     };
   }
@@ -286,31 +309,20 @@ export class OperationsRuntimeService {
     results: Array<{ offlineId: string | null; result: RuntimeRfResult }>;
   }> {
     await this.ensureTables();
-    let accepted = 0;
-    let duplicates = 0;
-    let rejected = 0;
-    const results: Array<{ offlineId: string | null; result: RuntimeRfResult }> = [];
-
-    for (const action of dto.actions) {
-      const result = await this.submitRfScan(warehouseId, {
-        ...action,
-        deviceCode: action.deviceCode || dto.deviceCode,
-      });
-      if (result.result === RuntimeRfResult.ACCEPTED) accepted += 1;
-      else if (result.result === RuntimeRfResult.DUPLICATE) duplicates += 1;
-      else rejected += 1;
-      results.push({ offlineId: action.offlineId ?? null, result: result.result });
-    }
-
-    await this.exec(
-      `UPDATE ops_rf_sessions
-       SET offline_queue = '[]'::jsonb, last_seen_at = now(), last_error = NULL
-       WHERE warehouse_id = $1 AND device_code = $2 AND state IN ('ACTIVE', 'OFFLINE', 'BLOCKED')`,
-      warehouseId,
-      dto.deviceCode.trim(),
-    );
-
-    return { warehouseId, deviceCode: dto.deviceCode, accepted, duplicates, rejected, results };
+    return withTransactionRetry(() => this.prisma.$transaction(async tx => {
+      let accepted = 0;
+      let duplicates = 0;
+      let rejected = 0;
+      const results: Array<{ offlineId: string | null; result: RuntimeRfResult }> = [];
+      for (const action of dto.actions) {
+        const outcome = await this.storeRfScan(tx, warehouseId, { ...action, deviceCode: action.deviceCode || dto.deviceCode });
+        if (outcome.result === RuntimeRfResult.ACCEPTED) accepted += 1;
+        else if (outcome.result === RuntimeRfResult.DUPLICATE) duplicates += 1;
+        else rejected += 1;
+        results.push({ offlineId: outcome.event.offlineId, result: outcome.result });
+      }
+      return { warehouseId, deviceCode: dto.deviceCode, accepted, duplicates, rejected, results };
+    }));
   }
 
   async reportRfException(
@@ -318,37 +330,51 @@ export class OperationsRuntimeService {
     dto: RuntimeRfExceptionDto,
   ): Promise<RuntimeRfException> {
     await this.ensureTables();
-    const rows = await this.query<RfExceptionRow>(
-      `INSERT INTO ops_rf_exceptions
-        (warehouse_id, session_id, device_code, task_reference, code, title, status, severity, metadata)
-       VALUES ($1, NULLIF($2, '')::uuid, $3, NULLIF($4, ''), $5, $6, 'OPEN', $7, $8::jsonb)
-       RETURNING *`,
-      warehouseId,
-      dto.sessionId ?? '',
-      dto.deviceCode.trim(),
-      dto.taskReference ?? '',
-      dto.code.trim().toUpperCase(),
-      dto.title?.trim() || defaultExceptionTitle(dto.code),
-      dto.severity?.trim().toUpperCase() || 'MEDIUM',
-      json({
-        releaseReservation: dto.releaseReservation ?? false,
-        supervisorPinPresent: Boolean(dto.supervisorPin),
-        metadata: dto.metadata ?? null,
-      }),
-    );
-
-    if (dto.sessionId) {
-      await this.exec(
-        `UPDATE ops_rf_sessions
-         SET state = 'BLOCKED', last_error = $3, last_seen_at = now()
-         WHERE warehouse_id = $1 AND id = $2::uuid`,
+    return withTransactionRetry(() => this.prisma.$transaction(async tx => {
+      const deviceCode = dto.deviceCode.trim();
+      const sessionId = await this.lockRfSession(tx, warehouseId, deviceCode, dto.sessionId);
+      const code = dto.code.trim().toUpperCase();
+      const rows = await tx.$queryRawUnsafe<RfExceptionRow[]>(
+        `INSERT INTO ops_rf_exceptions
+          (warehouse_id, session_id, device_code, task_reference, code, title, status, severity, metadata)
+         VALUES ($1, $2::uuid, $3, NULLIF($4, ''), $5, $6, 'OPEN', $7, $8::jsonb)
+         RETURNING *`,
         warehouseId,
-        dto.sessionId,
-        dto.code.trim().toUpperCase(),
+        sessionId,
+        deviceCode,
+        dto.taskReference ?? '',
+        code,
+        dto.title?.trim() || defaultExceptionTitle(code),
+        dto.severity?.trim().toUpperCase() || 'MEDIUM',
+        json({
+          releaseReservation: dto.releaseReservation ?? false,
+          supervisorPinPresent: Boolean(dto.supervisorPin),
+          metadata: dto.metadata ?? null,
+        }),
       );
-    }
 
-    return toRfException(required(rows, 'RF exception was not stored'));
+      if (sessionId) {
+        await tx.$executeRawUnsafe(
+          `UPDATE ops_rf_sessions
+           SET state = 'BLOCKED', last_error = $3, last_seen_at = now()
+           WHERE warehouse_id = $1 AND id = $2::uuid`,
+          warehouseId, sessionId, code,
+        );
+      }
+      return toRfException(required(rows, 'RF exception was not stored'));
+    }));
+  }
+
+  private async lockRfSession(
+    tx: Prisma.TransactionClient, warehouseId: string, deviceCode: string, sessionId?: string,
+  ): Promise<string | null> {
+    if (!sessionId) return null;
+    if (!isUUID(sessionId)) throw new BadRequestException('RF session ID must be a UUID.');
+    const sessions = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+      `SELECT id FROM ops_rf_sessions WHERE warehouse_id = $1 AND device_code = $2 AND id = $3::uuid FOR UPDATE`,
+      warehouseId, deviceCode, sessionId,
+    );
+    return required(sessions, 'RF session was not found for this device').id;
   }
 
   async getIntegrationCommandCenter(warehouseId: string): Promise<RuntimeIntegrationCommandCenter> {

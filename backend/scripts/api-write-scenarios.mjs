@@ -483,6 +483,60 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.ok(picking.tasks.every(task => task.workflow === 'PICK'));
   });
 
+  await scenario('RF replay preserves mismatches and stores each offline scan once', async () => {
+    const runtime = '/operations-runtime';
+    const scanPath = `${runtime}/rf/scans`;
+    const replayPath = `${runtime}/rf/offline-queue/replay`;
+    const exceptionPath = `${runtime}/rf/exceptions`;
+    const deviceCode = `RF-${suffix}`;
+    const session = await own('POST', `${runtime}/rf/sessions`, { deviceCode, workerCode: 'TEST-WORKER' });
+    const location = {
+      sessionId: session.id, deviceCode, stepKey: 'SCAN_LOCATION',
+      scannedValue: 'A-01-01', expectedValue: 'A-01-01',
+    };
+    const wrong = { ...location, scannedValue: 'B-00-00', offlineId: `WRONG-${suffix}` };
+    const failed = await own('POST', scanPath, wrong);
+    assert.equal(failed.result, 'MISMATCH');
+    assert.equal(failed.accepted, false);
+    const replayed = await own('POST', replayPath, { deviceCode, actions: [wrong] });
+    assert.deepEqual([replayed.accepted, replayed.duplicates, replayed.rejected], [0, 0, 1]);
+    assert.equal(replayed.results[0].result, 'MISMATCH');
+    assert.equal((await own('POST', scanPath, wrong)).event.id, failed.event.id);
+    let dashboard = await own('GET', `${runtime}/rf-console`);
+    assert.equal(dashboard.activeSessions.find(item => item.id === session.id).lastError, 'SCAN_MISMATCH');
+    assert.equal(dashboard.exceptionQueue.filter(item => item.sessionId === session.id && item.code === 'SCAN_MISMATCH').length, 1);
+
+    const accepted = { ...location, offlineId: ` ACCEPT-${suffix} ` };
+    const attempts = await Promise.all(Array.from({ length: 6 }, () => own('POST', scanPath, accepted)));
+    assert.equal(attempts.filter(item => item.result === 'ACCEPTED').length, 1);
+    assert.equal(attempts.filter(item => item.result === 'DUPLICATE' && item.accepted).length, 5);
+    assert.equal(new Set(attempts.map(item => item.event.id)).size, 1);
+    const detached = { ...accepted, sessionId: undefined, offlineId: `NO-SESSION-${suffix}` };
+    const parallel = await Promise.all(Array.from({ length: 6 }, () => own('POST', scanPath, detached)));
+    assert.equal(parallel.filter(item => item.result === 'ACCEPTED').length, 1);
+    assert.equal(new Set(parallel.map(item => item.event.id)).size, 1);
+    await own('POST', scanPath, { ...accepted, scannedValue: 'B-00-00' }, 409);
+    await own('POST', scanPath, { ...location, deviceCode: 'OTHER-DEVICE' }, 404);
+    await own('POST', scanPath, { ...location, sessionId: 'not-a-uuid' }, 400);
+    await own('POST', exceptionPath, { sessionId: session.id, deviceCode: 'OTHER-DEVICE', code: 'SHORT_PICK' }, 404);
+
+    const sku = { ...location, stepKey: 'SCAN_SKU', scannedValue: 'TEST-SKU', expectedValue: 'TEST-SKU' };
+    await own('POST', replayPath, {
+      deviceCode, actions: [sku, { ...sku, sessionId: randomUUID() }],
+    }, 404);
+    dashboard = await own('GET', `${runtime}/rf-console`);
+    assert.equal(dashboard.activeSessions.find(item => item.id === session.id).currentStep, 'SCAN_SKU');
+    assert.equal(dashboard.recentScans.filter(item => item.sessionId === session.id).length, 2);
+
+    const recorded = await own('POST', exceptionPath, { sessionId: session.id, deviceCode, code: 'SHORT_PICK' });
+    assert.equal(recorded.sessionId, session.id);
+    const repeats = await own('POST', replayPath, { deviceCode, actions: [wrong, accepted] });
+    assert.deepEqual([repeats.accepted, repeats.duplicates, repeats.rejected], [0, 1, 1]);
+    dashboard = await own('GET', `${runtime}/rf-console`);
+    assert.equal(dashboard.activeSessions.find(item => item.id === session.id).state, 'BLOCKED');
+    assert.equal(dashboard.activeSessions.find(item => item.id === session.id).lastError, 'SHORT_PICK');
+  });
+
   await scenario('fake print agents claim, finish and replay a job without touching hardware', async () => {
     const printerCode = `TEST-PRINTER-${suffix}`;
     const agentCode = `TEST-AGENT-${suffix}`;
