@@ -45,6 +45,7 @@ export function AccountMenu({ onLogout }: AccountMenuProps) {
   const [loading, setLoading] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
   const text = pickLanguage(language, accountCopy);
+  const mfaAvailable = config.showMfaSettings && mfaStatus !== null && mfaStatus.available !== false;
 
   const displayName = currentUser?.displayName || currentUser?.email || text.account;
   const contextWarehouses = workContext?.availableWarehouses.length
@@ -70,6 +71,16 @@ export function AccountMenu({ onLogout }: AccountMenuProps) {
       scannerDeviceReference: workContext.scannerDeviceReference ?? '',
     });
   }, [contextOpen, workContext]);
+
+  useEffect(() => {
+    if (!open || !config.showMfaSettings) return;
+    let active = true;
+    void getMfaStatus().then(
+      (status) => { if (active) setMfaStatus(status); },
+      () => { if (active) setMfaStatus(null); },
+    );
+    return () => { active = false; };
+  }, [open]);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -144,27 +155,24 @@ export function AccountMenu({ onLogout }: AccountMenuProps) {
     }
   };
 
-  const loadMfaStatus = async () => {
-    setMfaLoading(true);
-    try {
-      setMfaStatus(await getMfaStatus());
-    } catch {
-      setError(text.mfaStatusFailed);
-    } finally {
-      setMfaLoading(false);
-    }
-  };
-
-  const openMfaMenu = async () => {
+  const openMfaMenu = () => {
     setError(null);
     setMessage(null);
     setChangingPassword(false);
     setContextOpen(false);
     setMfaOpen(true);
-    setMfaStatus(null);
     setMfaSetup(null);
     setMfaCode('');
-    await loadMfaStatus();
+  };
+
+  const toggleAccountPanel = () => {
+    if (open) {
+      setMfaOpen(false);
+      setMfaSetup(null);
+      setMfaCode('');
+    }
+    setMfaStatus(null);
+    setOpen(!open);
   };
 
   const beginMfaSetup = async () => {
@@ -252,7 +260,7 @@ export function AccountMenu({ onLogout }: AccountMenuProps) {
               <button className="account-panel__action" type="button" onClick={openPasswordForm}>
                 {text.changePassword}
               </button>
-              {config.showMfaSettings && (
+              {mfaAvailable && (
                 <div className="account-mfa-entry">
                   <button className="account-panel__action account-panel__action--label" type="button" onClick={openMfaMenu}>
                     {text.mfaLongName}
@@ -331,11 +339,11 @@ export function AccountMenu({ onLogout }: AccountMenuProps) {
             </form>
           )}
 
-          {mfaOpen && (
+          {mfaOpen && mfaAvailable && (
             <section className="account-mfa-panel" aria-label={text.mfaLongName}>
               <div className="account-panel__header">
                 <strong>{text.mfaLongName}</strong>
-                <span>{mfaLoading && !mfaStatus ? text.loading : mfaStatus?.enabled ? text.mfaEnabledStatus : text.mfaDisabledStatus}</span>
+                <span>{mfaStatus?.enabled ? text.mfaEnabledStatus : text.mfaDisabledStatus}</span>
               </div>
 
               {mfaStatus && !mfaStatus.enabled && !mfaSetup && (
@@ -408,7 +416,7 @@ export function AccountMenu({ onLogout }: AccountMenuProps) {
           <button
             className="account-button__icon account-button__gear"
             type="button"
-            onClick={() => setOpen((value) => !value)}
+            onClick={toggleAccountPanel}
             aria-label={text.settings}
             aria-expanded={open}
           >
@@ -468,7 +476,6 @@ const accountCopy = {
     mfaCode: 'Ověřovací kód',
     mfaEnabledStatus: 'MFA je zapnuté.',
     mfaDisabledStatus: 'MFA není zapnuté.',
-    mfaStatusFailed: 'Stav MFA se nepodařilo načíst.',
     mfaSetupFailed: 'MFA nastavení se nepodařilo vytvořit.',
     mfaVerifyFailed: 'MFA kód se nepodařilo ověřit.',
     mfaDisableFailed: 'MFA se nepodařilo vypnout.',
@@ -515,7 +522,6 @@ const accountCopy = {
     mfaCode: 'Verification code',
     mfaEnabledStatus: 'MFA is enabled.',
     mfaDisabledStatus: 'MFA is not enabled.',
-    mfaStatusFailed: 'MFA status could not be loaded.',
     mfaSetupFailed: 'MFA setup could not be created.',
     mfaVerifyFailed: 'The MFA code could not be verified.',
     mfaDisableFailed: 'MFA could not be disabled.',
@@ -562,7 +568,6 @@ const accountCopy = {
     mfaCode: 'Код перевірки',
     mfaEnabledStatus: 'MFA увімкнено.',
     mfaDisabledStatus: 'MFA не увімкнено.',
-    mfaStatusFailed: 'Не вдалося завантажити стан MFA.',
     mfaSetupFailed: 'Не вдалося створити налаштування MFA.',
     mfaVerifyFailed: 'Не вдалося перевірити код MFA.',
     mfaDisableFailed: 'Не вдалося вимкнути MFA.',

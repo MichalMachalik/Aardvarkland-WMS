@@ -78,3 +78,43 @@ test('an account awaiting MFA setup can sign in to try WMS with a password', asy
   await expect(account.getByRole('button', { name: 'Change password', exact: true })).toBeVisible();
   await expect(account.getByRole('button', { name: 'Multi-factor authentication (MFA)', exact: true })).toHaveCount(0);
 });
+
+test('account settings offer authenticator setup only when the backend supports it', async ({ page }) => {
+  let available = false;
+  await page.addInitScript(() => localStorage.setItem('aardvarkland-ui-language', 'en'));
+  await page.route('**/config.js', route => route.fulfill({
+    contentType: 'text/javascript',
+    body: 'window.__AARDVARKLAND_STORAGE_SYSTEM_CONFIG__ = { apiBaseUrl: "/api", showMfaSettings: true };',
+  }));
+  await page.route(requestUrl => requestUrl.pathname.startsWith('/api/'), route => {
+    const { pathname } = new URL(route.request().url());
+    if (pathname === '/api/auth/login') {
+      return route.fulfill({ status: 201, json: { accessToken: 'account-fixture' } });
+    }
+    if (pathname === '/api/auth/me/mfa') {
+      return route.fulfill({ json: { available, enabled: false, verifiedAt: null } });
+    }
+    return route.fulfill({ status: 503, json: { message: 'Unavailable in this test' } });
+  });
+
+  await page.goto(url);
+  await page.locator('input[autocomplete="username"]').fill('warehouse.admin');
+  await page.locator('input[autocomplete="current-password"]').fill('Demo-test-only-42!');
+  await page.locator('.login-form button[type="submit"]').click();
+  const account = page.locator('.account-menu');
+  const settings = account.getByRole('button', { name: 'Settings', exact: true });
+  const authenticator = account.getByRole('button', { name: 'Multi-factor authentication (MFA)', exact: true });
+
+  const disabledResponse = page.waitForResponse(response => new URL(response.url()).pathname === '/api/auth/me/mfa');
+  await settings.click();
+  expect((await (await disabledResponse).json()).available).toBe(false);
+  await expect(account.getByRole('button', { name: 'Change password', exact: true })).toBeVisible();
+  await expect(authenticator).toHaveCount(0);
+  await settings.click();
+
+  available = true;
+  await settings.click();
+  await expect(authenticator).toBeVisible();
+  await authenticator.click();
+  await expect(account.getByRole('region', { name: 'Multi-factor authentication (MFA)', exact: true })).toBeVisible();
+});

@@ -329,9 +329,10 @@ export class AuthService {
     return { revoked: true, scope };
   }
 
-  async getMfaStatus(user: AuthenticatedUser): Promise<MfaStatusResponse> {
-    const row = this.isMfaEnabled() ? await this.findActiveMfaSecret(user.id) : null;
-    return { enabled: Boolean(row), verifiedAt: row?.verified_at ? toDate(row.verified_at) : null };
+  async getMfaStatus(user: AuthenticatedUser): Promise<MfaStatusResponse & { available: boolean }> {
+    const available = this.isMfaEnabled();
+    const row = available ? await this.findActiveMfaSecret(user.id) : null;
+    return { available, enabled: Boolean(row), verifiedAt: row?.verified_at ? toDate(row.verified_at) : null };
   }
 
   async getWorkContext(user: AuthenticatedUser): Promise<WorkContextResponse> {

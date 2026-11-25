@@ -24,6 +24,7 @@ export interface ChangePasswordInput {
 }
 
 export interface MfaStatusResponse {
+  available?: boolean;
   enabled: boolean;
   verifiedAt: string | null;
 }

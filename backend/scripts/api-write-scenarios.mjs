@@ -44,7 +44,7 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     const initial = await login(email, password);
     const asInitial = bind(initial.accessToken);
     const path = '/api/auth/me/mfa';
-    assert.deepEqual(await asInitial('GET', path), { enabled: false, verifiedAt: null });
+    assert.deepEqual(await asInitial('GET', path), { available: true, enabled: false, verifiedAt: null });
     await asInitial('POST', path + '/setup');
     const setup = await asInitial('POST', path + '/setup');
     assert.equal(setup.accountName, email);
@@ -67,7 +67,7 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     })).data;
     assert.equal(enrolled.mfaSatisfied, true);
     const asEnrolled = bind(enrolled.accessToken);
-    assert.deepEqual(await asEnrolled('GET', path), enabled);
+    assert.deepEqual(await asEnrolled('GET', path), { available: true, ...enabled });
 
     let passwordSession;
     setMfaMode('off');
@@ -77,7 +77,7 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
       assert.equal(passwordLogin.mfaSatisfied, false);
       const asPassword = bind(passwordLogin.accessToken);
       assert.equal((await asPassword('GET', '/api/auth/me')).email, email);
-      assert.deepEqual(await asPassword('GET', path), { enabled: false, verifiedAt: null });
+      assert.deepEqual(await asPassword('GET', path), { available: false, enabled: false, verifiedAt: null });
       await asPassword('POST', path + '/setup', undefined, 404);
       const code = authenticatorCodeForFixture(setup.secret);
       await asPassword('POST', path + '/verify', { code }, 404);
@@ -91,7 +91,7 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     }
     await bind(passwordSession.accessToken)('GET', '/api/auth/me', undefined, 401);
     await request('POST', '/api/auth/refresh', { body: { refreshToken: passwordSession.refreshToken }, expected: 401 });
-    assert.deepEqual(await asEnrolled('GET', path), enabled);
+    assert.deepEqual(await asEnrolled('GET', path), { available: true, ...enabled });
 
     await asEnrolled('POST', path + '/disable', { code: 'invalid' }, 400);
     const disabled = await asEnrolled('POST', path + '/disable', { code: authenticatorCodeForFixture(setup.secret) });
@@ -99,7 +99,7 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     await asEnrolled('GET', '/api/auth/me', undefined, 401);
     await request('POST', '/api/auth/refresh', { body: { refreshToken: enrolled.refreshToken }, expected: 401 });
     const renewed = await login(email, password);
-    assert.deepEqual(await bind(renewed.accessToken)('GET', path), disabled);
+    assert.deepEqual(await bind(renewed.accessToken)('GET', path), { available: true, ...disabled });
     assert.equal(await prisma.mfaTotpSecret.count({ where: { userId: user.id, disabledAt: null } }), 0);
   });
 
