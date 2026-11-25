@@ -126,12 +126,14 @@ export class RetentionCleanupService {
          SELECT ${policy.idColumn}
          FROM ${policy.table}
          WHERE ${policy.whereSql}
-         ORDER BY ${policy.orderBy}
+         ORDER BY ${policy.orderBy}, ${policy.idColumn}
          LIMIT $2::int
+         FOR UPDATE SKIP LOCKED
        ),
        deleted_rows AS (
          DELETE FROM ${policy.table}
          WHERE ${policy.idColumn} IN (SELECT ${policy.idColumn} FROM candidates)
+           AND (${policy.whereSql})
          RETURNING 1
        )
        SELECT COUNT(*) AS deleted FROM deleted_rows`,
@@ -248,8 +250,8 @@ export class RetentionCleanupService {
         idColumn: 'id',
         description: 'Resolved, ignored, or replayed integration dead letters.',
         daysKey: 'RETENTION_INTEGRATION_DEAD_LETTER_DAYS',
-        whereSql: "status IN ('RESOLVED', 'IGNORED', 'REPLAYED') AND COALESCE(resolved_at, replayed_at, updated_at) < $1",
-        orderBy: 'COALESCE(resolved_at, replayed_at, updated_at) ASC',
+        whereSql: "status IN ('RESOLVED', 'IGNORED', 'REPLAYED') AND GREATEST(resolved_at, replayed_at, updated_at) < $1",
+        orderBy: 'GREATEST(resolved_at, replayed_at, updated_at) ASC',
       }),
       this.policy({
         key: 'audit-logs',

@@ -49,7 +49,7 @@ test('incident lifecycle resolutions are audited', async () => {
 });
 
 function prisma(status: 'ACKNOWLEDGED' | 'RESOLVED') {
-  return {
+  const client = {
     $queryRawUnsafe: async (_sql: string, incidentKey: string, note: string | null, actorUserId: string) => [{
       incident_key: incidentKey,
       status,
@@ -62,7 +62,8 @@ function prisma(status: 'ACKNOWLEDGED' | 'RESOLVED') {
       resolved_at: status === 'RESOLVED' ? new Date('2026-05-25T10:05:00.000Z') : null,
       updated_at: new Date('2026-05-25T10:05:00.000Z'),
     }],
-  } as never;
+  };
+  return { $transaction: async (run: (tx: typeof client) => Promise<unknown>) => run(client) } as never;
 }
 
 function actor(): AuthenticatedUser {

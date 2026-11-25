@@ -2,7 +2,8 @@ import { BadRequestException, Injectable } from '@nestjs/common';
 
 import { AuthenticatedUser } from '../access-control';
 import { AuditService } from '../audit/audit.service';
-import { PrismaService } from '../database';
+import { PrismaService, withTransactionRetry } from '../database';
+import type { Prisma } from '../generated/prisma/client';
 import {
   OperationalIncident,
   OperationalIncidentLifecycleStatus,
@@ -46,96 +47,83 @@ export class OperationalIncidentLifecycleService {
     }));
   }
 
-  async acknowledgeIncident(
+  acknowledgeIncident(
     incidentKey: string,
     note: string | undefined,
     actor: AuthenticatedUser,
   ): Promise<OperationalIncidentState> {
-    const normalizedKey = normalizeIncidentKey(incidentKey);
-    const normalizedNote = normalizeNote(note);
-    const rows = await this.prisma.$queryRawUnsafe<IncidentStateRow[]>(
-      `
-        INSERT INTO operational_incident_states
-          (incident_key, status, note, acknowledged_by_user_id, acknowledged_at, updated_at)
-        VALUES ($1, 'ACKNOWLEDGED', $2, $3::uuid, NOW(), NOW())
-        ON CONFLICT (incident_key) DO UPDATE SET
-          status = 'ACKNOWLEDGED',
-          note = EXCLUDED.note,
-          acknowledged_by_user_id = EXCLUDED.acknowledged_by_user_id,
-          acknowledged_at = EXCLUDED.acknowledged_at,
-          updated_at = NOW()
-        RETURNING
-          incident_key,
-          status,
-          note,
-          acknowledged_by_user_id,
-          (SELECT display_name FROM users WHERE id = acknowledged_by_user_id) AS acknowledged_by_display_name,
-          acknowledged_at,
-          resolved_by_user_id,
-          (SELECT display_name FROM users WHERE id = resolved_by_user_id) AS resolved_by_display_name,
-          resolved_at,
-          updated_at
-      `,
-      normalizedKey,
-      normalizedNote,
-      actor.id,
-    );
-    await this.audit.writeAction({
-      actorUserId: actor.id,
-      action: 'reliability.incident_acknowledged',
-      resourceType: 'operational_incident',
-      resourceId: normalizedKey,
-      metadata: { note: normalizedNote },
-    });
-    return toState(rows[0]);
+    return this.transitionIncident(incidentKey, note, actor, 'ACKNOWLEDGED');
   }
 
-  async resolveIncident(
+  resolveIncident(
     incidentKey: string,
     note: string | undefined,
     actor: AuthenticatedUser,
   ): Promise<OperationalIncidentState> {
-    const normalizedKey = normalizeIncidentKey(incidentKey);
-    const normalizedNote = normalizeNote(note);
-    const rows = await this.prisma.$queryRawUnsafe<IncidentStateRow[]>(
-      `
-        INSERT INTO operational_incident_states
-          (incident_key, status, note, resolved_by_user_id, resolved_at, updated_at)
-        VALUES ($1, 'RESOLVED', $2, $3::uuid, NOW(), NOW())
-        ON CONFLICT (incident_key) DO UPDATE SET
-          status = 'RESOLVED',
-          note = EXCLUDED.note,
-          resolved_by_user_id = EXCLUDED.resolved_by_user_id,
-          resolved_at = EXCLUDED.resolved_at,
-          updated_at = NOW()
-        RETURNING
-          incident_key,
-          status,
-          note,
-          acknowledged_by_user_id,
-          (SELECT display_name FROM users WHERE id = acknowledged_by_user_id) AS acknowledged_by_display_name,
-          acknowledged_at,
-          resolved_by_user_id,
-          (SELECT display_name FROM users WHERE id = resolved_by_user_id) AS resolved_by_display_name,
-          resolved_at,
-          updated_at
-      `,
-      normalizedKey,
-      normalizedNote,
-      actor.id,
-    );
-    await this.audit.writeAction({
-      actorUserId: actor.id,
-      action: 'reliability.incident_resolved',
-      resourceType: 'operational_incident',
-      resourceId: normalizedKey,
-      metadata: { note: normalizedNote },
-    });
-    return toState(rows[0]);
+    return this.transitionIncident(incidentKey, note, actor, 'RESOLVED');
   }
 
-  private async findStates(keys: string[]): Promise<Map<string, OperationalIncidentState>> {
-    const rows = await this.prisma.$queryRawUnsafe<IncidentStateRow[]>(
+  private transitionIncident(
+    incidentKey: string,
+    note: string | undefined,
+    actor: AuthenticatedUser,
+    status: 'ACKNOWLEDGED' | 'RESOLVED',
+  ): Promise<OperationalIncidentState> {
+    const normalizedKey = normalizeIncidentKey(incidentKey);
+    const normalizedNote = normalizeNote(note);
+    return withTransactionRetry(() => this.prisma.$transaction(async tx => {
+      const rows = await tx.$queryRawUnsafe<IncidentStateRow[]>(
+        `INSERT INTO operational_incident_states AS previous
+          (incident_key, status, note, acknowledged_by_user_id, acknowledged_at, resolved_by_user_id, resolved_at, updated_at)
+         VALUES ($1, $4, $2,
+           CASE WHEN $4 = 'ACKNOWLEDGED' THEN $3::uuid ELSE NULL END,
+           CASE WHEN $4 = 'ACKNOWLEDGED' THEN statement_timestamp() ELSE NULL END,
+           CASE WHEN $4 = 'RESOLVED' THEN $3::uuid ELSE NULL END,
+           CASE WHEN $4 = 'RESOLVED' THEN statement_timestamp() ELSE NULL END,
+           statement_timestamp())
+         ON CONFLICT (incident_key) DO UPDATE SET
+           status = EXCLUDED.status,
+           note = EXCLUDED.note,
+           acknowledged_by_user_id = CASE WHEN EXCLUDED.status = 'ACKNOWLEDGED'
+             THEN EXCLUDED.acknowledged_by_user_id ELSE previous.acknowledged_by_user_id END,
+           acknowledged_at = CASE WHEN EXCLUDED.status = 'ACKNOWLEDGED'
+             THEN EXCLUDED.acknowledged_at ELSE previous.acknowledged_at END,
+           resolved_by_user_id = EXCLUDED.resolved_by_user_id,
+           resolved_at = EXCLUDED.resolved_at,
+           updated_at = statement_timestamp()
+         WHERE previous.status IS DISTINCT FROM EXCLUDED.status
+           OR previous.note IS DISTINCT FROM EXCLUDED.note
+           OR (EXCLUDED.status = 'ACKNOWLEDGED' AND previous.resolved_at IS NOT NULL)
+         RETURNING
+           previous.*,
+           (SELECT display_name FROM users WHERE id = previous.acknowledged_by_user_id) AS acknowledged_by_display_name,
+           (SELECT display_name FROM users WHERE id = previous.resolved_by_user_id) AS resolved_by_display_name`,
+        normalizedKey,
+        normalizedNote,
+        actor.id,
+        status,
+      );
+      if (!rows[0]) {
+        const existing = (await this.findStates([normalizedKey], tx)).get(normalizedKey);
+        if (existing) return existing;
+      }
+      const state = toState(rows[0]);
+      await this.audit.writeAction({
+        actorUserId: actor.id,
+        action: status === 'ACKNOWLEDGED' ? 'reliability.incident_acknowledged' : 'reliability.incident_resolved',
+        resourceType: 'operational_incident',
+        resourceId: normalizedKey,
+        metadata: { note: normalizedNote },
+      }, tx);
+      return state;
+    }));
+  }
+
+  private async findStates(
+    keys: string[],
+    client: Pick<Prisma.TransactionClient, '$queryRawUnsafe'> = this.prisma,
+  ): Promise<Map<string, OperationalIncidentState>> {
+    const rows = await client.$queryRawUnsafe<IncidentStateRow[]>(
       `
         SELECT
           state.incident_key,

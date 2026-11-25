@@ -61,8 +61,11 @@ export class AuditService {
     return this.buildHashManifest(await this.listLogs(query));
   }
 
-  async writeAction(input: AuditWriteInput): Promise<void> {
-    await this.prisma.auditLog.create({
+  async writeAction(
+    input: AuditWriteInput,
+    client: Pick<Prisma.TransactionClient, 'auditLog'> = this.prisma,
+  ): Promise<void> {
+    await client.auditLog.create({
       data: {
         actorUserId: input.actorUserId ?? null,
         warehouseId: input.warehouseId ?? null,

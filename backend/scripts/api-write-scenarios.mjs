@@ -2640,6 +2640,75 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     await own('POST', `${slotting}/recommendations/${discard[0].id}/apply`, {}, 409);
   });
 
+  await scenario('incident transitions audit a repeated request once and clear the prior resolution on recurrence', async () => {
+    const key = `fixture-incident-${suffix}`;
+    const path = `/api/operations/reliability/incidents/${key}`;
+    await asWorker('POST', path + '/acknowledge', { note: 'Not a warehouse action' }, 403);
+    await asAdmin('POST', '/api/operations/reliability/incidents/invalid%20key/acknowledge', {}, 400);
+    const [first, retry] = await Promise.all([
+      asAdmin('POST', path + '/acknowledge', { note: '  Investigating  ' }),
+      asAdmin('POST', path + '/acknowledge', { note: 'Investigating' }),
+    ]);
+    assert.equal(first.status, 'ACKNOWLEDGED');
+    assert.deepEqual(retry, first);
+    const ackAudit = { resourceId: key, action: 'reliability.incident_acknowledged' };
+    assert.equal(await prisma.auditLog.count({ where: ackAudit }), 1);
+    const settled = await asAdmin('POST', path + '/resolve', { note: 'Restored operation' });
+    assert.equal(settled.status, 'RESOLVED');
+    assert.equal(settled.acknowledgedAt, first.acknowledgedAt);
+    assert.ok(settled.resolvedByUserId);
+    assert.deepEqual(await asAdmin('POST', path + '/resolve', { note: 'Restored operation' }), settled);
+    assert.equal(await prisma.auditLog.count({ where: { resourceId: key, action: 'reliability.incident_resolved' } }), 1);
+    const recurring = await asAdmin('POST', path + '/acknowledge', { note: 'Issue detected again' });
+    assert.equal(recurring.status, 'ACKNOWLEDGED');
+    assert.equal(recurring.resolvedAt, null);
+    assert.equal(recurring.resolvedByUserId, null);
+    assert.equal(await prisma.auditLog.count({ where: ackAudit }), 2);
+  });
+
+  await scenario('retention previews safely, skips locked records and respects recent replay activity', async () => {
+    const path = '/api/operations/reliability/retention';
+    await asWorker('POST', path + '/run', { dryRun: false }, 403);
+    await asAdmin('POST', path + '/run', { dryRun: false, batchSize: 9 }, 400);
+    const old = new Date('2000-01-01T00:00:00.000Z');
+    const fixture = `RETENTION-${suffix}`;
+    const event = (tag, status, sentAt) => prisma.outboxEvent.create({ data: {
+      type: fixture, aggregateType: 'retention_fixture', aggregateId: tag, payload: {},
+      status, sentAt, availableAt: old, updatedAt: old,
+    } });
+    const stale = await event('stale', 'SENT', old);
+    const locked = await event('locked', 'SENT', old);
+    const pending = await event('pending', 'PENDING', null);
+    const recent = await event('recent', 'SENT', new Date());
+    const replayed = await prisma.integrationDeadLetter.create({ data: {
+      eventType: fixture, errorMessage: 'Fixture replay', status: 'REPLAYED', fingerprint: fixture,
+      resolvedAt: old, replayedAt: new Date(), updatedAt: old, replayOutboxEventId: pending.id,
+    } });
+    const preview = await asAdmin('POST', path + '/run', { batchSize: 10 });
+    assert.equal(preview.dryRun, true);
+    assert.equal(preview.totalDeleted, 0);
+    assert.ok(preview.items.find(item => item.key === 'outbox-sent-events').eligibleCount >= 2);
+    assert.equal(await prisma.outboxEvent.count({ where: { type: fixture } }), 4);
+    const verifyKept = () => prisma.integrationDeadLetter.findUniqueOrThrow({ where: { id: replayed.id } });
+    const cleanup = () => asAdmin('POST', path + '/run', { dryRun: false, batchSize: 10 });
+    await prisma.$transaction(async tx => {
+      await tx.$queryRawUnsafe('SELECT id FROM outbox_events WHERE id = $1::uuid FOR UPDATE', locked.id);
+      const run = await cleanup();
+      assert.equal(run.dryRun, false);
+      assert.ok(run.items.find(item => item.key === 'outbox-sent-events').deletedCount >= 1);
+      await verifyKept();
+      const remaining = await prisma.outboxEvent.findMany({ where: { type: fixture }, select: { id: true } });
+      assert.deepEqual(remaining.map(row => row.id).sort(), [locked.id, pending.id, recent.id].sort());
+    });
+    const completed = await cleanup();
+    assert.equal(await prisma.outboxEvent.count({ where: { id: { in: [stale.id, locked.id] } } }), 0);
+    assert.equal(await prisma.outboxEvent.count({ where: { type: fixture } }), 2);
+    await verifyKept();
+    const status = await asAdmin('GET', path);
+    assert.equal(status.lastRun.finishedAt, completed.finishedAt);
+    assert.equal(status.preview.dryRun, true);
+  });
+
   await scenario('yard check-in links one appointment and rejects missing or conflicting references', async () => {
     const yard = '/enterprise-ops/yard';
     const appointment = await own('POST', yard + '/appointments', {
