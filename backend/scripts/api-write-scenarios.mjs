@@ -2429,6 +2429,76 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.deepEqual(attempts, [1, 2]);
   });
 
+  await scenario('yard check-in links one appointment and rejects missing or conflicting references', async () => {
+    const yard = '/enterprise-ops/yard';
+    const appointment = await own('POST', yard + '/appointments', {
+      appointmentNumber: `CHECKIN-${suffix}`, direction: 'INBOUND',
+      plannedStartAt: '2030-02-01T12:00:00Z', plannedEndAt: '2030-02-01T13:00:00Z',
+    });
+    const dock = await own('POST', yard + '/dock-doors', { code: `CHECKIN-DOOR-${suffix}` });
+    const checkIn = yard + '/trailers/check-in';
+    const input = { trailerNumber: `T-${suffix}`, carrier: 'Fixture carrier', appointmentId: appointment.id, dockDoorId: dock.id };
+    const [checkedIn, repeated] = await Promise.all([own('POST', checkIn, input), own('POST', checkIn, input)]);
+    assert.equal(checkedIn.trailer.status, 'CHECKED_IN');
+    assert.equal(checkedIn.appointment.trailerId, checkedIn.trailer.id);
+    assert.equal(checkedIn.appointment.dockDoorId, dock.id);
+    assert.equal(repeated.appointment.trailerId, checkedIn.trailer.id);
+    assert.equal(repeated.trailer.id, checkedIn.trailer.id);
+    assert.equal(repeated.trailer.checkedInAt, checkedIn.trailer.checkedInAt);
+    await own('POST', checkIn, { ...input, trailerNumber: input.trailerNumber + '-OTHER' }, 409);
+    await own('POST', checkIn, { ...input, trailerNumber: input.trailerNumber + '-MISSING', appointmentId: randomUUID() }, 404);
+    assert.equal(await prisma.yardTrailer.count({ where: { trailerNumber: { startsWith: input.trailerNumber } } }), 1);
+    assert.equal(await prisma.auditLog.count({ where: { resourceId: checkedIn.trailer.id, action: 'yard_trailer.checked_in' } }), 1);
+  });
+
+  await scenario('cross-dock rolls back unknown lines and releases each plan once', async () => {
+    const { sku } = await createSku('CROSS-DOCK');
+    const path = '/enterprise-ops/cross-dock/plans';
+    const body = { reasonCode: `CROSS-${suffix}`, priority: 90, lines: [{ skuId: sku.id, quantity: 4 }] };
+    await asWorker('POST', warehouse + path, body, 403);
+    const plan = await own('POST', path, body);
+    assert.equal(plan.status, 'PLANNED');
+    const line = await prisma.crossDockPlanLine.findFirstOrThrow({ where: { planId: plan.id } });
+    assert.deepEqual([line.skuId, line.expectedQuantity, line.allocatedQuantity], [sku.id, 4, 0]);
+    const release = `${path}/${plan.id}/release`;
+    assert.equal((await own('PATCH', release, {})).status, 'RELEASED');
+    await own('PATCH', release, {}, 409);
+    assert.equal(await prisma.auditLog.count({ where: { resourceId: plan.id, action: 'cross_dock_plan.released' } }), 1);
+    await own('POST', path, {
+      ...body, reasonCode: body.reasonCode + '-BAD', lines: [...body.lines, { skuId: randomUUID(), quantity: 1 }],
+    }, 404);
+    assert.equal(await prisma.crossDockPlan.count({ where: { reasonCode: body.reasonCode + '-BAD' } }), 0);
+  });
+
+  await scenario('value-added services preserve kit versions and complete a task only once', async () => {
+    const vas = '/enterprise-ops/vas';
+    const code = `VAS-${suffix}`;
+    const service = await own('POST', vas + '/services', { code, name: 'Fixture labelling', serviceType: 'LABEL', defaultDurationSeconds: 90 });
+    assert.equal((await own('POST', vas + '/services', {
+      code, name: 'Updated labelling', serviceType: 'LABEL', defaultDurationSeconds: 100,
+    })).id, service.id);
+    const { sku: kitSku } = await createSku('KIT');
+    const { sku: componentSku } = await createSku('KIT-COMPONENT');
+    const kitBody = { kitSkuId: kitSku.id, code, lines: [{ componentSkuId: componentSku.id, quantityPerKit: 2 }] };
+    const kit = await own('POST', vas + '/kits', kitBody);
+    const revisedKit = await own('POST', vas + '/kits', { ...kitBody, version: 2 });
+    assert.notEqual(kit.id, revisedKit.id);
+    const line = await prisma.kitBomLine.findFirstOrThrow({ where: { bomId: kit.id } });
+    assert.deepEqual([line.componentSkuId, line.quantityPerKit], [componentSku.id, 2]);
+    const taskBody = { serviceId: service.id, targetResourceType: 'SKU', targetResourceId: kitSku.id, quantity: 2 };
+    const task = await own('POST', vas + '/tasks', taskBody);
+    assert.equal(task.status, 'OPEN');
+    const confirmation = `${vas}/tasks/${task.id}/confirm`;
+    const done = await own('PATCH', confirmation, { result: { labelled: 2 } });
+    assert.equal(done.status, 'COMPLETED');
+    assert.deepEqual(done.metadata.result, { labelled: 2 });
+    await own('PATCH', confirmation, { result: { labelled: 3 } }, 409);
+    assert.equal(await prisma.auditLog.count({ where: { resourceId: task.id, action: 'vas_task.completed' } }), 1);
+    await own('POST', vas + '/kits', { ...kitBody, lines: [{ componentSkuId: kitSku.id, quantityPerKit: 1 }] }, 400);
+    assert.equal((await prisma.kitBomLine.findFirstOrThrow({ where: { bomId: kit.id } })).id, line.id);
+    await own('POST', vas + '/tasks', { ...taskBody, serviceId: randomUUID() }, 404);
+  });
+
   await scenario('returns roll back invalid orders and keep an accurate ledger for partial inspections', async () => {
     const { sku } = await createSku('RETURN');
     const rma = `RMA-${suffix}`;

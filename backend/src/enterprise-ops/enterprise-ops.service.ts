@@ -1,7 +1,9 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { isUUID } from 'class-validator';
 
 import { AuthenticatedUser } from '../access-control/types';
 import { PrismaService } from '../database';
+import { lockPostgresAdvisoryTransaction } from '../database/transaction-locks';
 import {
   AssignDockDoorDto,
   AutomationHeartbeatDto,
@@ -43,12 +45,24 @@ import {
   WebhookDeliveryAttemptResponse,
   WebhookSubscriptionResponse,
   YardTrailerResponse,
+  YardTrailerStatus,
+  DockAppointmentStatus,
 } from './enterprise-ops.types';
 
 type SqlClient = {
   $queryRawUnsafe<T = unknown>(query: string, ...values: unknown[]): Promise<T>;
   $executeRawUnsafe<T = unknown>(query: string, ...values: unknown[]): Promise<T>;
 };
+
+const warehouseReferences = {
+  dock_doors: 'Dock door',
+  inbound_shipments: 'Inbound shipment',
+  outbound_orders: 'Outbound order',
+  warehouse_locations: 'Warehouse location',
+  sku_lots: 'Lot',
+  vas_service_catalog: 'VAS service',
+  warehouse_tasks: 'Warehouse task',
+} as const;
 
 @Injectable()
 export class EnterpriseOpsService {
@@ -424,31 +438,84 @@ export class EnterpriseOpsService {
     actor: AuthenticatedUser,
   ): Promise<{ trailer: YardTrailerResponse; appointment: DockAppointmentResponse | null }> {
     return this.withTenant(async (client) => {
+      const trailerNumber = normalizeEnterpriseCode(dto.trailerNumber);
+      if (!trailerNumber) throw new BadRequestException('Trailer number must not be blank.');
+      await lockPostgresAdvisoryTransaction(client, 'yard_trailer_check_in', `${warehouseId}:${trailerNumber}`);
+      const [existing] = await this.query<YardTrailerRow>(
+        client,
+        'SELECT * FROM yard_trailers WHERE warehouse_id = $1::uuid AND trailer_number = $2 FOR UPDATE',
+        warehouseId,
+        trailerNumber,
+      );
+      let appointment: DockAppointmentRow | null = null;
+      if (dto.appointmentId) {
+        assertUuid(dto.appointmentId, 'Appointment');
+        const [scheduled] = await this.query<DockAppointmentRow>(
+          client,
+          `SELECT * FROM dock_appointments
+           WHERE warehouse_id = $1::uuid AND id = $2::uuid FOR UPDATE`,
+          warehouseId,
+          dto.appointmentId,
+        );
+        if (!scheduled) throw new NotFoundException('Dock appointment was not found.');
+        if (![DockAppointmentStatus.SCHEDULED, DockAppointmentStatus.CHECKED_IN, DockAppointmentStatus.DOCK_ASSIGNED].includes(scheduled.status as DockAppointmentStatus)
+            || (scheduled.trailer_id && scheduled.trailer_id !== existing?.id)
+            || (scheduled.dock_door_id && dto.dockDoorId && scheduled.dock_door_id !== dto.dockDoorId)) {
+          throw new ConflictException('Dock appointment cannot accept this trailer or dock door.');
+        }
+        if (existing) {
+          const [other] = await this.query<{ id: string }>(
+            client,
+            `SELECT id FROM dock_appointments
+             WHERE warehouse_id = $1::uuid AND trailer_id = $2::uuid AND id <> $3::uuid
+               AND status IN ('SCHEDULED', 'CHECKED_IN', 'DOCK_ASSIGNED', 'IN_PROGRESS') LIMIT 1`,
+            warehouseId,
+            existing.id,
+            scheduled.id,
+          );
+          if (other) throw new ConflictException('Trailer already belongs to another active appointment.');
+        }
+        appointment = scheduled;
+      }
+      const ownerClientId = appointment?.owner_client_id ?? dto.ownerClientId ?? existing?.owner_client_id ?? null;
+      if (dto.ownerClientId) assertUuid(dto.ownerClientId, 'Owner');
+      if (appointment?.owner_client_id && dto.ownerClientId && dto.ownerClientId !== appointment.owner_client_id) {
+        throw new ConflictException('Trailer owner does not match the appointment owner.');
+      }
+      const dockDoorId = appointment?.dock_door_id ?? dto.dockDoorId ?? null;
+      await this.assertWarehouseReference(client, 'dock_doors', warehouseId, dockDoorId);
+      const fresh = !existing?.checked_in_at || existing.status === YardTrailerStatus.CHECKED_OUT || existing.status === YardTrailerStatus.CANCELLED;
+      if (!fresh && existing.owner_client_id && ownerClientId !== existing.owner_client_id) {
+        throw new ConflictException('An active trailer already belongs to a different owner.');
+      }
+      const newLink = Boolean(appointment && (!appointment.trailer_id || appointment.status === DockAppointmentStatus.SCHEDULED));
       const rows = await this.query<YardTrailerRow>(
         client,
         `INSERT INTO yard_trailers
           (warehouse_id, owner_client_id, trailer_number, carrier, status, dock_door_id, checked_in_at, metadata)
-         VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6::uuid, now(), $7::jsonb)
+         VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6::uuid, statement_timestamp() AT TIME ZONE 'UTC', $7::jsonb)
          ON CONFLICT (warehouse_id, trailer_number) DO UPDATE SET
            owner_client_id = EXCLUDED.owner_client_id,
            carrier = COALESCE(EXCLUDED.carrier, yard_trailers.carrier),
            status = EXCLUDED.status,
-           dock_door_id = COALESCE(EXCLUDED.dock_door_id, yard_trailers.dock_door_id),
-           checked_in_at = COALESCE(yard_trailers.checked_in_at, now()),
+           dock_door_id = CASE WHEN $8 THEN EXCLUDED.dock_door_id ELSE COALESCE(EXCLUDED.dock_door_id, yard_trailers.dock_door_id) END,
+           checked_in_at = CASE WHEN $8 THEN EXCLUDED.checked_in_at ELSE yard_trailers.checked_in_at END,
+           checked_out_at = CASE WHEN $8 THEN NULL ELSE yard_trailers.checked_out_at END,
+           dwell_minutes = CASE WHEN $8 THEN NULL ELSE yard_trailers.dwell_minutes END,
            metadata = COALESCE(yard_trailers.metadata, '{}'::jsonb) || EXCLUDED.metadata,
            updated_at = now()
          RETURNING *`,
         warehouseId,
-        dto.ownerClientId ?? null,
-        normalizeEnterpriseCode(dto.trailerNumber),
+        ownerClientId,
+        trailerNumber,
         nullable(dto.carrier),
-        nextYardTrailerStatus('CHECK_IN'),
-        dto.dockDoorId ?? null,
+        fresh ? nextYardTrailerStatus('CHECK_IN') : existing.status,
+        dockDoorId,
         json(dto.metadata ?? {}),
+        fresh,
       );
       const trailer = requiredRow(rows, 'Trailer was not checked in.');
-      let appointment: DockAppointmentRow | null = null;
-      if (dto.appointmentId) {
+      if (appointment && (newLink || (!appointment.dock_door_id && dockDoorId))) {
         const appointmentRows = await this.query<DockAppointmentRow>(
           client,
           `UPDATE dock_appointments SET
@@ -458,13 +525,19 @@ export class EnterpriseOpsService {
              updated_at = now()
            WHERE id = $4::uuid AND warehouse_id = $5::uuid
            RETURNING *`,
-          nextDockAppointmentStatus('CHECK_IN'),
+          appointment.status === DockAppointmentStatus.SCHEDULED ? nextDockAppointmentStatus('CHECK_IN') : appointment.status,
           trailer.id,
-          dto.dockDoorId ?? null,
-          dto.appointmentId,
+          dockDoorId,
+          appointment.id,
           warehouseId,
         );
-        appointment = appointmentRows[0] ?? null;
+        appointment = requiredRow(appointmentRows, 'Dock appointment was not updated.');
+      }
+      if (!fresh && !newLink) {
+        return {
+          trailer: toYardTrailerResponse(trailer),
+          appointment: appointment ? toDockAppointmentResponse(appointment) : null,
+        };
       }
       await this.writeAudit(
         client,
@@ -549,6 +622,14 @@ export class EnterpriseOpsService {
     actor: AuthenticatedUser,
   ): Promise<CrossDockPlanResponse> {
     return this.withTenant(async (client) => {
+      await this.assertWarehouseReference(client, 'inbound_shipments', warehouseId, dto.inboundShipmentId);
+      await this.assertWarehouseReference(client, 'outbound_orders', warehouseId, dto.outboundOrderId);
+      await this.assertSkus(client, dto.lines.map(line => line.skuId));
+      for (const line of dto.lines) {
+        await this.assertWarehouseReference(client, 'sku_lots', warehouseId, line.lotId, line.skuId);
+        await this.assertWarehouseReference(client, 'warehouse_locations', warehouseId, line.fromLocationId);
+        await this.assertWarehouseReference(client, 'warehouse_locations', warehouseId, line.toLocationId);
+      }
       const rows = await this.query<CrossDockPlanRow>(
         client,
         `INSERT INTO cross_dock_plans
@@ -695,6 +776,11 @@ export class EnterpriseOpsService {
     actor: AuthenticatedUser,
   ): Promise<KitBomResponse> {
     return this.withTenant(async (client) => {
+      const components = dto.lines.map(line => line.componentSkuId);
+      if (components.some(component => component.toLowerCase() === dto.kitSkuId.toLowerCase())) {
+        throw new BadRequestException('A kit cannot include itself as a component.');
+      }
+      await this.assertSkus(client, [dto.kitSkuId, ...components]);
       const rows = await this.query<KitBomRow>(
         client,
         `INSERT INTO kit_bom_headers
@@ -719,8 +805,8 @@ export class EnterpriseOpsService {
         await this.execute(
           client,
           `INSERT INTO kit_bom_lines
-            (warehouse_id, owner_client_id, bom_id, component_sku_id, quantity_per_kit, scrap_percent, metadata)
-           VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7::jsonb)`,
+            (warehouse_id, owner_client_id, bom_id, component_sku_id, quantity_per_kit, scrap_percent, metadata, updated_at)
+           VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7::jsonb, statement_timestamp() AT TIME ZONE 'UTC')`,
           warehouseId,
           bom.owner_client_id,
           bom.id,
@@ -750,6 +836,8 @@ export class EnterpriseOpsService {
     actor: AuthenticatedUser,
   ): Promise<VasTaskResponse> {
     return this.withTenant(async (client) => {
+      await this.assertWarehouseReference(client, 'vas_service_catalog', warehouseId, dto.serviceId);
+      await this.assertWarehouseReference(client, 'warehouse_tasks', warehouseId, dto.warehouseTaskId);
       const rows = await this.query<VasTaskRow>(
         client,
         `INSERT INTO vas_tasks
@@ -1094,6 +1182,34 @@ export class EnterpriseOpsService {
     return this.prisma.withTenantRls((client) => operation(client as SqlClient));
   }
 
+  private async assertWarehouseReference(
+    client: SqlClient,
+    table: keyof typeof warehouseReferences,
+    warehouseId: string,
+    id: string | null | undefined,
+    skuId?: string,
+  ): Promise<void> {
+    if (id == null) return;
+    const label = warehouseReferences[table];
+    assertUuid(id, label);
+    const skuFilter = skuId ? ' AND sku_id = $3::uuid' : '';
+    const ids = await this.query<{ id: string }>(
+      client,
+      `SELECT id FROM ${table} WHERE warehouse_id = $1::uuid AND id = $2::uuid${skuFilter} FOR KEY SHARE`,
+      warehouseId, id, ...(skuId ? [skuId] : []),
+    );
+    if (!ids.length) throw new NotFoundException(`${label} was not found in this warehouse.`);
+  }
+
+  private async assertSkus(client: SqlClient, references: string[]): Promise<void> {
+    const ids = [...new Set(references.map(id => id.toLowerCase()))];
+    for (const id of ids) assertUuid(id, 'SKU');
+    const rows = await this.query<{ id: string }>(
+      client, 'SELECT id FROM skus WHERE id = ANY($1::uuid[]) ORDER BY id FOR KEY SHARE', ids,
+    );
+    if (rows.length !== ids.length) throw new NotFoundException('One or more SKUs were not found.');
+  }
+
   private query<T>(client: SqlClient, query: string, ...values: unknown[]): Promise<T[]> {
     return client.$queryRawUnsafe<T[]>(query, ...values);
   }
@@ -1107,6 +1223,10 @@ function assertDateWindow(start: string, end: string): void {
   if (new Date(start).getTime() >= new Date(end).getTime()) {
     throw new ConflictException('plannedStartAt must be before plannedEndAt.');
   }
+}
+
+function assertUuid(value: string, label: string): void {
+  if (!isUUID(value)) throw new BadRequestException(`${label} ID must be a UUID.`);
 }
 
 function json(value: unknown): string {

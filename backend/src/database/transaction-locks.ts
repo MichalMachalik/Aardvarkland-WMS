@@ -32,6 +32,7 @@ const SAFE_ADVISORY_LOCK_NAMESPACES = new Set([
   'idempotency_key',
   'outbox_delivery',
   'base_com_order',
+  'yard_trailer_check_in',
 ]);
 
 export function canRunRawSql(client: unknown): client is RawSqlClient {
