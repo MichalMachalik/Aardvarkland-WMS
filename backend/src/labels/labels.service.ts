@@ -1027,6 +1027,7 @@ export class LabelsService {
     dto: ResolveScanDto,
     actor: AuthenticatedUser,
   ): Promise<ScanResolveResponse> {
+    if (!dto.scannedValue.trim()) throw new BadRequestException('Scanned value must not be blank');
     await this.ensureHardwareTables();
     const warehouse = await this.resolveWarehouse(warehouseReference);
     const parsed = parseScanCode(dto.scannedValue, this.gs1Syntax);

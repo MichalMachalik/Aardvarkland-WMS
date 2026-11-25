@@ -1,4 +1,4 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 
 import { AuthenticatedUser } from '../access-control/types';
 import { normalizeOffsetPagination } from '../common';
@@ -167,10 +167,10 @@ export class ProductsService {
       const sku = await this.getClient().sku.create({
         data: {
           productId: product.id,
-          code: normalizeCode(dto.code),
-          name: dto.name.trim(),
+          code: normalizeCode(requireSkuText(dto.code, 'SKU code', 2)),
+          name: requireSkuText(dto.name, 'SKU name'),
           barcode: normalizeNullableString(dto.barcode),
-          uom: normalizeCode(dto.uom ?? 'EA'),
+          uom: normalizeCode(requireSkuText(dto.uom ?? 'EA', 'Unit of measure')),
           weightGrams: dto.weightGrams,
           status: dto.status ?? SkuStatus.ACTIVE,
           metadata: buildSkuCreateMetadata(dto.metadata, dto.dimensions),
@@ -206,10 +206,10 @@ export class ProductsService {
         where: { id: existingSku.id },
         data: {
           ...(productId === undefined ? {} : { productId }),
-          ...(dto.code === undefined ? {} : { code: normalizeCode(dto.code) }),
-          ...(dto.name === undefined ? {} : { name: dto.name.trim() }),
+          ...(dto.code === undefined ? {} : { code: normalizeCode(requireSkuText(dto.code, 'SKU code', 2)) }),
+          ...(dto.name === undefined ? {} : { name: requireSkuText(dto.name, 'SKU name') }),
           ...(dto.barcode === undefined ? {} : { barcode: normalizeNullableString(dto.barcode) }),
-          ...(dto.uom === undefined ? {} : { uom: normalizeCode(dto.uom) }),
+          ...(dto.uom === undefined ? {} : { uom: normalizeCode(requireSkuText(dto.uom, 'Unit of measure')) }),
           ...(dto.weightGrams === undefined ? {} : { weightGrams: dto.weightGrams }),
           ...(dto.status === undefined ? {} : { status: dto.status }),
           ...(metadata === undefined ? {} : { metadata }),
@@ -381,6 +381,12 @@ function skuReferenceWhere(reference: string): SkuWhereInput {
 
 function normalizeCode(value: string): string {
   return value.trim().toUpperCase();
+}
+
+function requireSkuText(value: unknown, label: string, minimum = 1): string {
+  const normalized = typeof value === 'string' ? value.trim() : '';
+  if (normalized.length < minimum) throw new BadRequestException(`${label} must contain at least ${minimum} character(s)`);
+  return normalized;
 }
 
 function normalizeSearch(value: string | undefined): string | undefined {

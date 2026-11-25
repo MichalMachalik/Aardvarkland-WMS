@@ -1,4 +1,4 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 
 import { AuthenticatedUser } from '../access-control/types';
 import { PrismaService } from '../database';
@@ -52,7 +52,7 @@ interface ScannerDeviceDelegate extends FindFirstDelegate<ScannerDeviceRecord> {
     orderBy: Array<Record<string, SortOrder>>;
   }): Promise<ScannerDeviceRecord[]>;
   create(args: { data: MutationObject }): Promise<ScannerDeviceRecord>;
-  update(args: { where: { id: string }; data: MutationObject }): Promise<ScannerDeviceRecord>;
+  update(args: { where: { id: string; status?: ScannerStatus }; data: MutationObject }): Promise<ScannerDeviceRecord>;
 }
 
 interface TrackingEventDelegate {
@@ -153,23 +153,32 @@ export class ScannersService {
     dto: CreateScannerScanDto,
     actor: AuthenticatedUser,
   ): Promise<ScannerScanResponse> {
+    const scanValue = dto.value.trim();
+    if (!scanValue) throw new BadRequestException('Scanned value must not be blank');
     const warehouse = await this.resolveWarehouse(warehouseReference);
     const existingScanner = await this.resolveScanner(warehouse.id, scannerReference);
+    if (existingScanner.status !== ScannerStatus.ACTIVE) {
+      throw new ConflictException('Scanner must be active to record a scan');
+    }
     const scannedAt = new Date();
-    const scanValue = dto.value.trim();
     const parcel = await this.resolveParcelByScanValue(warehouse.id, scanValue);
 
-    const scanner = await this.db.scannerDevice.update({
-      where: { id: existingScanner.id },
-      data: {
-        status: ScannerStatus.ACTIVE,
-        lastSeenAt: scannedAt,
-        metadata: toJsonInput(buildScannerMetadata(existingScanner.metadata, {
-          metadata: { lastActivitySource: 'scanner.scan' },
-          lastActivityAt: scannedAt.toISOString(),
-        })),
-      },
-    });
+    let scanner: ScannerDeviceRecord;
+    try {
+      scanner = await this.db.scannerDevice.update({
+        where: { id: existingScanner.id, status: ScannerStatus.ACTIVE },
+        data: {
+          lastSeenAt: scannedAt,
+          metadata: toJsonInput(buildScannerMetadata(existingScanner.metadata, {
+            metadata: { lastActivitySource: 'scanner.scan' },
+            lastActivityAt: scannedAt.toISOString(),
+          })),
+        },
+      });
+    } catch (error) {
+      if (hasPrismaCode(error, 'P2025')) throw new ConflictException('Scanner is no longer active');
+      throw error;
+    }
 
     await this.writeScanAudit(actor, warehouse.id, scanner, dto, scanValue, scannedAt, parcel);
     const trackingEventCreated = await this.writeOptionalTrackingEvent(
@@ -217,7 +226,6 @@ export class ScannersService {
     const scanner = await this.db.scannerDevice.update({
       where: { id: existingScanner.id },
       data: {
-        status: ScannerStatus.ACTIVE,
         lastSeenAt: seenAt,
         metadata: toJsonInput(buildScannerMetadata(existingScanner.metadata, {
           ...dto,

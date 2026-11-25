@@ -23,6 +23,29 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     return { product, sku };
   }
 
+  await scenario('SKU creation and product alias updates preserve explicit nullable fields and reject blank names', async () => {
+    const product = await asAdmin('POST', '/api/products', { code: `SKU-ALIAS-${suffix}`, name: 'Fixture product' });
+    const body = {
+      productReference: product.id, code: `SKU-ALIAS-${suffix}`, name: ' Fixture SKU ',
+      barcode: `SKU-BARCODE-${suffix}`, weightGrams: 100,
+    };
+    const sku = await asAdmin('POST', '/api/skus', body);
+    assert.equal(sku.name, 'Fixture SKU');
+    assert.equal(sku.weightGrams, 100);
+    await asAdmin('POST', '/api/skus', body, 409);
+    const path = `/api/products/skus/${sku.id}`;
+    const changed = await asAdmin('PATCH', path, { name: '  Updated name  ', barcode: null, weightGrams: null });
+    assert.equal(changed.name, 'Updated name');
+    assert.equal(changed.barcode, null);
+    assert.equal(changed.weightGrams, null);
+    assert.equal(changed.code, sku.code);
+    await asAdmin('PATCH', path, { name: '  ' }, 400);
+    await asAdmin('PATCH', path, { code: null }, 400);
+    await asAdmin('PATCH', path, { weightGrams: 2_147_483_648 }, 400);
+    await asAdmin('POST', '/api/skus', { ...body, code: '  ' }, 400);
+    assert.equal((await asAdmin('GET', `/api/skus/${sku.code}`)).name, 'Updated name');
+  });
+
   await scenario('product and warehouse master data persist and reject invalid input', async () => {
     const { product, sku } = await createSku('CAT');
     await asAdmin('POST', '/api/products', { code: product.code, name: 'Duplicate' }, 409);
@@ -2063,6 +2086,36 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.equal(quarantined.availableQuantity, 0);
     await own('POST', `/quality/quarantine/${quantId}/release`);
     assert.equal((await own('GET', `/inventory/quants/${quantId}`)).availableQuantity, 2);
+  });
+
+  await scenario('scanner writes link parcels and respect maintenance state while the resolver checks warehouse codes', async () => {
+    const scanner = await own('POST', '/scanners', { code: `DIRECT-SCAN-${suffix}`, name: 'Fixture scanner' });
+    const scannerPath = `/scanners/${scanner.id}`;
+    const parcel = await own('POST', '/parcels', { trackingNumber: `DIRECT-SCAN-PARCEL-${suffix}` });
+    const scan = await own('POST', scannerPath + '/scans', {
+      value: ` ${parcel.trackingNumber} `, symbology: 'CODE128', operation: 'RECEIVE',
+    });
+    assert.equal(scan.result, 'MATCHED');
+    assert.equal(scan.match.parcel.id, parcel.id);
+    assert.equal(scan.scan.value, parcel.trackingNumber);
+    assert.equal(scan.trackingEventCreated, true);
+    assert.equal(await prisma.trackingEvent.count({ where: { parcelId: parcel.id, type: 'SCANNED' } }), 1);
+    assert.equal(await prisma.auditLog.count({ where: { resourceId: parcel.id, action: 'scanner.scan.logged' } }), 1);
+    const missing = await own('POST', scannerPath + '/scans', { value: 'MISSING-SCAN-PARCEL' });
+    assert.equal(missing.result, 'UNMATCHED');
+    assert.equal(missing.trackingEventCreated, false);
+    const found = await asWorker('POST', warehouse + '/scans/resolve', { scannedValue: 'AARD1:LOC:MAIN:A-01-01' });
+    assert.equal(found.resolved.found, true);
+    assert.equal(found.resolved.code, 'A-01-01');
+    await asWorker('POST', warehouse + '/scans/resolve', { scannedValue: 'AARD1:LOC:OTHER:A-01-01' }, 400);
+    await asWorker('POST', warehouse + '/scans/resolve', { scannedValue: '   ' }, 400);
+    await own('POST', scannerPath + '/scans', { value: '   ' }, 400);
+    await own('PATCH', scannerPath, { status: 'MAINTENANCE' });
+    const telemetry = await own('PATCH', scannerPath + '/telemetry', { batteryLevel: 20 });
+    assert.equal(telemetry.status, 'MAINTENANCE');
+    assert.equal(telemetry.batteryLevel, 20);
+    await own('POST', scannerPath + '/scans', { value: parcel.trackingNumber }, 409);
+    assert.equal(await prisma.trackingEvent.count({ where: { parcelId: parcel.id, type: 'SCANNED' } }), 1);
   });
 
   await scenario('scanner writes persist bounded telemetry and RF queue filters reject invalid input', async () => {

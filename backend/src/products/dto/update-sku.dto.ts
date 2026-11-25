@@ -5,6 +5,7 @@ import {
   IsObject,
   IsOptional,
   IsString,
+  Max,
   MaxLength,
   Min,
   MinLength,
@@ -57,6 +58,7 @@ export class UpdateSkuDto {
   @Type(() => Number)
   @IsInt()
   @Min(0)
+  @Max(2_147_483_647)
   weightGrams?: number | null;
 
 
@@ -68,7 +70,7 @@ export class UpdateSkuDto {
   dimensions?: SkuDimensionsDto | null;
 
   @ApiPropertyOptional({ enum: SkuStatus, example: SkuStatus.INACTIVE })
-  @IsOptional()
+  @ValidateIf((_, value: unknown) => value !== undefined)
   @IsEnum(SkuStatus)
   status?: SkuStatus;
 
