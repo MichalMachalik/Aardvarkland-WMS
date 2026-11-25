@@ -1500,6 +1500,59 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.equal(current.get(right.id).status, 'GENERATED');
   });
 
+  await scenario('configuration rules match valid inputs and preserve concurrent metadata edits', async () => {
+    const path = '/configuration';
+    const rules = path + '/rules';
+    const ruleType = 'CARRIER_ROUTING';
+    const base = { ruleType, code: `ROUTING-${suffix}`, name: 'Warehouse fallback', priority: 200, status: 'ACTIVE' };
+    const fallback = await own('POST', rules, { ...base, actions: { service: 'STANDARD' } });
+    const client = await asAdmin('POST', '/api/clients', { code: `RULES-${suffix}`, name: 'Rules fixture client' });
+    const override = {
+      ...base, code: `OVERRIDE-${suffix}`, name: 'Client override', ownerClientReference: client.code,
+      priority: 1, conditions: { match: { 'parcel.grams': { min: 0, max: 1000 }, country: ['CZ', 'SK'] } },
+      actions: { service: 'EXPRESS' }, metadata: { origin: 'fixture' },
+    };
+    const clientRule = await own('POST', rules, override);
+    assert.equal(clientRule.ownerClientId, client.id);
+    assert.equal((await own('POST', rules, override)).id, clientRule.id);
+    const simulate = (context, ownerClientReference = client.code) =>
+      own('POST', path + '/simulate', { ruleType, ownerClientReference, context });
+    for (const value of [null, '', ' ', false, [], {}, 'infinity', -1, 1001]) {
+      const result = await simulate({ country: 'CZ', parcel: { grams: value } });
+      assert.equal(result.matchedRule.id, fallback.id, `Invalid weight: ${JSON.stringify(value)}`);
+    }
+    assert.equal((await simulate({ country: 'CZ' })).matchedRule.id, fallback.id);
+    assert.equal((await simulate({ country: 'DE', parcel: { grams: 500 } })).matchedRule.id, fallback.id);
+    const context = { country: 'SK', parcel: { grams: 1000 } };
+    const chosen = await simulate(context);
+    assert.equal(chosen.matchedRule.id, clientRule.id);
+    assert.deepEqual(chosen.decision, { service: 'EXPRESS' });
+    assert.equal((await simulate(context, null)).matchedRule.id, fallback.id);
+
+    const rulePath = rules + '/' + clientRule.id;
+    await own('POST', rules, { ...override, code: '   ' }, 400);
+    await own('PATCH', rulePath, { name: '   ' }, 400);
+    for (const match of [null, [], { grams: {} }, { grams: { minimum: 10 } }, { grams: { min: 200, max: 50 } }]) {
+      await own('PATCH', rulePath, { conditions: { match } }, 400);
+    }
+    await Promise.all([
+      own('PATCH', rulePath, { metadata: { serviceOwner: 'shipping' } }),
+      own('PATCH', rulePath, { metadata: { verified: true } }),
+    ]);
+    const [savedRule] = await own('GET', rules + `?ownerClientReference=${client.code}&ruleType=${ruleType}`);
+    assert.equal(savedRule.id, clientRule.id);
+    assert.deepEqual(savedRule.metadata, { origin: 'fixture', serviceOwner: 'shipping', verified: true });
+    const paused = await own('PATCH', rulePath, { status: 'PAUSED' });
+    assert.equal(paused.status, 'PAUSED');
+    assert.equal((await simulate(context)).matchedRule.id, fallback.id);
+    assert.equal(await prisma.auditLog.count({ where: { resourceId: clientRule.id, action: 'configuration_rule.updated' } }), 3);
+
+    const sameCode = await own('POST', rules, { ...base, ruleType: 'SLA' });
+    await own('PATCH', `${rules}/${fallback.code}`, { name: 'Ambiguous update' }, 409);
+    assert.equal((await own('PATCH', `${rules}/${sameCode.id}`, { name: 'SLA updated' })).name, 'SLA updated');
+    assert.equal((await simulate(context)).matchedRule.name, base.name);
+  });
+
   await scenario('automation commands, appointments and replayed events stay scoped to the warehouse', async () => {
     const prefix = '/enterprise-ops';
     const deviceBody = { code: `DEVICE-${suffix}`, deviceType: 'TEST', status: 'ONLINE' };

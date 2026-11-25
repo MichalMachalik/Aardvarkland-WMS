@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 
 import { AuthenticatedUser } from '../access-control/types';
 import { PrismaService } from '../database';
@@ -52,13 +52,16 @@ export class ConfigurationRulesService {
     dto: UpsertConfigurationRuleDto,
     actor: AuthenticatedUser,
   ): Promise<WmsConfigurationRuleResponse> {
+    const code = normalizeCode(dto.code);
+    const name = dto.name.trim();
+    if (!code || !name) throw new BadRequestException('Configuration rule code and name are required');
+    validateConditions(dto.conditions);
     await this.ensureSchema();
     const warehouse = await this.resolveWarehouse(warehouseReference);
     const ownerClient = dto.ownerClientReference
       ? await this.resolveClient(dto.ownerClientReference)
       : null;
     const ruleType = normalizeCode(dto.ruleType) as WmsConfigurationRuleType;
-    const code = normalizeCode(dto.code);
 
     const rows = await this.query<ConfigurationRuleRow>(
       `INSERT INTO warehouse_configuration_rules
@@ -79,7 +82,7 @@ export class ConfigurationRulesService {
       ownerClient?.id ?? null,
       ruleType,
       code,
-      dto.name.trim(),
+      name,
       dto.status ?? WmsConfigurationRuleStatus.DRAFT,
       dto.priority ?? 100,
       json(dto.conditions ?? {}),
@@ -103,11 +106,12 @@ export class ConfigurationRulesService {
     dto: UpdateConfigurationRuleDto,
     actor: AuthenticatedUser,
   ): Promise<WmsConfigurationRuleResponse> {
+    const name = dto.name?.trim();
+    if (name === '') throw new BadRequestException('Configuration rule name is required');
+    validateConditions(dto.conditions);
     await this.ensureSchema();
     const warehouse = await this.resolveWarehouse(warehouseReference);
     const existing = await this.resolveRule(warehouse.id, ruleReference);
-    const mergedMetadata =
-      dto.metadata === undefined ? existing.metadata ?? {} : { ...toRecord(existing.metadata), ...dto.metadata };
 
     const rows = await this.query<ConfigurationRuleRow>(
       `UPDATE warehouse_configuration_rules SET
@@ -116,19 +120,21 @@ export class ConfigurationRulesService {
          priority = COALESCE($5::integer, priority),
          conditions = COALESCE($6::jsonb, conditions),
          actions = COALESCE($7::jsonb, actions),
-         metadata = COALESCE($8::jsonb, metadata),
+         metadata = CASE WHEN $8::jsonb IS NULL THEN metadata
+                         ELSE (CASE WHEN jsonb_typeof(metadata) = 'object' THEN metadata ELSE '{}'::jsonb END) || $8::jsonb
+                    END,
          updated_by_user_id = $9::uuid,
          updated_at = now()
        WHERE warehouse_id = $1::uuid AND id = $2::uuid
        RETURNING *`,
       warehouse.id,
       existing.id,
-      optionalText(dto.name?.trim()),
+      name ?? null,
       dto.status ?? null,
       dto.priority ?? null,
       dto.conditions === undefined ? null : json(dto.conditions),
       dto.actions === undefined ? null : json(dto.actions),
-      dto.metadata === undefined ? null : json(mergedMetadata),
+      dto.metadata == null ? null : json(dto.metadata),
       actor.id,
     );
     const rule = requiredRow(rows, 'Configuration rule was not updated');
@@ -160,7 +166,8 @@ export class ConfigurationRulesService {
        ORDER BY rule_type ASC,
                 CASE WHEN owner_client_id IS NULL THEN 0 ELSE 1 END DESC,
                 priority DESC,
-                updated_at DESC`,
+                updated_at DESC,
+                code ASC`,
       warehouse.id,
       input.ruleType ? normalizeCode(input.ruleType) : null,
       ownerClient?.id ?? null,
@@ -222,13 +229,17 @@ export class ConfigurationRulesService {
     const rows = await this.query<ConfigurationRuleRow>(
       `SELECT * FROM warehouse_configuration_rules
        WHERE warehouse_id = $1::uuid AND (id::text = $2 OR code = $3)
-       LIMIT 1`,
+       ORDER BY (id::text = $2) DESC
+       LIMIT 2`,
       warehouseId,
       reference,
       normalizeCode(reference),
     );
     const row = rows[0];
     if (!row) throw new NotFoundException('Configuration rule was not found');
+    if (row.id !== reference && rows.length > 1) {
+      throw new ConflictException('Configuration rule code matches multiple rule types. Use the rule ID.');
+    }
     return row;
   }
 
@@ -323,6 +334,9 @@ function evaluateConditions(
   conditions: Record<string, unknown>,
   context: Record<string, unknown>,
 ): { matched: boolean; reasons: string[] } {
+  if (Object.hasOwn(conditions, 'match') && !isRecord(conditions['match'])) {
+    return { matched: false, reasons: ['Invalid match configuration.'] };
+  }
   const match = toRecord(conditions['match']);
   const required = Object.entries(match);
 
@@ -346,16 +360,40 @@ function evaluateConditions(
 }
 
 function evaluateRange(expected: Record<string, unknown>, actual: unknown): boolean {
-  const value = Number(actual);
-  if (!Number.isFinite(value)) return false;
-  const min = expected['min'] === undefined ? undefined : Number(expected['min']);
-  const max = expected['max'] === undefined ? undefined : Number(expected['max']);
-  return (min === undefined || value >= min) && (max === undefined || value <= max);
+  const value = finiteNumber(actual);
+  const bounds = rangeBounds(expected);
+  return value !== undefined && bounds !== null && value >= bounds.min && value <= bounds.max;
+}
+
+function validateConditions(conditions: Record<string, unknown> | undefined): void {
+  if (!conditions || !Object.hasOwn(conditions, 'match')) return;
+  const match = conditions['match'];
+  if (!isRecord(match)) throw new BadRequestException('Configuration rule match must be an object');
+
+  for (const [field, expected] of Object.entries(match)) {
+    if (isRecord(expected) && rangeBounds(expected) === null) {
+      throw new BadRequestException(`Invalid numeric range for condition ${field}`);
+    }
+  }
+}
+
+function rangeBounds(range: Record<string, unknown>): { min: number; max: number } | null {
+  const keys = Object.keys(range);
+  if (!keys.length || keys.some(key => key !== 'min' && key !== 'max')) return null;
+  const min = Object.hasOwn(range, 'min') ? finiteNumber(range['min']) : -Infinity;
+  const max = Object.hasOwn(range, 'max') ? finiteNumber(range['max']) : Infinity;
+  return min === undefined || max === undefined || min > max ? null : { min, max };
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  if (typeof value !== 'number' && (typeof value !== 'string' || !value.trim())) return undefined;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : undefined;
 }
 
 function readPath(context: Record<string, unknown>, path: string): unknown {
   return path.split('.').reduce<unknown>((current, key) => {
-    if (!current || typeof current !== 'object') return undefined;
+    if (!current || typeof current !== 'object' || !Object.hasOwn(current, key)) return undefined;
     return (current as Record<string, unknown>)[key];
   }, context);
 }
@@ -449,18 +487,16 @@ function normalizeCode(value: string): string {
   return value.trim().toUpperCase().replace(/[^A-Z0-9_:-]/g, '_');
 }
 
-function optionalText(value: string | undefined): string | null {
-  return value && value.length > 0 ? value : null;
-}
-
 function json(value: unknown): string {
   return JSON.stringify(value ?? {});
 }
 
 function toRecord(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : {};
+  return isRecord(value) ? value : {};
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 interface IdCodeRow {
