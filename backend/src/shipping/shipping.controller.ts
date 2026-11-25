@@ -10,6 +10,7 @@ import { CreateShipmentDto } from './dto/create-shipment.dto';
 import { GenerateCarrierLabelDto } from './dto/generate-carrier-label.dto';
 import { ListShipmentPackagesQueryDto } from './dto/list-shipment-packages-query.dto';
 import { ListShipmentsQueryDto } from './dto/list-shipments-query.dto';
+import { PrintShipmentLabelDto } from './dto/print-shipment-label.dto';
 import { ShipShipmentDto } from './dto/ship-shipment.dto';
 import { StageShipmentDto } from './dto/stage-shipment.dto';
 import { ShippingService } from './shipping.service';
@@ -86,6 +87,28 @@ export class ShippingController {
     @CurrentUser() actor: AuthenticatedUser,
   ) {
     return this.shippingService.generateLabel(warehouseId, shipmentId, dto, actor);
+  }
+
+  @RequireWarehousePermissions('shipment.read', 'label.read')
+  @Get('shipments/:shipmentId/labels/:labelId/document')
+  downloadLabel(
+    @Param('warehouseId') warehouseId: string,
+    @Param('shipmentId') shipmentId: string,
+    @Param('labelId') labelId: string,
+  ) {
+    return this.shippingService.downloadLabel(warehouseId, shipmentId, labelId);
+  }
+
+  @RequireWarehousePermissions('shipment.read', 'label.print')
+  @Post('shipments/:shipmentId/labels/:labelId/print-jobs')
+  printLabel(
+    @Param('warehouseId') warehouseId: string,
+    @Param('shipmentId') shipmentId: string,
+    @Param('labelId') labelId: string,
+    @Body() dto: PrintShipmentLabelDto,
+    @CurrentUser() actor: AuthenticatedUser,
+  ) {
+    return this.shippingService.printLabel(warehouseId, shipmentId, labelId, dto, actor);
   }
 
   @RequireWarehousePermissions('shipment.manage')

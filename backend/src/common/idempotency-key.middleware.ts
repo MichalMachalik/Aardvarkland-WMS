@@ -23,6 +23,7 @@ const CRITICAL_WRITE_PATTERNS: RegExp[] = [
   /^\/warehouses\/[^/]+\/inventory\/quants\/(receive|move|adjust|[^/]+\/block|[^/]+\/unblock)$/,
   /^\/warehouses\/[^/]+\/print\/jobs$/,
   /^\/warehouses\/[^/]+\/print-jobs$/,
+  /^\/warehouses\/[^/]+\/shipments\/[^/]+\/labels\/[^/]+\/print-jobs$/,
   /^\/warehouses\/[^/]+\/print-jobs\/[^/]+\/reprint$/,
   /^\/warehouses\/[^/]+\/parcels\/[^/]+\/labels\/print-jobs$/,
   /^\/warehouses\/[^/]+\/label-print-jobs\/[^/]+\/reprint$/,

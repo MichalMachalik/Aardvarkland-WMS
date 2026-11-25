@@ -156,6 +156,7 @@ interface PrintAgentAuthFailureRow {
 interface RuntimePrintJobRow {
   id: string;
   warehouse_id: string;
+  carrier_label_id: string | null;
   printer_code: string | null;
   agent_code: string | null;
   template_code: string | null;
@@ -517,6 +518,7 @@ export class LabelsService {
     warehouseReference: string,
     dto: CreateRuntimePrintJobDto,
     actor: AuthenticatedUser,
+    carrierLabelId?: string,
   ): Promise<RuntimePrintJobResponse> {
     await this.ensureHardwareTables();
     const warehouse = await this.resolveWarehouse(warehouseReference);
@@ -542,14 +544,15 @@ export class LabelsService {
       payload: dto.payload ?? {},
       renderedZpl,
       actorUserId: actor.id,
+      ...(carrierLabelId ? { carrierLabelId } : {}),
     });
 
     const rows = await this.query<RuntimePrintJobRow>(
       `INSERT INTO wms_print_jobs
         (warehouse_id, printer_code, agent_code, template_code, template_version, status, copies,
-         max_attempts, payload, rendered_zpl, requested_by_user_id, idempotency_key, request_hash, updated_at)
+         max_attempts, payload, rendered_zpl, requested_by_user_id, idempotency_key, request_hash, carrier_label_id, updated_at)
        VALUES ($1::uuid, NULLIF($2, ''), NULLIF($3, ''), NULLIF($4, ''), 1, 'QUEUED', $5, $6, $7::jsonb, $8, $9::uuid,
-               NULLIF($10, ''), NULLIF($11, ''), now())
+               NULLIF($10, ''), NULLIF($11, ''), $12::uuid, now())
        ON CONFLICT (warehouse_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
        RETURNING *`,
       warehouse.id,
@@ -563,6 +566,7 @@ export class LabelsService {
       actor.id,
       idempotencyKey ?? '',
       idempotencyKey ? requestHash : '',
+      carrierLabelId ?? null,
     );
     const printJob = rows[0] ?? await this.resolveRuntimePrintJobReplay(
       warehouse.id,
@@ -575,6 +579,19 @@ export class LabelsService {
     });
 
     return toRuntimePrintJobResponse(printJob);
+  }
+
+  async findLatestShipmentLabelPrintStatuses(warehouseId: string, carrierLabelIds: string[]): Promise<Map<string, string>> {
+    if (!carrierLabelIds.length) return new Map();
+    const rows = await this.query<{ carrier_label_id: string; status: string }>(
+      `SELECT DISTINCT ON (carrier_label_id) carrier_label_id, status
+       FROM wms_print_jobs
+       WHERE warehouse_id = $1::uuid AND carrier_label_id = ANY($2::uuid[])
+       ORDER BY carrier_label_id, created_at DESC, id DESC`,
+      warehouseId,
+      carrierLabelIds,
+    );
+    return new Map(rows.map(row => [row.carrier_label_id, row.status]));
   }
 
   async retryRuntimePrintJob(
@@ -748,9 +765,9 @@ export class LabelsService {
     const rows = await this.query<RuntimePrintJobRow>(
       `INSERT INTO wms_print_jobs
         (warehouse_id, printer_code, agent_code, template_code, template_version, status, copies,
-         max_attempts, payload, rendered_zpl, requested_by_user_id, idempotency_key, request_hash, updated_at)
+         max_attempts, payload, rendered_zpl, requested_by_user_id, idempotency_key, request_hash, carrier_label_id, updated_at)
        VALUES ($1::uuid, NULLIF($2, ''), NULLIF($3, ''), NULLIF($4, ''), $5, 'QUEUED', $6,
-               $7, $8::jsonb, $9, $10::uuid, NULLIF($11, ''), NULLIF($12, ''), now())
+               $7, $8::jsonb, $9, $10::uuid, NULLIF($11, ''), NULLIF($12, ''), $13::uuid, now())
        ON CONFLICT (warehouse_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
        RETURNING *`,
       warehouse.id,
@@ -769,6 +786,7 @@ export class LabelsService {
       actor.id,
       idempotencyKey ?? '',
       idempotencyKey ? requestHash : '',
+      job.carrier_label_id,
     );
     const created = rows[0] ?? await this.resolveRuntimePrintJobReplay(
       warehouse.id,
@@ -797,6 +815,12 @@ export class LabelsService {
     const routing = buildPrintAgentRouting(configuredPrinterCodes, reportedPrinterCodes, dto.acceptUnassignedJobs);
     await this.heartbeatAgent(warehouse.id, agent.code, dto.version, dto.hostname, reportedPrinterCodes);
     const limit = dto.limit ?? 1;
+    const activeLabel = `(carrier_label_id IS NULL OR EXISTS (
+      SELECT 1 FROM carrier_labels label
+      WHERE label.id = wms_print_jobs.carrier_label_id
+        AND label.warehouse_id = wms_print_jobs.warehouse_id
+        AND label.status IN ('GENERATED', 'PRINTED')
+    ))`;
 
     const jobs = routing.legacyWarehouseClaim
       ? await this.query<RuntimePrintJobRow>(
@@ -807,6 +831,7 @@ export class LabelsService {
               OR (status = 'CLAIMED' AND (claim_expires_at IS NULL OR claim_expires_at < now()))
             )
             AND attempts < max_attempts
+            AND ${activeLabel}
            ORDER BY created_at ASC
            LIMIT $3`,
           warehouse.id,
@@ -817,6 +842,7 @@ export class LabelsService {
           `SELECT * FROM wms_print_jobs
            WHERE warehouse_id = $1::uuid
             AND attempts < max_attempts
+            AND ${activeLabel}
             AND (
               (status = 'QUEUED' AND agent_code = $2)
               OR (
@@ -863,6 +889,7 @@ export class LabelsService {
          WHERE id = $1::uuid
           AND warehouse_id = $2::uuid
           AND attempts < max_attempts
+          AND ${activeLabel}
           AND (
             (status = 'QUEUED' AND (agent_code IS NULL OR agent_code = $3))
             OR (status = 'CLAIMED' AND (claim_expires_at IS NULL OR claim_expires_at < now()))
@@ -908,14 +935,26 @@ export class LabelsService {
     }
 
     const rows = await this.query<RuntimePrintJobRow>(
-      `UPDATE wms_print_jobs
+      `WITH updated_job AS (
+       UPDATE wms_print_jobs
        SET status = $3,
            error_message = CASE WHEN $3 = 'PRINTED' THEN NULL ELSE NULLIF($4, '') END,
            claim_expires_at = CASE WHEN $3 = 'PRINTING' THEN now() + ($5::text || ' seconds')::interval ELSE NULL END,
            printed_at = CASE WHEN $3 = 'PRINTED' THEN now() ELSE printed_at END,
            updated_at = now()
        WHERE id = $1::uuid AND warehouse_id = $2::uuid AND status = $6 AND agent_code = $7
-       RETURNING *`,
+       RETURNING *
+       ), confirmed_label AS (
+         UPDATE carrier_labels AS label
+         SET status = 'PRINTED', printed_at = job.printed_at, updated_at = now()
+         FROM updated_job job
+         WHERE job.status = 'PRINTED'
+           AND label.id = job.carrier_label_id
+           AND label.warehouse_id = job.warehouse_id
+           AND label.status = 'GENERATED'
+         RETURNING label.id
+       )
+       SELECT * FROM updated_job`,
       jobId,
       warehouse.id,
       dto.status,

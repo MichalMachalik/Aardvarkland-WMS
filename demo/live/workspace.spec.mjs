@@ -1,5 +1,6 @@
 import { expect, test } from '@playwright/test';
 import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 
 const base = process.env.WMS_LIVE_UI_URL;
 const roles = {
@@ -398,7 +399,7 @@ test('packing keeps orders separate and resumes packages, labels and dispatch fr
   await expect(line(20)).toContainText('Naskenováno 0');
   await orders.selectOption(newer.order.id);
   await expect(packageRow(newer.initial.packageCode)).toBeVisible();
-  await expectNoWrite(packButton);
+  await expect(packButton).toHaveCount(0);
   await orders.selectOption(older.order.id);
   await expect(line(10)).toContainText('Naskenováno 0');
   await scan(sku);
@@ -427,6 +428,48 @@ test('packing keeps orders separate and resumes packages, labels and dispatch fr
     await packageRow(pack.packageCode).getByRole('button', { name: 'Vygenerovat štítek' }).click();
     await expect(packageRow(pack.packageCode)).toContainText('Štítek připraven');
   }
+
+  const firstPack = packageRow(saved[0].packageCode);
+  const downloaded = page.waitForEvent('download');
+  await firstPack.getByRole('button', { name: 'Stáhnout štítek' }).click();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+  const file = await downloaded;
+  expect(file.suggestedFilename()).toMatch(/\.zpl$/);
+  const zpl = await readFile(await file.path(), 'utf8');
+  expect(zpl).toMatch(/^\^XA[\s\S]*\^XZ$/);
+  expect(zpl).toContain(saved[0].trackingNumber);
+
+  const printerCode = `PACK-PRINTER-${run}`;
+  const agentCode = `PACK-AGENT-${run}`;
+  const token = randomUUID();
+  await own('/printers', { code: printerCode, name: 'Packing test printer', protocol: 'WINDOWS_RAW', windowsPrinterName: 'Test-only printer' });
+  await own('/print-agents', { code: agentCode, name: 'Packing test agent', token, printerCodes: [printerCode] });
+  await page.reload();
+  await orders.selectOption(older.order.id);
+  const printer = page.getByRole('combobox', { name: 'Tiskárna' });
+  await expect(printer.getByRole('option', { name: new RegExp(printerCode) })).toBeAttached();
+  await printer.selectOption(printerCode);
+  const queueResponse = page.waitForResponse(response => response.request().method() === 'POST' && response.url().endsWith('/print-jobs'));
+  await firstPack.getByRole('button', { name: 'Zařadit štítek k tisku' }).click();
+  const queued = await queueResponse;
+  expect(queued.ok()).toBe(true);
+  const job = await queued.json();
+  expect(job).toMatchObject({ printerCode, status: 'QUEUED', renderedZpl: zpl });
+  await expect(firstPack).toContainText('Čeká na potvrzení tisku');
+  await expect(firstPack.getByRole('button', { name: 'Zařadit štítek k tisku' })).toBeDisabled();
+  expect((await packages(older)).find(pack => pack.id === saved[0].id).label.status).toBe('GENERATED');
+  const claimed = await own('/print-agent/jobs/claim', { agentCode, token, limit: 1 });
+  expect(claimed.jobs.map(item => item.id)).toEqual([job.id]);
+  const resultPath = `/print-agent/jobs/${job.id}/result`;
+  await own(resultPath, { agentCode, token, status: 'PRINTED' });
+  await own(resultPath, { agentCode, token, status: 'PRINTED' });
+  await page.reload();
+  await orders.selectOption(older.order.id);
+  await expect(firstPack).toContainText('Štítek vytištěn');
+  const labelsAfterPrint = await packages(older);
+  expect(labelsAfterPrint.find(pack => pack.id === saved[0].id).label.status).toBe('PRINTED');
+  expect(labelsAfterPrint.find(pack => pack.id === saved[1].id).label.status).toBe('GENERATED');
+
   await expect(shipButton).toBeEnabled();
   await page.route(`**/shipments/${older.shipment.id}/ship`, route => route.abort(), { times: 1 });
   await shipButton.click();
@@ -435,7 +478,8 @@ test('packing keeps orders separate and resumes packages, labels and dispatch fr
 
   await page.reload();
   await orders.selectOption(older.order.id);
-  for (const pack of saved) await expect(packageRow(pack.packageCode)).toContainText('Štítek připraven');
+  await expect(firstPack).toContainText('Štítek vytištěn');
+  await expect(packageRow(saved[1].packageCode)).toContainText('Štítek připraven');
   await expect(shipButton).toBeEnabled();
   const dispatch = page.waitForResponse(response => response.url().endsWith(`/shipments/${older.shipment.id}/ship`));
   await shipButton.click();
@@ -443,6 +487,7 @@ test('packing keeps orders separate and resumes packages, labels and dispatch fr
   await expect(page.getByRole('status').filter({ hasText: older.order.orderNumber })).toBeVisible();
   expect((await shipments(older))[0].status).toBe('SHIPPED');
   expect((await shipments(newer))[0].status).toBe('PACKING');
+  expect((await packages(older)).find(pack => pack.id === saved[1].id).label.status).toBe('GENERATED');
 
   await orders.selectOption(pickup.order.id);
   expect(await shipments(pickup)).toHaveLength(0);

@@ -268,6 +268,59 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.equal(metrics.labelJobs.failed, before.labelJobs.failed + 1);
   });
 
+  await scenario('shipment labels are linked to confirmed print jobs and scoped to their shipment', async () => {
+    const printerCode = `SHIP-PRINTER-${suffix}`;
+    const agentCode = `SHIP-AGENT-${suffix}`;
+    const token = randomUUID();
+    await own('POST', '/printers', { code: printerCode, name: 'Shipment test printer', protocol: 'WINDOWS_RAW', windowsPrinterName: 'Test-only printer' });
+    await own('POST', '/print-agents', { code: agentCode, name: 'Shipment test agent', token, printerCodes: [printerCode] });
+    const shipment = await own('POST', '/shipments', { shipmentNumber: `PRINT-SHIP-${suffix}` });
+    const otherShipment = await own('POST', '/shipments', { shipmentNumber: `PRINT-OTHER-${suffix}` });
+    const packagesPath = `/shipments/${shipment.id}/packages`;
+    const labelsPath = `/shipments/${shipment.id}/labels`;
+    const left = await own('POST', packagesPath, { packageCode: `PRINT-L-${suffix}` });
+    const right = await own('POST', packagesPath, { packageCode: `PRINT-R-${suffix}` });
+    await own('POST', labelsPath, { packageReference: left.id, labelFormat: 'PDF' }, 400);
+    const leftLabel = await own('POST', labelsPath, { packageReference: left.id });
+    const rightLabel = await own('POST', labelsPath, { packageReference: right.id });
+    const document = await own('GET', `${labelsPath}/${leftLabel.id}/document`);
+    assert.equal(document.format, 'ZPL');
+    assert.equal(document.content, leftLabel.payload.labelData);
+    assert.match(document.content, /^\^XA[\s\S]*\^XZ$/);
+    await own('GET', `/shipments/${otherShipment.id}/labels/${leftLabel.id}/document`, undefined, 404);
+    const printPath = label => `${warehouse}${labelsPath}/${label.id}/print-jobs`;
+    const key = randomUUID();
+    const queued = await asWorker('POST', printPath(leftLabel), { printerCode }, 201, key);
+    assert.equal(queued.renderedZpl, document.content);
+    assert.equal((await asWorker('POST', printPath(leftLabel), { printerCode }, 201, key)).id, queued.id);
+    await asWorker('POST', printPath(rightLabel), { printerCode }, 409, key);
+    const claimPath = `${warehouse}/print-agent/jobs/claim`;
+    const claim = async () => (await request('POST', claimPath, { body: { agentCode, token }, expected: 201 })).data.jobs[0];
+    const report = (job, status) => request('POST', `${warehouse}/print-agent/jobs/${job.id}/result`, {
+      body: { agentCode, token, status }, expected: 201,
+    });
+    const states = async () => new Map((await own('GET', packagesPath)).map(item => [item.id, item.label]));
+    assert.equal((await claim()).id, queued.id);
+    await report(queued, 'FAILED');
+    assert.equal((await states()).get(left.id).status, 'GENERATED');
+    assert.equal((await states()).get(left.id).printStatus, 'FAILED');
+
+    const unrelated = await own('POST', '/print-jobs', {
+      printerCode, renderedZpl: document.content, payload: { carrierLabelId: rightLabel.id },
+    });
+    assert.equal((await claim()).id, unrelated.id);
+    await report(unrelated, 'PRINTED');
+    assert.equal((await states()).get(right.id).status, 'GENERATED');
+    const reprint = await own('POST', `/print-jobs/${queued.id}/reprint`, {});
+    assert.equal((await claim()).id, reprint.id);
+    await report(reprint, 'PRINTED');
+    await report(reprint, 'PRINTED');
+    const current = await states();
+    assert.equal(current.get(left.id).status, 'PRINTED');
+    assert.equal(current.get(left.id).printStatus, 'PRINTED');
+    assert.equal(current.get(right.id).status, 'GENERATED');
+  });
+
   await scenario('automation commands, appointments and replayed events stay scoped to the warehouse', async () => {
     const prefix = '/enterprise-ops';
     const deviceBody = { code: `DEVICE-${suffix}`, deviceType: 'TEST', status: 'ONLINE' };

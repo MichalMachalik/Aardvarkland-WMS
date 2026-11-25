@@ -93,6 +93,8 @@ export const endpoints = {
   shipments: (warehouseId: string) => `/warehouses/${warehouseId}/shipments`,
   shipmentPackages: (warehouseId: string, shipmentId: string) => `/warehouses/${warehouseId}/shipments/${shipmentId}/packages`,
   shipmentLabels: (warehouseId: string, shipmentId: string) => `/warehouses/${warehouseId}/shipments/${shipmentId}/labels`,
+  shipmentLabelDocument: (warehouseId: string, shipmentId: string, labelId: string) => `/warehouses/${warehouseId}/shipments/${shipmentId}/labels/${labelId}/document`,
+  shipmentLabelPrintJobs: (warehouseId: string, shipmentId: string, labelId: string) => `/warehouses/${warehouseId}/shipments/${shipmentId}/labels/${labelId}/print-jobs`,
   stageShipment: (warehouseId: string, shipmentId: string) => `/warehouses/${warehouseId}/shipments/${shipmentId}/stage`,
   shipShipment: (warehouseId: string, shipmentId: string) => `/warehouses/${warehouseId}/shipments/${shipmentId}/ship`,
   observabilityRuntime: () => '/observability/runtime',
@@ -210,6 +212,8 @@ export function listShipmentPackages<T>(warehouseId: string, shipmentId: string,
 export function createShipment<T>(warehouseId: string, body: MutationBody) { return post<T>(endpoints.shipments(warehouseId), body, String(body.idempotencyKey ?? createWmsIdempotencyKey(`storage-create-shipment-${String(body.outboundOrderReference ?? 'shipment')}`))); }
 export function addShipmentPackage<T>(warehouseId: string, shipmentId: string, body: MutationBody) { return post<T>(endpoints.shipmentPackages(warehouseId, shipmentId), body, createWmsIdempotencyKey(`storage-package-${shipmentId}`)); }
 export function generateShipmentLabel<T>(warehouseId: string, shipmentId: string, body: MutationBody = {}) { return post<T>(endpoints.shipmentLabels(warehouseId, shipmentId), body, createWmsIdempotencyKey(`storage-label-${shipmentId}`)); }
+export function getShipmentLabelDocument<T>(warehouseId: string, shipmentId: string, labelId: string) { return apiRequest<T>(endpoints.shipmentLabelDocument(warehouseId, shipmentId, labelId)); }
+export function printShipmentLabel<T>(warehouseId: string, shipmentId: string, labelId: string, body: MutationBody) { return post<T>(endpoints.shipmentLabelPrintJobs(warehouseId, shipmentId, labelId), body, String(body.idempotencyKey ?? '')); }
 export function stageShipment<T>(warehouseId: string, shipmentId: string, body: MutationBody = {}) { return post<T>(endpoints.stageShipment(warehouseId, shipmentId), body, createWmsIdempotencyKey(`storage-stage-${shipmentId}`)); }
 export function shipShipment<T>(warehouseId: string, shipmentId: string, body: MutationBody = {}) { return post<T>(endpoints.shipShipment(warehouseId, shipmentId), body, createWmsIdempotencyKey(`storage-ship-${shipmentId}`)); }
 export function getRfQueue<T>(warehouseId: string, query?: QueryParams, options?: ReadOptions) { return get<T>(endpoints.rfQueue(warehouseId), query, options); }

@@ -29,5 +29,6 @@ import { LabelsService } from './labels.service';
     ScanResolverController,
   ],
   providers: [Gs1SyntaxService, LabelsService],
+  exports: [LabelsService],
 })
 export class LabelsModule {}

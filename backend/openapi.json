@@ -14569,6 +14569,104 @@
           "Health"
         ]
       }
+    },
+    "/api/warehouses/{warehouseId}/shipments/{shipmentId}/labels/{labelId}/document": {
+      "get": {
+        "operationId": "ShippingController_downloadLabel",
+        "parameters": [
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "shipmentId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "labelId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "tags": [
+          "packing-shipping"
+        ]
+      }
+    },
+    "/api/warehouses/{warehouseId}/shipments/{shipmentId}/labels/{labelId}/print-jobs": {
+      "post": {
+        "operationId": "ShippingController_printLabel",
+        "parameters": [
+          {
+            "name": "warehouseId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "shipmentId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "labelId",
+            "required": true,
+            "in": "path",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PrintShipmentLabelDto"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ],
+        "tags": [
+          "packing-shipping"
+        ]
+      }
     }
   },
   "info": {
@@ -21263,6 +21361,22 @@
             "example": false
           }
         }
+      },
+      "PrintShipmentLabelDto": {
+        "type": "object",
+        "properties": {
+          "printerCode": {
+            "type": "string",
+            "example": "PACK-01"
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "example": "shipment-label-print-1"
+          }
+        },
+        "required": [
+          "printerCode"
+        ]
       }
     }
   }

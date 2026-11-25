@@ -16,6 +16,7 @@ test('mandatory idempotency remains enabled only for service paths that consume 
     '/api/warehouses/MAIN/inventory/quants/receive',
     '/api/warehouses/MAIN/print-jobs',
     '/api/warehouses/MAIN/print-jobs/JOB-1/reprint',
+    '/api/warehouses/MAIN/shipments/SHP-1/labels/LBL-1/print-jobs',
   ]) {
     assert.equal(isIdempotencyKeyRequired('POST', path), true, path);
   }
@@ -55,5 +56,8 @@ test('task, fulfillment and shipping writes are not advertised as idempotent whi
 
   assert.doesNotMatch(source('src/warehouse-tasks/warehouse-tasks.service.ts'), /\bdto\.idempotencyKey\b/);
   assert.doesNotMatch(source('src/fulfillment/fulfillment.service.ts'), /\bdto\.idempotencyKey\b/);
-  assert.doesNotMatch(source('src/shipping/shipping.service.ts'), /\bdto\.idempotencyKey\b/);
+  const shipping = source('src/shipping/shipping.service.ts');
+  const shipmentLabelPrinting = shipping.match(/\basync printLabel\([\s\S]+?(?=\s+private async resolvePrintableLabel)/)?.[0] ?? '';
+  assert.match(shipmentLabelPrinting, /labelsService\.createRuntimePrintJob\([\s\S]+idempotencyKey:\s*dto\.idempotencyKey/);
+  assert.doesNotMatch(shipping.replace(shipmentLabelPrinting, ''), /\bdto\.idempotencyKey\b/);
 });

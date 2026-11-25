@@ -1,18 +1,21 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 
 import { AuthenticatedUser } from '../access-control/types';
 import { normalizeOffsetPagination } from '../common';
 import { OwnerClientRecord, OwnerScopePrismaClient, OwnerScopeService } from '../clients/owner-scope.service';
 import { lockPostgresAdvisoryTransaction, lockPostgresRowById, PrismaService, withTransactionRetry } from '../database';
+import { LabelsService } from '../labels/labels.service';
 import { AddShipmentPackageDto } from './dto/add-shipment-package.dto';
 import { CreatePackingStationDto } from './dto/create-packing-station.dto';
 import { CreateShipmentDto } from './dto/create-shipment.dto';
 import { GenerateCarrierLabelDto } from './dto/generate-carrier-label.dto';
 import { ListShipmentPackagesQueryDto } from './dto/list-shipment-packages-query.dto';
 import { ListShipmentsQueryDto } from './dto/list-shipments-query.dto';
+import { PrintShipmentLabelDto } from './dto/print-shipment-label.dto';
 import { ShipShipmentDto } from './dto/ship-shipment.dto';
 import { StageShipmentDto } from './dto/stage-shipment.dto';
 import { makePackageCode, makeShipmentNumber, makeTrackingNumber } from './shipping.helpers';
+import { readStoredLabelDocument, renderShipmentLabel } from './shipment-label.helpers';
 import {
   CarrierLabelResponse,
   CarrierLabelStatus,
@@ -26,7 +29,11 @@ import {
 
 @Injectable()
 export class ShippingService {
-  constructor(private readonly prisma: PrismaService, private readonly ownerScope: OwnerScopeService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly ownerScope: OwnerScopeService,
+    private readonly labelsService: LabelsService,
+  ) {}
 
   async listStations(warehouseReference: string): Promise<PackingStationResponse[]> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
@@ -127,6 +134,7 @@ export class ShippingService {
       this.client.packageContent.findMany({ where: { packageId: { in: packages.map((pack) => pack.id) } } }),
       this.client.carrierLabel.findMany({
         where: { shipmentId: shipment.id, status: { in: [CarrierLabelStatus.GENERATED, CarrierLabelStatus.PRINTED] } },
+        orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       }),
     ]);
     const contentsByPackage = new Map<string, PackageContentRecord[]>();
@@ -135,12 +143,21 @@ export class ShippingService {
       if (existing) existing.push(content);
       else contentsByPackage.set(content.packageId, [content]);
     }
-    const labelledPackages = new Set(labels.map((label) => label.packageId));
-    return packages.map((pack) => toPackageResponse(
-      pack,
-      contentsByPackage.get(pack.id),
-      labelledPackages.has(null) || labelledPackages.has(pack.id),
-    ));
+    const labelByPackage = new Map<string | null, CarrierLabelRecord>();
+    for (const label of labels) {
+      if (!labelByPackage.has(label.packageId)) labelByPackage.set(label.packageId, label);
+    }
+    const printStatuses = await this.labelsService.findLatestShipmentLabelPrintStatuses(warehouse.id, labels.map(label => label.id));
+    return packages.map((pack) => {
+      const label = labelByPackage.get(pack.id) ?? labelByPackage.get(null);
+      return toPackageResponse(pack, contentsByPackage.get(pack.id), label ? {
+        id: label.id,
+        reference: label.labelReference,
+        format: label.labelFormat,
+        status: label.status as CarrierLabelStatus,
+        printStatus: printStatuses.get(label.id) ?? null,
+      } : null);
+    });
   }
 
   async createShipment(
@@ -325,6 +342,10 @@ export class ShippingService {
     actor: AuthenticatedUser,
   ): Promise<CarrierLabelResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
+    const labelFormat = normalizeCode(dto.labelFormat ?? 'ZPL');
+    if (labelFormat !== 'ZPL') {
+      throw new BadRequestException('Warehouse labels must use ZPL');
+    }
     return this.transaction(async (tx) => {
       const shipment = await this.lockShipment(tx, warehouse.id, shipmentReference);
       const pack = dto.packageReference
@@ -344,13 +365,18 @@ export class ShippingService {
       const trackingNumber =
         dto.trackingNumber ?? pack?.trackingNumber ?? makeTrackingNumber(shipment.carrier, shipment.shipmentNumber);
       const labelReference = normalizeCode(`LBL-${trackingNumber}`);
-      const labelFormat = normalizeCode(dto.labelFormat ?? 'ZPL');
       await lockPostgresAdvisoryTransaction(tx, 'idempotency_key', `shipment-label:${warehouse.id}:${labelReference}`);
       const [existing] = await tx.carrierLabel.findMany({ where: { warehouseId: warehouse.id, labelReference } });
       if (existing) {
         if (existing.shipmentId === shipment.id && existing.packageId === (pack?.id ?? null)
           && existing.labelFormat === labelFormat && ['GENERATED', 'PRINTED'].includes(existing.status)) {
-          return toLabelResponse(existing);
+          return {
+            ...toLabelResponse(existing),
+            payload: {
+              ...toRecord(existing.payload),
+              labelData: this.getLabelDocument(existing, shipment).content,
+            },
+          };
         }
         throw new ConflictException('A different label already uses this tracking number');
       }
@@ -371,6 +397,7 @@ export class ShippingService {
             trackingNumber,
             carrier: shipment.carrier,
             serviceLevel: shipment.serviceLevel,
+            labelData: renderShipmentLabel(pack?.packageCode ?? shipment.shipmentNumber, trackingNumber),
             customPayload: dto.payload ?? null,
           },
         },
@@ -396,6 +423,64 @@ export class ShippingService {
       });
       return toLabelResponse(label);
     });
+  }
+
+  async downloadLabel(warehouseReference: string, shipmentReference: string, labelId: string) {
+    const { shipment, label } = await this.resolvePrintableLabel(warehouseReference, shipmentReference, labelId);
+    return { reference: label.labelReference, ...this.getLabelDocument(label, shipment) };
+  }
+
+  async printLabel(
+    warehouseReference: string,
+    shipmentReference: string,
+    labelId: string,
+    dto: PrintShipmentLabelDto,
+    actor: AuthenticatedUser,
+  ) {
+    const { shipment, label } = await this.resolvePrintableLabel(warehouseReference, shipmentReference, labelId);
+    const document = this.getLabelDocument(label, shipment);
+    if (document.format !== 'ZPL') {
+      throw new ConflictException('Only ZPL labels can be queued for warehouse printers');
+    }
+    const printerCode = dto.printerCode.trim();
+    if (!printerCode) throw new BadRequestException('Printer code is required');
+    return this.labelsService.createRuntimePrintJob(shipment.warehouseId, {
+      printerCode,
+      idempotencyKey: dto.idempotencyKey,
+      payload: { shipmentNumber: shipment.shipmentNumber, labelReference: label.labelReference },
+      renderedZpl: document.content,
+    }, actor, label.id);
+  }
+
+  private async resolvePrintableLabel(warehouseReference: string, shipmentReference: string, labelId: string) {
+    const warehouse = await this.resolveWarehouse(warehouseReference);
+    const shipment = await this.resolveShipment(warehouse.id, shipmentReference);
+    const [label] = isUuid(labelId) ? await this.client.carrierLabel.findMany({
+      where: { warehouseId: warehouse.id, shipmentId: shipment.id, id: labelId },
+    }) : [];
+    if (!label) throw new NotFoundException('Shipment label was not found');
+    if (shipment.status === ShipmentStatus.CANCELLED || !['GENERATED', 'PRINTED'].includes(label.status)) {
+      throw new ConflictException('Shipment label is not ready for printing');
+    }
+    if (label.packageId) {
+      const pack = await this.resolvePackage(this.client, warehouse.id, label.packageId);
+      if (pack.shipmentId !== shipment.id || pack.status === ShipmentPackageStatus.CANCELLED) {
+        throw new ConflictException('Shipment package is not ready for printing');
+      }
+    }
+    return { shipment, label };
+  }
+
+  private getLabelDocument(label: CarrierLabelRecord, shipment: ShipmentRecord) {
+    const stored = readStoredLabelDocument(label.labelFormat, label.payload);
+    if (stored) return stored;
+    const payload = toRecord(label.payload);
+    if (label.labelFormat === 'ZPL' && label.trackingNumber && payload['shipmentNumber'] === shipment.shipmentNumber
+      && 'customPayload' in payload && !('labelData' in payload)) {
+      const reference = typeof payload['packageCode'] === 'string' ? payload['packageCode'] : shipment.shipmentNumber;
+      return { format: 'ZPL' as const, content: renderShipmentLabel(reference, label.trackingNumber) };
+    }
+    throw new ConflictException('Shipment label has no printable document');
   }
 
   async stageShipment(
@@ -499,11 +584,6 @@ export class ShippingService {
         },
         data: { status: ShipmentPackageStatus.SHIPPED },
       });
-      await tx.carrierLabel.updateMany({
-        where: { shipmentId: shipment.id, status: CarrierLabelStatus.GENERATED },
-        data: { status: CarrierLabelStatus.PRINTED, printedAt: shippedAt },
-      });
-
       if (shipment.outboundOrderId) {
         const order = await tx.outboundOrder.findFirst({ where: { id: shipment.outboundOrderId } });
         await tx.outboundOrder.update({
@@ -943,7 +1023,7 @@ function toShipmentResponse(shipment: ShipmentRecord): ShipmentResponse {
 function toPackageResponse(
   pack: ShipmentPackageRecord,
   contents: ShipmentPackageResponse['contents'] = [],
-  labelReady = false,
+  label: ShipmentPackageResponse['label'] = null,
 ): ShipmentPackageResponse {
   return {
     id: pack.id,
@@ -959,7 +1039,8 @@ function toPackageResponse(
     heightCm: pack.heightCm ?? null,
     trackingNumber: pack.trackingNumber ?? null,
     contents: contents.map(({ outboundOrderLineId, sku, quantity }) => ({ outboundOrderLineId, sku, quantity })),
-    labelReady,
+    labelReady: Boolean(label),
+    label,
     metadata: pack.metadata ?? null,
   };
 }

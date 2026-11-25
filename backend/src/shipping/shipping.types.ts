@@ -78,6 +78,13 @@ export interface ShipmentPackageResponse {
   heightCm: number | null;
   trackingNumber: string | null;
   labelReady: boolean;
+  label: {
+    id: string;
+    reference: string;
+    format: string;
+    status: CarrierLabelStatus;
+    printStatus: string | null;
+  } | null;
   contents: Array<{ outboundOrderLineId: string | null; sku: string; quantity: number }>;
   metadata: unknown;
 }

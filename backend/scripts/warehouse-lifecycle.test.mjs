@@ -133,13 +133,18 @@ test('warehouse workflows on a disposable database', {
     const labels = await Promise.all([own(labelPath, labelBody), own(labelPath, labelBody)]);
     assert.ok(labels[0].id, 'A label must be generated for the test parcel');
     assert.equal(labels[1].id, labels[0].id);
-    assert.equal((await own(packagesPath))[0].labelReady, true);
+    const document = await own(`${labelPath}/${labels[0].id}/document`);
+    assert.equal(document.format, 'ZPL');
+    assert.match(document.content, /^\^XA[\s\S]*\^XZ$/);
+    assert.ok(document.content.includes(labels[0].trackingNumber));
+    assert.equal((await own(packagesPath))[0].label.status, 'GENERATED');
     const shipping = await Promise.allSettled([own(shipPath, {}), own(shipPath, {})]);
     const confirmed = shipping.filter(result => result.status === 'fulfilled');
     assert.equal(confirmed.length, 1);
     assert.equal(confirmed[0].value.status, 'SHIPPED');
     assert.match(shipping.find(result => result.status === 'rejected')?.reason?.message ?? '', /returned 409/);
     assert.equal((await own(`/outbound-orders/${order.id}`)).status, 'SHIPPED');
+    assert.equal((await own(packagesPath))[0].label.status, 'GENERATED');
   });
 
   await context.test('inbound receipts stay consistent across retries, concurrent writes and active stock freezes', async () => {

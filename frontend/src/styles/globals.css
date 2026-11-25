@@ -1051,6 +1051,7 @@ code { max-width: 100%; overflow-wrap: anywhere; white-space: normal; }
 .packing-workbench, .packing-workbench--os, .packing-desk, .packing-desk--pro { display: grid; grid-template-columns: 1fr 330px; gap: 16px; }
 .packing-lines { display: grid; gap: 10px; margin-top: 14px; }
 .packing-lines article { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 12px; align-items: center; padding: 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+.packing-lines article > div:first-child { min-width: 0; overflow-wrap: anywhere; }
 .label-preview, .label-preview--pro { min-height: 320px; display: grid; align-content: center; justify-items: center; gap: 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
 .barcode { width: 230px; height: 90px; background: repeating-linear-gradient(90deg, var(--text) 0 3px, transparent 3px 7px, var(--text) 7px 9px, transparent 9px 15px); }
 .decision-summary { min-height: 260px; display: flex; flex-direction: column; justify-content: center; gap: 12px; padding: 18px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-muted); }
@@ -1720,6 +1721,7 @@ code { max-width: 100%; overflow-wrap: anywhere; white-space: normal; }
   .span-3, .span-4, .span-5, .span-6, .span-7, .span-8, .span-9 { grid-column: span 12; }
   .client-panel-grid, .client-kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .client-portal-shell, .packing-workbench, .packing-workbench--os, .packing-desk, .packing-desk--pro { grid-template-columns: 1fr; }
+  .packing-lines article:has(> .action-panel) { grid-template-columns: minmax(0, 1fr); }
   .phone-preview { width: min(100%, 380px); }
   .login-card { grid-template-columns: 1fr; min-height: 0; width: min(470px, 100%); }
   .login-card__visual { padding: 22px; }
