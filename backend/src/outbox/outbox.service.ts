@@ -388,6 +388,7 @@ export class OutboxService {
             event.type,
             event.aggregate_type AS "aggregateType",
             event.aggregate_id AS "aggregateId",
+            event.target_endpoint_id AS "targetEndpointId",
             event.payload,
             event.status,
             event.attempts,
@@ -406,6 +407,7 @@ export class OutboxService {
           type,
           aggregate_type AS "aggregateType",
           aggregate_id AS "aggregateId",
+          target_endpoint_id AS "targetEndpointId",
           payload,
           status,
           attempts,
@@ -466,6 +468,7 @@ export class OutboxService {
       type: event.type,
       aggregateType: event.aggregateType ?? null,
       aggregateId: event.aggregateId ?? null,
+      targetEndpointId: event.targetEndpointId ?? null,
       payload: event.payload ?? {},
       attempts: event.attempts ?? 0,
       createdAt: event.createdAt,
@@ -739,6 +742,7 @@ interface OutboxEventRecord {
   type: string;
   aggregateType?: string | null;
   aggregateId?: string | null;
+  targetEndpointId?: string | null;
   payload?: unknown;
   status?: string | null;
   attempts?: number | null;

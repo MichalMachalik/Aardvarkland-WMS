@@ -1,7 +1,8 @@
 import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 
 import { AuthenticatedUser } from '../access-control/types';
-import { PrismaService } from '../database';
+import { lockPostgresRowById, PrismaService, withTransactionRetry } from '../database';
+import { OutboxEvent, Prisma } from '../generated/prisma/client';
 import { CreateExternalSystemDto } from './dto/create-external-system.dto';
 import { ReplayDeadLetterDto } from './dto/replay-dead-letter.dto';
 import { ResolveDeadLetterDto } from './dto/resolve-dead-letter.dto';
@@ -109,61 +110,87 @@ export class IntegrationEnterpriseService {
     dto: ReplayDeadLetterDto,
     actor: AuthenticatedUser,
   ): Promise<IntegrationReplayResponse> {
-    const existing = await this.findDeadLetter(deadLetterReference);
-    let outboxEventId = existing.outbox_event_id;
-    let replayCreated = false;
+    return withTransactionRetry(() => this.prisma.$transaction(async tx => {
+      const existing = await this.lockDeadLetter(tx, deadLetterReference);
+      const previous = await this.findReplayOutbox(tx, existing);
+      if (existing.status === IntegrationDeadLetterStatus.REPLAYED && previous && (!dto.force || isQueued(previous))) {
+        return {
+          deadLetterId: existing.id,
+          status: IntegrationDeadLetterStatus.REPLAYED,
+          outboxEventId: previous.id,
+          replayCreated: false,
+          replayedAt: existing.replayed_at ?? previous.createdAt,
+        };
+      }
+      if (!dto.force && ([
+        IntegrationDeadLetterStatus.RESOLVED,
+        IntegrationDeadLetterStatus.IGNORED,
+        IntegrationDeadLetterStatus.REPLAYED,
+      ] as string[]).includes(existing.status)) {
+        throw new ConflictException('This dead letter needs an explicit repeat replay');
+      }
 
-    if (existing.status === IntegrationDeadLetterStatus.RESOLVED && !dto.force) {
-      throw new ConflictException('Dead letter is already resolved. Use force=true to replay anyway.');
-    }
+      const original = previous?.id === existing.outbox_event_id
+        ? previous : await this.lockOutboxEvent(tx, existing.outbox_event_id);
+      if (isQueued(original) || isQueued(previous)) {
+        throw new ConflictException('An outbox event for this dead letter is already pending or processing');
+      }
+      if (!dto.force && original && (original.status === 'SENT' || original.sentAt)) {
+        throw new ConflictException('This outbox event was already sent. Confirm an explicit replay.');
+      }
 
-    if (outboxEventId) {
-      await this.execute(
-        `UPDATE outbox_events
-         SET status = 'PENDING', attempts = 0, last_error = NULL, available_at = now(), updated_at = now()
-         WHERE id = $1::uuid`,
-        outboxEventId,
-      );
-    } else {
-      const rows = await this.query<{ id: string }>(
-        `INSERT INTO outbox_events (type, aggregate_type, aggregate_id, payload, status, attempts, available_at)
-         VALUES ($1, $2, $3, $4::jsonb, 'PENDING', 0, now())
-         RETURNING id`,
-        existing.event_type,
-        existing.resource_type ?? 'integration_dead_letter',
-        existing.resource_id ?? existing.id,
-        json({ replayedDeadLetterId: existing.id, originalPayload: existing.payload ?? null }),
-      );
-      outboxEventId = rows[0]?.id ?? null;
-      replayCreated = true;
-    }
+      const targetEndpointId = existing.endpoint_id ?? previous?.targetEndpointId ?? original?.targetEndpointId ?? null;
+      if (targetEndpointId && !await tx.integrationEndpoint.findFirst({
+        where: { id: targetEndpointId, status: 'ACTIVE' }, select: { id: true },
+      })) {
+        throw new ConflictException('The failed endpoint is unavailable for replay');
+      }
 
-    const rows = await this.query<IntegrationDeadLetterRow>(
-      `UPDATE integration_dead_letters SET
-         status = $1,
-         replayed_at = now(),
-         metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb,
-         updated_at = now()
-       WHERE id = $3::uuid
-       RETURNING *`,
-      IntegrationDeadLetterStatus.REPLAYED,
-      json({ ...(dto.metadata ?? {}), note: dto.note ?? null, replayedByUserId: actor.id, outboxEventId }),
-      existing.id,
-    );
-    const updated = requiredRow(rows, 'Dead letter was not replayed');
-    await this.writeAudit(actor, 'integration_dead_letter.replayed', 'integration_dead_letter', updated.id, null, {
-      outboxEventId,
-      replayCreated,
-      note: dto.note ?? null,
-    });
-
-    return {
-      deadLetterId: updated.id,
-      status: updated.status as IntegrationDeadLetterStatus,
-      outboxEventId,
-      replayCreated,
-      replayedAt: updated.replayed_at ?? new Date(),
-    };
+      const now = new Date();
+      const source = original ?? previous;
+      const legacyPayload = toObject(source?.payload);
+      const wrapped = !existing.replay_outbox_event_id && !original && legacyPayload['replayedDeadLetterId'] === existing.id;
+      const payload = wrapped ? legacyPayload['originalPayload'] : source?.payload;
+      const candidate = previous ?? original;
+      const reusable = !wrapped && candidate?.targetEndpointId === targetEndpointId ? candidate : null;
+      const queued = reusable
+        ? await tx.outboxEvent.update({
+            where: { id: reusable.id },
+            data: { status: 'PENDING', attempts: 0, lastError: null, sentAt: null, availableAt: now },
+          })
+        : await tx.outboxEvent.create({
+            data: {
+              type: source?.type ?? existing.event_type,
+              aggregateType: source?.aggregateType ?? existing.resource_type ?? 'integration_dead_letter',
+              aggregateId: source?.aggregateId ?? existing.resource_id ?? existing.id,
+              payload: (payload ?? existing.payload ?? {}) as Prisma.InputJsonValue,
+              targetEndpointId,
+              availableAt: now,
+            },
+          });
+      const details = { outboxEventId: queued.id, replayCreated: !reusable, note: dto.note ?? null };
+      await tx.integrationDeadLetter.update({
+        where: { id: existing.id },
+        data: {
+          status: IntegrationDeadLetterStatus.REPLAYED,
+          replayedAt: now,
+          replayOutboxEventId: queued.id,
+          nextRetryAt: null,
+          metadata: {
+            ...toObject(existing.metadata), ...dto.metadata,
+            note: details.note, replayedByUserId: actor.id, outboxEventId: queued.id,
+          } as Prisma.InputJsonObject,
+        },
+      });
+      await this.writeAudit(actor, 'integration_dead_letter.replayed', 'integration_dead_letter', existing.id, null, details, tx);
+      return {
+        deadLetterId: existing.id,
+        status: IntegrationDeadLetterStatus.REPLAYED,
+        outboxEventId: queued.id,
+        replayCreated: details.replayCreated,
+        replayedAt: now,
+      };
+    }));
   }
 
   async runReconciliation(
@@ -449,28 +476,29 @@ export class IntegrationEnterpriseService {
     dto: ResolveDeadLetterDto,
     actor: AuthenticatedUser,
   ): Promise<IntegrationDeadLetterResponse> {
-    const existing = await this.findDeadLetter(deadLetterReference);
-    const timestampColumn = dto.status === IntegrationDeadLetterStatus.REPLAYED ? 'replayed_at' : 'resolved_at';
-    const rows = await this.query<IntegrationDeadLetterRow>(
-      `UPDATE integration_dead_letters SET
-         status = $1,
-         ${timestampColumn} = now(),
-         metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb,
-         updated_at = now()
-       WHERE id = $3::uuid
-       RETURNING *`,
-      dto.status,
-      json({ ...(dto.metadata ?? {}), note: dto.note ?? null, resolvedByUserId: actor.id }),
-      existing.id,
-    );
-    const deadLetter = requiredRow(rows, 'Integration dead letter was not updated');
-    await this.writeAudit(actor, 'integration_dead_letter.resolved', 'integration_dead_letter', deadLetter.id, null, {
-      status: deadLetter.status,
-      note: dto.note ?? null,
-    });
-    return toDeadLetterResponse(deadLetter);
-  }
+    return withTransactionRetry(() => this.prisma.$transaction(async tx => {
+      const existing = await this.lockDeadLetter(tx, deadLetterReference);
+      if (existing.status === dto.status) return toDeadLetterResponse(existing);
 
+      const metadata = json({ ...dto.metadata, note: dto.note ?? null, resolvedByUserId: actor.id });
+      const rows = await tx.$queryRaw<IntegrationDeadLetterRow[]>`
+        UPDATE integration_dead_letters
+        SET status = ${dto.status},
+            resolved_at = statement_timestamp() AT TIME ZONE 'UTC',
+            next_retry_at = NULL,
+            metadata = COALESCE(metadata, '{}'::jsonb) || ${metadata}::jsonb,
+            updated_at = statement_timestamp() AT TIME ZONE 'UTC'
+        WHERE id = ${existing.id}::uuid
+        RETURNING *
+      `;
+      const deadLetter = requiredRow(rows, 'Integration dead letter was not updated');
+      await this.writeAudit(actor, 'integration_dead_letter.resolved', 'integration_dead_letter', deadLetter.id, null, {
+        status: deadLetter.status,
+        note: dto.note ?? null,
+      }, tx);
+      return toDeadLetterResponse(deadLetter);
+    }));
+  }
 
   private async buildReconciliationBucket(input: {
     resourceType: string;
@@ -479,74 +507,83 @@ export class IntegrationEnterpriseService {
     ownerClientId: string | null;
   }): Promise<IntegrationReconciliationResponse['resources'][number]> {
     const resource = RECONCILIATION_RESOURCES[input.resourceType];
-    const mappedRows = await this.query<{ count: number | string | bigint }>(
-      `SELECT count(*) AS count
-       FROM external_id_mappings
-       WHERE resource_type = $1
-         AND ($2::uuid IS NULL OR external_system_id = $2::uuid)
-         AND ($3::uuid IS NULL OR warehouse_id = $3::uuid)
-         AND ($4::uuid IS NULL OR owner_client_id = $4::uuid)`,
+    const mappings = `SELECT resource_id, warehouse_id, owner_client_id
+      FROM external_id_mappings
+      WHERE resource_type = $1
+        AND ($2::uuid IS NULL OR external_system_id = $2::uuid)
+        AND ($3::uuid IS NULL OR warehouse_id = $3::uuid)
+        AND ($4::uuid IS NULL OR owner_client_id = $4::uuid)`;
+    const parameters = [
       input.resourceType,
       input.externalSystemId,
       input.warehouseId,
       input.ownerClientId,
-    );
+    ];
 
     if (!resource) {
+      const [mapped] = await this.query<{ count: bigint }>(`SELECT count(*) AS count FROM (${mappings}) mapping`, ...parameters);
       return {
         resourceType: input.resourceType,
-        mappedCount: toNumber(mappedRows[0]?.count ?? 0),
+        mappedCount: toNumber(mapped?.count ?? 0),
         orphanMappingCount: 0,
         missingMappingCount: 0,
       };
     }
 
-    const orphanRows = await this.query<{ count: number | string | bigint }>(
-      `SELECT count(*) AS count
-       FROM external_id_mappings m
-       WHERE m.resource_type = $1
-         AND ($2::uuid IS NULL OR m.external_system_id = $2::uuid)
-         AND ($3::uuid IS NULL OR m.warehouse_id = $3::uuid)
-         AND ($4::uuid IS NULL OR m.owner_client_id = $4::uuid)
-         AND NOT EXISTS (SELECT 1 FROM ${resource.tableName} r WHERE r.id::text = m.resource_id)`,
-      input.resourceType,
-      input.externalSystemId,
-      input.warehouseId,
-      input.ownerClientId,
-    );
-    const missingRows = await this.query<{ count: number | string | bigint }>(
-      `SELECT count(*) AS count
-       FROM ${resource.tableName} r
-       WHERE ($1::uuid IS NULL OR r.${resource.warehouseColumn} = $1::uuid)
-         AND ($2::uuid IS NULL OR r.${resource.ownerClientColumn} = $2::uuid)
-         AND NOT EXISTS (
-           SELECT 1 FROM external_id_mappings m
-           WHERE m.resource_type = $3
-             AND m.resource_id = r.id::text
-             AND ($4::uuid IS NULL OR m.external_system_id = $4::uuid)
-         )`,
-      input.warehouseId,
-      input.ownerClientId,
-      input.resourceType,
-      input.externalSystemId,
+    const matchingScope = `m.resource_id = r.id::text
+      AND (m.warehouse_id IS NULL OR m.warehouse_id = r.${resource.warehouseColumn})
+      AND (m.owner_client_id IS NULL OR m.owner_client_id = r.${resource.ownerClientColumn})`;
+    const [counts] = await this.query<{ mapped: bigint; orphaned: bigint; missing: bigint }>(
+      `WITH mappings AS (${mappings})
+       SELECT
+         (SELECT count(*) FROM mappings) AS mapped,
+         (SELECT count(*) FROM mappings m WHERE NOT EXISTS (
+           SELECT 1 FROM ${resource.tableName} r WHERE ${matchingScope}
+         )) AS orphaned,
+         (SELECT count(*) FROM ${resource.tableName} r
+          WHERE ($3::uuid IS NULL OR r.${resource.warehouseColumn} = $3::uuid)
+            AND ($4::uuid IS NULL OR r.${resource.ownerClientColumn} = $4::uuid)
+            AND NOT EXISTS (SELECT 1 FROM mappings m WHERE ${matchingScope})
+         ) AS missing`,
+      ...parameters,
     );
 
     return {
       resourceType: input.resourceType,
-      mappedCount: toNumber(mappedRows[0]?.count ?? 0),
-      orphanMappingCount: toNumber(orphanRows[0]?.count ?? 0),
-      missingMappingCount: toNumber(missingRows[0]?.count ?? 0),
+      mappedCount: toNumber(counts?.mapped ?? 0),
+      orphanMappingCount: toNumber(counts?.orphaned ?? 0),
+      missingMappingCount: toNumber(counts?.missing ?? 0),
     };
   }
 
-  private async findDeadLetter(reference: string): Promise<IntegrationDeadLetterRow> {
-    const rows = await this.query<IntegrationDeadLetterRow>(
-      `SELECT * FROM integration_dead_letters WHERE id::text = $1 OR fingerprint = $1 LIMIT 1`,
-      reference,
-    );
+  private async lockDeadLetter(tx: Prisma.TransactionClient, reference: string): Promise<IntegrationDeadLetterRow> {
+    const normalized = reference.trim();
+    const rows = await tx.$queryRaw<IntegrationDeadLetterRow[]>`
+      SELECT * FROM integration_dead_letters
+      WHERE id::text = ${normalized} OR fingerprint = ${normalized}
+      LIMIT 1 FOR UPDATE
+    `;
     const row = rows[0];
     if (!row) throw new NotFoundException('Integration dead letter was not found');
     return row;
+  }
+
+  private async lockOutboxEvent(tx: Prisma.TransactionClient, id: string | null): Promise<OutboxEvent | null> {
+    if (!id) return null;
+    await lockPostgresRowById(tx, 'outbox_events', id);
+    return tx.outboxEvent.findUnique({ where: { id } });
+  }
+
+  private async findReplayOutbox(tx: Prisma.TransactionClient, existing: IntegrationDeadLetterRow): Promise<OutboxEvent | null> {
+    if (existing.replay_outbox_event_id) return this.lockOutboxEvent(tx, existing.replay_outbox_event_id);
+    // Earlier versions put the replay reference only in metadata.
+    const id = toObject(existing.metadata)['outboxEventId'];
+    if (!existing.replayed_at || typeof id !== 'string' || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(id)) {
+      return null;
+    }
+    const replay = await this.lockOutboxEvent(tx, id);
+    return replay && (id === existing.outbox_event_id || toObject(replay.payload)['replayedDeadLetterId'] === existing.id)
+      ? replay : null;
   }
 
   private async resolveExternalSystem(reference: string): Promise<ExternalSystemRow> {
@@ -589,8 +626,9 @@ export class IntegrationEnterpriseService {
     resourceId: string,
     warehouseId: string | null,
     metadata: Record<string, unknown>,
+    db: Pick<Prisma.TransactionClient, '$executeRawUnsafe'> = this.prisma,
   ): Promise<void> {
-    await this.execute(
+    await db.$executeRawUnsafe(
       `INSERT INTO audit_logs (actor_user_id, warehouse_id, action, resource_type, resource_id, metadata)
        VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6::jsonb)`,
       actor.id,
@@ -606,15 +644,16 @@ export class IntegrationEnterpriseService {
     return this.prisma.$queryRawUnsafe<T[]>(query, ...values);
   }
 
-  private execute(query: string, ...values: unknown[]): Promise<number> {
-    return this.prisma.$executeRawUnsafe(query, ...values);
-  }
 }
 
 function requiredRow<T>(rows: T[], message: string): T {
   const row = rows[0];
   if (!row) throw new ConflictException(message);
   return row;
+}
+
+function isQueued(event: OutboxEvent | null): boolean {
+  return event?.status === 'PENDING' || event?.status === 'PROCESSING';
 }
 
 function toExternalSystemResponse(row: ExternalSystemRow): ExternalSystemResponse {
@@ -684,6 +723,7 @@ function toDeadLetterResponse(row: IntegrationDeadLetterRow): IntegrationDeadLet
     id: row.id,
     endpointId: row.endpoint_id,
     outboxEventId: row.outbox_event_id,
+    replayOutboxEventId: row.replay_outbox_event_id,
     inboxEventId: row.inbox_event_id,
     eventType: row.event_type,
     resourceType: row.resource_type,
@@ -784,6 +824,7 @@ interface DeadLetterDashboardRow {
 interface IntegrationDeadLetterRow extends TimestampedRow {
   endpoint_id: string | null;
   outbox_event_id: string | null;
+  replay_outbox_event_id: string | null;
   inbox_event_id: string | null;
   event_type: string;
   resource_type: string | null;

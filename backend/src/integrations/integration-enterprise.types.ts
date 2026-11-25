@@ -44,6 +44,7 @@ export interface IntegrationDeadLetterResponse {
   id: string;
   endpointId: string | null;
   outboxEventId: string | null;
+  replayOutboxEventId: string | null;
   inboxEventId: string | null;
   eventType: string;
   resourceType: string | null;

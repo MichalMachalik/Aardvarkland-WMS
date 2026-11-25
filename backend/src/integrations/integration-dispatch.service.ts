@@ -43,9 +43,10 @@ export class IntegrationDispatchService {
   ) {}
 
   async dispatchOutboxEvent(event: HttpIntegrationEvent): Promise<IntegrationDispatchSummary> {
-    const endpoints = await this.findActiveEndpointsForEvent(event.type);
+    const endpoints = await this.findActiveEndpointsForEvent(event.type, event.targetEndpointId);
 
     if (endpoints.length === 0) {
+      if (event.targetEndpointId) throw new Error('The replay endpoint is inactive or no longer accepts this event');
       return { delivered: 0, skipped: 1, failures: 0, results: [] };
     }
 
@@ -157,9 +158,9 @@ export class IntegrationDispatchService {
     });
   }
 
-  private async findActiveEndpointsForEvent(eventType: string): Promise<HttpIntegrationEndpoint[]> {
+  private async findActiveEndpointsForEvent(eventType: string, endpointId?: string | null): Promise<HttpIntegrationEndpoint[]> {
     const endpoints = await this.client.integrationEndpoint.findMany({
-      where: { status: 'ACTIVE' },
+      where: { status: 'ACTIVE', ...(endpointId ? { id: endpointId } : {}) },
       orderBy: { code: 'asc' },
     });
 

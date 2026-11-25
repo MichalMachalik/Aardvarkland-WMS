@@ -1602,6 +1602,7 @@ model OutboxEvent {
   type          String
   aggregateType String            @map("aggregate_type")
   aggregateId   String            @map("aggregate_id")
+  targetEndpointId String?        @map("target_endpoint_id") @db.Uuid
   payload       Json
   status        OutboxEventStatus @default(PENDING)
   attempts      Int               @default(0)
@@ -2762,6 +2763,7 @@ model IntegrationDeadLetter {
   id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   endpointId    String?   @map("endpoint_id") @db.Uuid
   outboxEventId String?   @map("outbox_event_id") @db.Uuid
+  replayOutboxEventId String? @map("replay_outbox_event_id") @db.Uuid
   inboxEventId  String?   @map("inbox_event_id") @db.Uuid
   eventType     String    @map("event_type")
   resourceType  String?   @map("resource_type")

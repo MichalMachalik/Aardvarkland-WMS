@@ -23,6 +23,7 @@ export interface HttpIntegrationEvent {
   type: string;
   aggregateType?: string | null;
   aggregateId?: string | null;
+  targetEndpointId?: string | null;
   payload?: unknown;
   attempts?: number | null;
   createdAt?: Date | string | null;

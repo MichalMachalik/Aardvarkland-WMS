@@ -1652,6 +1652,157 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.equal(await prisma.auditLog.count({ where: { action: 'base_com.dispatch_synced', resourceId: order.id } }), 1);
   });
 
+  await scenario('integration replay links the queued message once and only sends it to the failed endpoint', async () => {
+    const received = [];
+    const receiver = createServer(async (incoming, outgoing) => {
+      const chunks = [];
+      for await (const chunk of incoming) chunks.push(chunk);
+      received.push({ path: incoming.url, event: JSON.parse(Buffer.concat(chunks).toString('utf8')) });
+      outgoing.writeHead(200);
+      outgoing.end('Fixture response');
+    });
+    await new Promise((resolve, reject) => receiver.listen(0, '127.0.0.1', resolve).once('error', reject));
+    const baseUrl = `http://127.0.0.1:${receiver.address().port}`;
+    const eventType = `REPLAY_FIXTURE_${suffix}`;
+    const endpointIds = [];
+    try {
+      for (const segment of ['failed', 'already-delivered']) {
+        const endpoint = await prisma.integrationEndpoint.create({
+          data: {
+            code: `REPLAY-${segment}-${suffix}`, name: 'Replay fixture endpoint', type: 'WEBHOOK', status: 'ACTIVE',
+            baseUrl, config: { eventTypes: [eventType], path: '/' + segment },
+          },
+        });
+        endpointIds.push(endpoint.id);
+      }
+      const path = '/api/integrations/enterprise/dead-letters';
+      const publish = '/api/outbox/events/dispatch';
+      const original = await prisma.outboxEvent.create({
+        data: { type: eventType, aggregateType: 'order', aggregateId: suffix, payload: { order: suffix },
+          status: 'SENT', sentAt: new Date(), attempts: 1 },
+      });
+      const letter = await prisma.integrationDeadLetter.create({
+        data: { eventType, endpointId: endpointIds[0], outboxEventId: original.id, payload: original.payload,
+          errorMessage: 'Fixture transport failure', fingerprint: `REPLAY-${suffix}` },
+      });
+      const letterPath = `${path}/${letter.id}`;
+      const replayPath = letterPath + '/replay';
+      await asAdmin('PATCH', letterPath, { status: 'REPLAYED' }, 400);
+      const resolved = await asAdmin('PATCH', letterPath, { status: 'RESOLVED', note: 'Reviewed by operator' });
+      assert.equal(resolved.status, 'RESOLVED');
+      await asAdmin('PATCH', letterPath, { status: 'RESOLVED', note: 'Second acknowledgement' });
+      assert.equal(await prisma.auditLog.count({ where: { resourceId: letter.id, action: 'integration_dead_letter.resolved' } }), 1);
+      await asAdmin('POST', replayPath, {}, 409);
+      const requests = await Promise.all([
+        asAdmin('POST', replayPath, { force: true, note: 'Retry reviewed connection' }),
+        asAdmin('POST', replayPath, { force: true, note: 'Competing replay' }),
+      ]);
+      assert.deepEqual(requests.map(item => item.replayCreated).sort(), [false, true]);
+      const [replay] = requests;
+      assert.equal(requests[1].outboxEventId, replay.outboxEventId);
+      assert.notEqual(replay.outboxEventId, original.id);
+      const originalAfter = await prisma.outboxEvent.findUniqueOrThrow({ where: { id: original.id } });
+      assert.equal(originalAfter.status, 'SENT');
+      assert.equal(originalAfter.sentAt.toISOString(), original.sentAt.toISOString());
+      const audited = await prisma.integrationDeadLetter.findUniqueOrThrow({ where: { id: letter.id } });
+      assert.equal(audited.outboxEventId, original.id);
+      assert.equal(audited.replayOutboxEventId, replay.outboxEventId);
+      const reported = (await asAdmin('GET', path + '?status=REPLAYED')).find(item => item.id === letter.id);
+      assert.equal(reported?.outboxEventId, original.id);
+      assert.equal(reported?.replayOutboxEventId, replay.outboxEventId);
+      assert.equal(await prisma.auditLog.count({ where: { resourceId: letter.id, action: 'integration_dead_letter.replayed' } }), 1);
+      const sent = await asAdmin('POST', publish, { eventType });
+      assert.equal(sent.dispatched, 1);
+      assert.deepEqual(received.map(call => [call.path, call.event.payload]), [['/failed', original.payload]]);
+      assert.equal(received[0].event.id, replay.outboxEventId);
+      const stable = await asAdmin('POST', replayPath, {});
+      assert.equal(stable.outboxEventId, replay.outboxEventId);
+      assert.equal(stable.replayCreated, false);
+
+      const unlinked = await prisma.integrationDeadLetter.create({
+        data: { eventType, endpointId: endpointIds[0], payload: { order: 'unlinked' },
+          errorMessage: 'Fixture without a source outbox event', fingerprint: `UNLINKED-${suffix}` },
+      });
+      const unlinkedPath = `${path}/${unlinked.id}/replay`;
+      const initial = await asAdmin('POST', unlinkedPath, {});
+      const later = await asAdmin('POST', unlinkedPath, {});
+      assert.equal(initial.replayCreated, true);
+      assert.equal(later.outboxEventId, initial.outboxEventId);
+      assert.equal(later.replayCreated, false);
+      const firstEvent = await prisma.outboxEvent.findUniqueOrThrow({ where: { id: initial.outboxEventId } });
+      assert.equal(firstEvent.status, 'PENDING');
+      assert.equal(firstEvent.targetEndpointId, endpointIds[0]);
+      assert.equal(await prisma.outboxEvent.count({ where: { type: eventType } }), 3);
+
+      const legacyId = randomUUID();
+      const legacyPayload = { order: 'legacy' };
+      const legacy = await prisma.outboxEvent.create({
+        data: { type: eventType, aggregateType: 'order', aggregateId: suffix,
+          payload: { replayedDeadLetterId: legacyId, originalPayload: legacyPayload }, status: 'SENT', sentAt: new Date() },
+      });
+      await prisma.integrationDeadLetter.create({
+        data: { id: legacyId, eventType, endpointId: endpointIds[0], payload: legacyPayload, status: 'REPLAYED',
+          replayedAt: new Date(), metadata: { outboxEventId: legacy.id }, errorMessage: 'Older replay record',
+          fingerprint: `LEGACY-${suffix}` },
+      });
+      const legacyPath = `${path}/${legacyId}/replay`;
+      assert.equal((await asAdmin('POST', legacyPath, {})).outboxEventId, legacy.id);
+      const legacyReplay = await asAdmin('POST', legacyPath, { force: true });
+      assert.equal(legacyReplay.replayCreated, true);
+      const restored = await prisma.outboxEvent.findUniqueOrThrow({ where: { id: legacyReplay.outboxEventId } });
+      assert.deepEqual(restored.payload, legacyPayload);
+      assert.equal(restored.targetEndpointId, endpointIds[0]);
+    } finally {
+      await prisma.integrationEndpoint.updateMany({ where: { id: { in: endpointIds } }, data: { status: 'INACTIVE' } });
+      receiver.closeAllConnections();
+      await new Promise(resolve => receiver.close(resolve));
+    }
+  });
+
+  await scenario('reconciliation reports orphan and missing mappings inside the requested warehouse and owner', async () => {
+    const external = '/api/integrations/enterprise';
+    const system = await asAdmin('POST', external + '/external-systems', {
+      code: `RECON-${suffix}`, name: 'Reconciliation fixture', systemType: 'ERP',
+    });
+    const owner = await asAdmin('POST', '/api/clients', { code: `RECON-OWNER-${suffix}`, name: 'Reconciliation owner' });
+    const otherOwner = await asAdmin('POST', '/api/clients', { code: `RECON-OTHER-${suffix}`, name: 'Other fixture owner' });
+    const main = await prisma.warehouse.findUniqueOrThrow({ where: { code: 'MAIN' } });
+    const outside = await prisma.warehouse.create({ data: { code: `RECON-OUT-${suffix}`, name: 'Other fixture warehouse' } });
+    const order = (tag, warehouseId, ownerClientId) => prisma.outboundOrder.create({
+      data: { warehouseId, ownerClientId, orderNumber: `RECON-${tag}-${suffix}` },
+    });
+    const valid = await order('VALID', main.id, owner.id);
+    const missing = await order('MISSING', main.id, owner.id);
+    const wrongWarehouse = await order('OUTSIDE', outside.id, owner.id);
+    const wrongOwner = await order('OWNER', main.id, otherOwner.id);
+    const scope = { externalSystemId: system.id, resourceType: 'OUTBOUND_ORDER', warehouseId: main.id, ownerClientId: owner.id };
+    await prisma.externalIdMapping.createMany({ data: [
+      { ...scope, resourceId: valid.id, externalId: 'VALID' },
+      { ...scope, resourceId: missing.id, externalId: 'WRONG-MAPPING-SCOPE', warehouseId: outside.id },
+      { ...scope, resourceId: wrongWarehouse.id, externalId: 'WRONG-WAREHOUSE' },
+      { ...scope, resourceId: wrongOwner.id, externalId: 'WRONG-OWNER' },
+      { ...scope, resourceId: randomUUID(), externalId: 'MISSING-ID' },
+    ] });
+    const run = external + '/reconciliation/run';
+    await asAdmin('POST', run, { warehouseReference: `MISSING-${suffix}` }, 404);
+    const report = await asAdmin('POST', run, {
+      warehouseReference: main.code, ownerClientReference: owner.code, externalSystemReference: system.code,
+      resourceType: 'OUTBOUND_ORDER', metadata: { fixture: suffix },
+    });
+    assert.deepEqual(report.resources, [{
+      resourceType: 'OUTBOUND_ORDER', mappedCount: 4, orphanMappingCount: 3, missingMappingCount: 1,
+    }]);
+    assert.equal(report.warehouseId, main.id);
+    assert.equal(report.ownerClientId, owner.id);
+    assert.equal(report.externalSystemId, system.id);
+    const audit = await prisma.auditLog.findUniqueOrThrow({ where: { id: report.auditLogId } });
+    assert.equal(audit.action, 'integration.reconciliation_run');
+    assert.equal(audit.metadata.requestedMetadata.fixture, suffix);
+    const saved = await asAdmin('GET', external + '/reconciliation/report');
+    assert.equal(saved.auditLogId, audit.id);
+    assert.deepEqual(saved.resources, report.resources);
+  });
+
   await scenario('quality checks handle a missing stock reference and quarantine and release real stock', async () => {
     const { sku } = await createSku('QUALITY');
     const receipt = await own('POST', '/inventory/quants/receive', {
