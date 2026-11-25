@@ -2,11 +2,13 @@ import { createHash } from 'node:crypto';
 
 import {
   ConflictException,
+  ForbiddenException,
   Injectable,
   NotFoundException,
   ServiceUnavailableException,
 } from '@nestjs/common';
 
+import { hasClientAccess, shouldEnforceClientAccess } from '../access-control/client-access.helpers';
 import { AuthenticatedUser } from '../access-control/types';
 import {
   OwnerClientRecord,
@@ -525,80 +527,159 @@ export class InventoryService {
     const destination = await this.resolveLocation(client, warehouse.id, dto.toLocationReference);
     const sourceQuant = await this.resolveMoveSourceQuant(client, warehouse.id, dto);
 
-    if (sourceQuant.locationId === destination.id) {
+    const result = await this.transaction(client, (tx) =>
+      this.moveStockInTransaction(tx, warehouse.id, sourceQuant.id, destination, dto, actor, { requestFingerprint }),
+    );
+    return this.toOperationResponse(client, result.quant, result.movement);
+  }
+
+  async moveStockForTask(
+    tx: Prisma.TransactionClient,
+    warehouseId: string,
+    taskId: string,
+    confirmedQuantity: number | undefined,
+    actor: AuthenticatedUser,
+  ): Promise<number> {
+    const permissions = actor.warehouses.find(access => access.warehouseId === warehouseId)?.permissionCodes ?? [];
+    if (!permissions.includes('*') && !(permissions.includes('inventory.move') && permissions.includes('task.manage'))) {
+      throw new ForbiddenException('Task movement requires inventory movement and task permissions');
+    }
+    const task = await tx.warehouseTask.findFirst({ where: { id: taskId, warehouseId, type: 'MOVE' } });
+    if (!task) throw new NotFoundException('Stock movement task was not found');
+    if (!task.skuId || !task.fromLocationId || !task.toLocationId) {
+      throw new ConflictException('Movement task requires a SKU and source and destination locations');
+    }
+    if (task.handlingUnitId) {
+      throw new ConflictException('A loose stock movement cannot move a handling unit');
+    }
+    const quantity = confirmedQuantity ?? task.quantity;
+    if (!quantity || !Number.isInteger(quantity) || quantity < 1 || quantity > 2_147_483_647 ||
+        (task.quantity !== null && task.quantity !== quantity)) {
+      throw new ConflictException('Confirmed movement quantity must match the planned amount');
+    }
+    if (shouldEnforceClientAccess(actor) && (!task.ownerClientId || !hasClientAccess({
+      user: actor, clientReference: task.ownerClientId, warehouseReference: warehouseId,
+    }))) {
+      throw new ForbiddenException('Movement task is outside the active client scope');
+    }
+    const destination = await tx.warehouseLocation.findFirst({ where: { id: task.toLocationId, warehouseId } });
+    if (!destination?.isActive) throw new ConflictException('Movement task requires an active destination');
+    if (task.fromLocationId === destination.id) {
       throw new ConflictException('Source and destination locations must be different');
     }
+    const link = await tx.warehouseOrderTask.findFirst({
+      where: { warehouseId, warehouseTaskId: task.id },
+      select: { warehouseOrderLine: { select: { lotId: true, serialRequired: true } } },
+    });
+    if (link?.warehouseOrderLine?.serialRequired) {
+      throw new ConflictException('A loose stock movement cannot move individually tracked serial numbers');
+    }
+    const [source] = await tx.$queryRawUnsafe<{ id: string }[]>(
+      `SELECT source.id FROM stock_quants AS source
+       WHERE source.warehouse_id = $1::uuid AND source.sku_id = $2::uuid AND source.location_id = $3::uuid
+         AND source.owner_client_id IS NOT DISTINCT FROM $4::uuid
+         AND ($5::uuid IS NULL OR source.lot_id = $5::uuid)
+         AND source.handling_unit_id IS NULL AND source.status = 'AVAILABLE'
+         AND source.quantity - source.reserved_quantity >= $6::int
+         AND NOT EXISTS (SELECT 1 FROM serial_numbers WHERE stock_quant_id = source.id)
+       ORDER BY source.expiry_date ASC NULLS LAST, source.created_at, source.id
+       LIMIT 1 FOR UPDATE OF source`,
+      warehouseId, task.skuId, task.fromLocationId, task.ownerClientId,
+      link?.warehouseOrderLine?.lotId ?? null, quantity,
+    );
+    if (!source) throw new ConflictException('Insufficient eligible unreserved stock for the movement task');
+    await this.moveStockInTransaction(
+      tx as unknown as InventoryTransactionClient, warehouseId, source.id, destination,
+      {
+        toLocationReference: destination.id, quantity, reference: task.id,
+        ownerClientReference: task.ownerClientId ?? undefined,
+        metadata: { source: 'warehouse_task' },
+      },
+      actor, { taskId: task.id },
+    );
+    return quantity;
+  }
 
-    const result = await this.transaction(client, async (tx) => {
-      const currentSourceQuant = await this.resolveQuant(tx, warehouse.id, sourceQuant.id);
-      await assertNoBlockingStockFreeze(tx, {
-        warehouseId: warehouse.id,
-        locationId: destination.id,
-        skuId: currentSourceQuant.skuId,
-        operation: 'move stock into destination',
-      });
-      await this.decrementQuant(tx, currentSourceQuant, dto.quantity, {
-        preserveReservedQuantity: true,
-      });
-      const targetQuant = await this.incrementOrCreateQuant(tx, {
-        warehouseId: warehouse.id,
-        skuId: currentSourceQuant.skuId,
-        locationId: destination.id,
-        status: currentSourceQuant.status,
-        ownerClientId: currentSourceQuant.ownerClientId ?? null,
-        lotId: currentSourceQuant.lotId ?? null,
-        batch: currentSourceQuant.batch,
-        expiry: readDateCandidate(currentSourceQuant, ['expiry', 'expiryDate', 'expiresAt']),
-        quantity: dto.quantity,
-      });
-      const movement = await this.createStockMovement(tx, {
-        warehouseId: warehouse.id,
-        quantId: targetQuant.id,
-        skuId: currentSourceQuant.skuId,
-        type: StockMovementType.MOVE,
-        quantityDelta: 0,
-        quantity: dto.quantity,
-        fromLocationId: currentSourceQuant.locationId,
-        toLocationId: destination.id,
-        actorUserId: actor.id,
-        reference: normalizeNullableString(dto.reference),
-        idempotencyKey: normalizeNullableString(dto.idempotencyKey),
-        requestFingerprint,
-        metadata: toJsonInput(
-          withStockAdjustmentReasonMetadata(dto.metadata, dto.reasonCode, dto.reason),
-        ),
-      });
-
-      const owner = await this.resolveOperationOwner(
-        tx,
-        warehouse.id,
-        this.ownerScope.readOwnerClientReference({
-          ownerClientReference: dto.ownerClientReference,
-          metadata: dto.metadata,
-        }),
-        [{ resourceType: 'STOCK_QUANT', resourceId: currentSourceQuant.id }],
-      );
-      if (owner) {
-        await this.linkOwnerResources(tx, warehouse.id, owner, [
-          {
-            resourceType: 'STOCK_QUANT',
-            resourceId: targetQuant.id,
-            metadata: { source: 'inventory.move', sourceStockQuantId: currentSourceQuant.id },
-          },
-          {
-            resourceType: 'STOCK_MOVEMENT',
-            resourceId: movement.id,
-            metadata: { source: 'inventory.move', stockQuantId: targetQuant.id },
-          },
-        ]);
-      }
-
-      await this.writeMovementAudit(tx, actor, warehouse.id, movement);
-
-      return { movement, quant: targetQuant };
+  private async moveStockInTransaction(
+    tx: InventoryTransactionClient,
+    warehouseId: string,
+    sourceQuantId: string,
+    destination: WarehouseLocation,
+    dto: MoveStockDto,
+    actor: AuthenticatedUser,
+    options: { requestFingerprint?: string; taskId?: string } = {},
+  ): Promise<StockOperationInternalResult> {
+    const currentSourceQuant = await this.resolveQuant(tx, warehouseId, sourceQuantId);
+    if (currentSourceQuant.locationId === destination.id) {
+      throw new ConflictException('Source and destination locations must be different');
+    }
+    await assertNoBlockingStockFreeze(tx, {
+      warehouseId,
+      locationId: destination.id,
+      skuId: currentSourceQuant.skuId,
+      operation: 'move stock into destination',
+    });
+    await this.decrementQuant(tx, currentSourceQuant, dto.quantity, {
+      preserveReservedQuantity: true,
+    });
+    const targetQuant = await this.incrementOrCreateQuant(tx, {
+      warehouseId,
+      skuId: currentSourceQuant.skuId,
+      locationId: destination.id,
+      status: currentSourceQuant.status,
+      ownerClientId: currentSourceQuant.ownerClientId ?? null,
+      lotId: currentSourceQuant.lotId ?? null,
+      batch: currentSourceQuant.batch,
+      expiry: readDateCandidate(currentSourceQuant, ['expiry', 'expiryDate', 'expiresAt']),
+      quantity: dto.quantity,
+    });
+    const movement = await this.createStockMovement(tx, {
+      warehouseId,
+      quantId: targetQuant.id,
+      skuId: currentSourceQuant.skuId,
+      type: StockMovementType.MOVE,
+      quantityDelta: 0,
+      quantity: dto.quantity,
+      fromLocationId: currentSourceQuant.locationId,
+      toLocationId: destination.id,
+      actorUserId: actor.id,
+      reference: normalizeNullableString(dto.reference),
+      idempotencyKey: normalizeNullableString(dto.idempotencyKey),
+      requestFingerprint: options.requestFingerprint,
+      taskId: options.taskId,
+      ownerClientId: currentSourceQuant.ownerClientId,
+      metadata: toJsonInput(
+        withStockAdjustmentReasonMetadata(dto.metadata, dto.reasonCode, dto.reason),
+      ),
     });
 
-    return this.toOperationResponse(client, result.quant, result.movement);
+    const owner = await this.resolveOperationOwner(
+      tx,
+      warehouseId,
+      this.ownerScope.readOwnerClientReference({
+        ownerClientReference: dto.ownerClientReference,
+        metadata: dto.metadata,
+      }),
+      [{ resourceType: 'STOCK_QUANT', resourceId: currentSourceQuant.id }],
+    );
+    if (owner) {
+      await this.linkOwnerResources(tx, warehouseId, owner, [
+        {
+          resourceType: 'STOCK_QUANT',
+          resourceId: targetQuant.id,
+          metadata: { source: 'inventory.move', sourceStockQuantId: currentSourceQuant.id },
+        },
+        {
+          resourceType: 'STOCK_MOVEMENT',
+          resourceId: movement.id,
+          metadata: { source: 'inventory.move', stockQuantId: targetQuant.id },
+        },
+      ]);
+    }
+
+    await this.writeMovementAudit(tx, actor, warehouseId, movement);
+
+    return { movement, quant: targetQuant };
   }
 
   async adjust(
@@ -1290,6 +1371,8 @@ export class InventoryService {
       fromLocationId: input.fromLocationId,
       toLocationId: input.toLocationId,
       actorUserId: input.actorUserId,
+      ownerClientId: input.ownerClientId,
+      taskId: input.taskId,
       referenceType: input.reference ? input.type : null,
       referenceId: input.reference,
       sourceSystem: input.idempotencyKey ? 'WMS' : null,
@@ -1932,6 +2015,8 @@ interface CreateStockMovementInput {
   fromLocationId?: string | null;
   toLocationId?: string | null;
   actorUserId: string | null;
+  ownerClientId?: string | null;
+  taskId?: string;
   reference: string | null;
   idempotencyKey: string | null;
   requestFingerprint?: string;

@@ -147,6 +147,10 @@ export class WarehouseOrdersService {
     const fromLocation = dto.fromLocationReference ? await this.resolveLocation(warehouse.id, dto.fromLocationReference) : null;
     const toLocation = dto.toLocationReference ? await this.resolveLocation(warehouse.id, dto.toLocationReference) : null;
     const lines = await this.resolveLines(warehouse.id, dto.lines);
+    if (dto.orderType === WarehouseOrderType.MOVE &&
+        (!fromLocation || !toLocation || fromLocation.id === toLocation.id || lines.some(line => !line.skuId))) {
+      throw new ConflictException('A movement order requires distinct locations and a SKU on each line');
+    }
     const orderNumber = normalizeNullableString(dto.orderNumber)?.toUpperCase() ?? generateOrderNumber();
 
     return this.transaction(async (client) => {
@@ -215,7 +219,7 @@ export class WarehouseOrdersService {
         order.status === WarehouseOrderStatus.EXCEPTION ? 'EXCEPTION_RECOVERED' : undefined,
       );
       const lines = await this.readOrderLines(order.id, client);
-      const progress = await this.readTaskProgress(client, order.id);
+      const progress = await this.readTaskProgress(client, order);
       await client.$executeRawUnsafe(
         `UPDATE warehouse_orders SET status = 'RELEASED', released_at = COALESCE(released_at, NOW()), updated_at = NOW() WHERE id = $1::uuid`,
         order.id,
@@ -280,7 +284,7 @@ export class WarehouseOrdersService {
       const order = await this.lockOrder(client, warehouse.id, orderReference);
       this.assertWarehouseOrderTransition(order, 'COMPLETE', actor);
       const lines = await this.readOrderLines(order.id, client);
-      const progress = await this.readTaskProgress(client, order.id);
+      const progress = await this.readTaskProgress(client, order);
       const countOnly = isCountOrder(order);
       if (progress.get(null)?.pending) throw new ConflictException('Warehouse order still has unfinished tasks');
 
@@ -332,7 +336,7 @@ export class WarehouseOrdersService {
         reason,
       );
       const lines = await this.readOrderLines(order.id, client);
-      const progress = await this.readTaskProgress(client, order.id);
+      const progress = await this.readTaskProgress(client, order);
       for (const line of lines) {
         if (line.status === WarehouseOrderLineStatus.DONE) continue;
         const result = progress.get(line.id);
@@ -362,16 +366,26 @@ export class WarehouseOrdersService {
     return this.resolveOrder(warehouseId, candidate.id, client);
   }
 
-  private async readTaskProgress(client: Prisma.TransactionClient, orderId: string) {
+  private async readTaskProgress(client: Prisma.TransactionClient, order: WarehouseOrderRow) {
     const links = await client.warehouseOrderTask.findMany({
-      where: { warehouseOrderId: orderId, warehouseTask: { status: { notIn: ['FAILED', 'CANCELLED'] } } },
-      select: { warehouseOrderLineId: true, warehouseTask: { select: { status: true, quantity: true } } },
+      where: { warehouseOrderId: order.id, warehouseTask: { status: { notIn: ['FAILED', 'CANCELLED'] } } },
+      select: {
+        warehouseOrderLineId: true,
+        warehouseTask: { select: {
+          status: true,
+          quantity: true,
+          stockMovements: { where: { type: 'MOVE' }, select: { quantity: true } },
+        } },
+      },
     });
     const progress = new Map<string | null, LineTaskProgress>();
     for (const link of links) {
       const line = progress.get(link.warehouseOrderLineId) ?? { pending: false, recorded: false, quantity: 0 };
       const task = link.warehouseTask;
-      if (task.status === 'DONE' && task.quantity !== null) {
+      const moved = order.order_type === WarehouseOrderType.MOVE
+        ? task.stockMovements.reduce((total, movement) => total + movement.quantity, 0)
+        : null;
+      if (task.status === 'DONE' && task.quantity !== null && (moved === null || moved === task.quantity)) {
         line.recorded = true;
         line.quantity += task.quantity;
       } else {
@@ -421,9 +435,9 @@ export class WarehouseOrdersService {
     return sku;
   }
 
-  private async resolveLot(warehouseId: string, reference: string): Promise<{ id: string }> {
-    const rows = await this.prisma.$queryRawUnsafe<{ id: string }[]>(
-      `SELECT id FROM sku_lots WHERE warehouse_id = $1::uuid AND (id::text = $2 OR lot_code = $3) LIMIT 1`,
+  private async resolveLot(warehouseId: string, reference: string): Promise<{ id: string; sku_id: string }> {
+    const rows = await this.prisma.$queryRawUnsafe<{ id: string; sku_id: string }[]>(
+      `SELECT id, sku_id FROM sku_lots WHERE warehouse_id = $1::uuid AND (id::text = $2 OR lot_code = $3) LIMIT 1`,
       warehouseId,
       reference,
       normalizeCode(reference),
@@ -456,9 +470,12 @@ export class WarehouseOrdersService {
       lineNumbers.add(lineNumber);
       const sku = line.skuReference ? await this.resolveSku(line.skuReference) : null;
       const lot = line.lotReference ? await this.resolveLot(warehouseId, line.lotReference) : null;
+      if (sku && lot && sku.id !== lot.sku_id) {
+        throw new ConflictException(`Lot does not belong to the SKU on warehouse order line ${lineNumber}`);
+      }
       resolved.push({
         lineNumber,
-        skuId: sku?.id ?? null,
+        skuId: sku?.id ?? lot?.sku_id ?? null,
         lotId: lot?.id ?? null,
         requestedQuantity: line.requestedQuantity ?? 1,
         serialRequired: line.serialRequired ?? false,

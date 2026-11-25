@@ -11,6 +11,7 @@ import { OwnerScopeService } from '../clients/owner-scope.service';
 import { normalizeOffsetPagination } from '../common';
 import { lockPostgresRowById, PrismaService, withTransactionRetry } from '../database';
 import { Prisma, User, Warehouse, WarehouseLocation } from '../generated/prisma/client';
+import { InventoryService } from '../inventory/inventory.service';
 import { AssignWarehouseTaskDto } from './dto/assign-warehouse-task.dto';
 import { CancelWarehouseTaskDto } from './dto/cancel-warehouse-task.dto';
 import { ClaimNextWarehouseTaskDto } from './dto/claim-next-warehouse-task.dto';
@@ -68,7 +69,11 @@ const allowedTransitions: Record<WarehouseTaskStatus, readonly WarehouseTaskStat
 
 @Injectable()
 export class WarehouseTasksService {
-  constructor(private readonly prisma: PrismaService, private readonly ownerScope: OwnerScopeService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly ownerScope: OwnerScopeService,
+    private readonly inventory: InventoryService,
+  ) {}
 
   async findMany(
     warehouseReference: string,
@@ -345,6 +350,19 @@ export class WarehouseTasksService {
       const handlingUnitId = body.handlingUnitReference
         ? (await this.resolveHandlingUnit(warehouse.id, body.handlingUnitReference, db)).id
         : undefined;
+      let quantity = body.quantity;
+      if (task.type === WarehouseTaskType.MOVE) {
+        const overrides = [
+          [fromLocationId, task.fromLocationId], [toLocationId, task.toLocationId],
+          [skuId, task.skuId], [handlingUnitId, task.handlingUnitId],
+        ];
+        if (overrides.some(([confirmed, planned]) => confirmed !== undefined && confirmed !== planned)) {
+          throw new ConflictException('Confirmed movement must match the planned SKU and locations');
+        }
+        quantity = await this.inventory.moveStockForTask(
+          db as unknown as Prisma.TransactionClient, warehouse.id, task.id, body.quantity, actor,
+        );
+      }
       const data: MutationObject = {
         status: WarehouseTaskStatus.DONE,
         completedAt: new Date(),
@@ -352,7 +370,7 @@ export class WarehouseTasksService {
         ...(fromLocationId === undefined ? {} : { fromLocationId }),
         ...(toLocationId === undefined ? {} : { toLocationId }),
         ...(skuId === undefined ? {} : { skuId }),
-        ...(body.quantity === undefined ? {} : { quantity: body.quantity }),
+        ...(quantity === undefined ? {} : { quantity }),
         ...(handlingUnitId === undefined ? {} : { handlingUnitId }),
         metadata: mergeTaskMetadata(task.metadata, body.metadata),
       };
@@ -368,7 +386,7 @@ export class WarehouseTasksService {
           fromLocationId: fromLocationId ?? task.fromLocationId ?? null,
           toLocationId: toLocationId ?? task.toLocationId ?? null,
           skuId: skuId ?? task.skuId ?? null,
-          quantity: body.quantity ?? task.quantity ?? null,
+          quantity: quantity ?? task.quantity ?? null,
           handlingUnitId: handlingUnitId ?? task.handlingUnitId ?? null,
         },
       });

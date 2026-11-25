@@ -4,7 +4,9 @@ import test from 'node:test';
 import { ConflictException } from '@nestjs/common';
 
 import { AuthenticatedUser } from '../src/access-control/types';
+import { OwnerScopeService } from '../src/clients/owner-scope.service';
 import { PrismaService } from '../src/database';
+import { InventoryService } from '../src/inventory/inventory.service';
 import { PutawayService } from '../src/putaway/putaway.service';
 import { RfWorkflowsService } from '../src/rf-workflows/rf-workflows.service';
 
@@ -215,7 +217,8 @@ function createRfCycleCountService(taskQuantity: number | null = 10): {
   };
 
   const prismaService = prisma as unknown as PrismaService;
-  return { calls, service: new RfWorkflowsService(prismaService, new PutawayService(prismaService)) };
+  const inventory = new InventoryService(prismaService, new OwnerScopeService(prismaService));
+  return { calls, service: new RfWorkflowsService(prismaService, new PutawayService(prismaService), inventory) };
 }
 
 function actor(): AuthenticatedUser {

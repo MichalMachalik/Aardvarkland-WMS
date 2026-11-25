@@ -5,6 +5,7 @@ import { calculateCountVariance, MAX_COUNT_QUANTITY } from '../cycle-counts/cycl
 import { CycleCountPlanStatus, CycleCountTaskStatus } from '../cycle-counts/cycle-counts.types';
 import { lockPostgresRowById, PrismaService, withTransactionRetry } from '../database';
 import { Prisma, WarehouseTaskType } from '../generated/prisma/client';
+import { InventoryService } from '../inventory/inventory.service';
 import { assertNoBlockingStockFreeze, StockFreezeClient } from '../inventory/stock-freeze.helpers';
 import { PutawayService } from '../putaway/putaway.service';
 import { CancelRfSessionDto } from './dto/cancel-rf-session.dto';
@@ -48,6 +49,7 @@ export class RfWorkflowsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly putawayService: PutawayService,
+    private readonly inventory: InventoryService,
   ) {}
 
   async getQueue(
@@ -418,12 +420,19 @@ export class RfWorkflowsService {
 
     const expected = expectedFromStep(step);
     const scannedValue = dto.scannedValue?.trim() ?? (dto.quantity === undefined ? '' : String(dto.quantity));
+    let quantity = dto.quantity ?? null;
+    if (task?.type === 'MOVE' && step.stepKey === RfStepKey.CONFIRM_QUANTITY) {
+      quantity = resolveRfQuantity(dto);
+      if (!quantity || (task.quantity !== null && quantity !== task.quantity)) {
+        throw new ConflictException('Confirmed movement quantity must match the planned amount');
+      }
+    }
     if (!isExpectedScan(expected, scannedValue)) {
       const retryStep = await tx.scannerWorkflowStep.update({
         where: { id: step.id },
         data: {
           scannedValue,
-          quantity: dto.quantity ?? null,
+          quantity,
           errorCode: 'SCAN_MISMATCH',
           metadata: toJson(dto.metadata),
         },
@@ -436,7 +445,7 @@ export class RfWorkflowsService {
       data: {
         status: 'COMPLETED',
         scannedValue,
-        quantity: dto.quantity ?? null,
+        quantity,
         metadata: toJson(dto.metadata),
         completedAt: new Date(),
       },
@@ -464,7 +473,7 @@ export class RfWorkflowsService {
       },
     });
 
-    await this.completeTaskAfterRfScan(tx, warehouseId, task, dto, actor);
+    await this.completeTaskAfterRfScan(tx, warehouseId, session.id, task, dto, actor);
     await tx.outboxEvent.create({
       data: {
         type: 'RF_WORKFLOW_COMPLETED',
@@ -610,6 +619,7 @@ export class RfWorkflowsService {
   private async completeTaskAfterRfScan(
     tx: RfTransactionClient,
     warehouseId: string,
+    sessionId: string,
     task: WarehouseTaskRecord | null,
     dto: ScanRfStepDto,
     actor: AuthenticatedUser,
@@ -636,12 +646,29 @@ export class RfWorkflowsService {
       return;
     }
 
+    let recordedQuantity: number | undefined;
+    if (task.type === 'MOVE') {
+      const amount = await tx.scannerWorkflowStep.findFirst({
+        where: { sessionId, stepKey: RfStepKey.CONFIRM_QUANTITY, status: 'COMPLETED' },
+        orderBy: { sequence: 'desc' },
+      });
+      const confirmed = amount ? resolveRfQuantity({
+        quantity: amount.quantity ?? undefined, scannedValue: amount.scannedValue ?? undefined,
+      }) : null;
+      if (!confirmed) throw new ConflictException('RF movement requires a confirmed quantity');
+      recordedQuantity = await this.inventory.moveStockForTask(
+        tx as unknown as Prisma.TransactionClient, warehouseId, task.id, confirmed, actor,
+      );
+    }
     if (task.type === 'COUNT') {
       const submitted = await this.submitCycleCountFromRf(tx, warehouseId, task, dto, actor);
 
       if (submitted) {
         return;
       }
+      const counted = resolveRfQuantity(dto);
+      if (counted === null) throw new ConflictException('RF count requires a counted quantity');
+      recordedQuantity = counted;
     }
 
     await tx.warehouseTask.update({
@@ -649,10 +676,11 @@ export class RfWorkflowsService {
       data: {
         status: 'DONE',
         completedAt: new Date(),
+        quantity: recordedQuantity,
         version: { increment: 1 },
         metadata: mergeMetadata(task.metadata, {
           rfCompletedAt: new Date().toISOString(),
-          rfQuantity: dto.quantity ?? null,
+          rfQuantity: recordedQuantity ?? dto.quantity ?? null,
         }),
       },
     });
@@ -1647,6 +1675,8 @@ interface RfStepRecord {
   expectedType: string | null;
   expectedValue: string | null;
   errorCode: string | null;
+  quantity: number | null;
+  scannedValue: string | null;
   metadata: unknown;
 }
 

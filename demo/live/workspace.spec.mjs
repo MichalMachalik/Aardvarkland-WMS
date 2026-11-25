@@ -625,6 +625,40 @@ test('the tasks page confirms putaway by moving the planned stock', async ({ pag
   await expect(taskRow).toHaveCount(0);
 });
 
+test('the tasks page moves the planned stock to its destination', async ({ page }) => {
+  test.skip(process.env.WMS_LIVE_UI_WRITE !== 'true', 'Requires a disposable warehouse database.');
+  const { accessToken: admin } = await liveApi(page, '/api/auth/login', {
+    data: { email: roles.system.email, password: roles.system.password },
+  });
+  const own = (path, data) => liveApi(page, '/api/warehouses/MAIN' + path, { token: admin, data });
+  const code = `UI-MOVE-${randomUUID().slice(0, 8).toUpperCase()}`;
+  const product = await liveApi(page, '/api/products', { token: admin, data: { code, name: 'Movement test product' } });
+  await liveApi(page, '/api/products/skus', { token: admin, data: { code, productReference: product.id, name: 'Movement test SKU' } });
+  const target = await own('/locations', {
+    code: `${code}-TARGET`, name: 'Movement test bin', type: 'STORAGE', parentReference: 'A-01',
+  });
+  const { quant: stock } = await own('/inventory/quants/receive', {
+    skuReference: code, locationReference: 'A-01-01', quantity: 6, batch: 'UI-MOVE',
+  });
+  const task = await own('/tasks', {
+    type: 'MOVE', sku: code, fromLocationReference: 'A-01-01', toLocationReference: target.id, quantity: 2,
+  });
+
+  await login(page, roles.worker);
+  await desktopNav(page).getByRole('button', { name: 'Úkoly', exact: true }).click();
+  await page.locator(`[data-e2e-row="task"][data-e2e-value="${task.id}"]`).check();
+  const confirm = page.locator('[data-e2e-action="task-confirm-selected"]');
+  await expect(confirm).toBeDisabled();
+  await page.locator('[data-e2e-action="task-start-selected"]').click();
+  await expect(confirm).toBeEnabled();
+  await confirm.click();
+  await expect.poll(() => own(`/tasks/${task.id}`)).toMatchObject({ status: 'DONE', quantity: 2 });
+  expect((await own(`/inventory/quants/${stock.id}`)).quantity).toBe(4);
+  const destination = await own(`/inventory/quants?skuReference=${code}&locationReference=${target.code}`);
+  expect(destination).toHaveLength(1);
+  expect(destination[0]).toMatchObject({ quantity: 2, batch: 'UI-MOVE' });
+});
+
 // The service worker can handle these requests before Playwright intercepts them.
 const interceptedTest = test.extend({ serviceWorkers: 'block' });
 interceptedTest('the RF browser uploads stored scans in order and keeps every unconfirmed scan after an interrupted batch', async ({ page }) => {

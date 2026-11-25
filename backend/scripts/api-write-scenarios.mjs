@@ -214,6 +214,7 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     const input = {
       orderNumber: `COUNT-${suffix}`, orderType: 'COUNT',
       fromLocationReference: 'A-01-01',
+      dueAt: '2027-01-10T09:00:00.000Z',
       lines: [
         { lineNumber: '1', skuReference: sku.code, requestedQuantity: 2 },
         { lineNumber: '2', skuReference: sku.id, requestedQuantity: 2 },
@@ -224,6 +225,7 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     await work('POST', orders, { ...input, lines: [input.lines[0], { ...input.lines[1], lineNumber: '1 ' }] }, 409);
     const draft = await work('POST', orders, input);
     assert.equal(draft.status, 'DRAFT');
+    assert.equal(draft.dueAt, input.dueAt);
     assert.equal(draft.lines.length, 2);
     assert.equal(draft.taskLinks.length, 0);
     await work('POST', orders, input, 409);
@@ -267,6 +269,101 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.equal((await own('GET', `/tasks/${doneId}`)).status, 'DONE');
     assert.equal((await own('GET', `/tasks/${openId}`)).status, 'CANCELLED');
     await work('POST', secondPath + '/release', undefined, 409);
+  });
+
+  await scenario('desktop and RF movement tasks write the confirmed stock transfer exactly once', async () => {
+    const { sku } = await createSku('PLANNED-MOVE');
+    const { sku: otherSku } = await createSku('OTHER-MOVE-SKU');
+    const lot = await own('POST', '/traceability/lots', {
+      skuReference: sku.code, lotCode: `MOVE-LOT-${suffix}`, batch: 'PLANNED',
+    });
+    const target = await own('POST', '/locations', {
+      code: `MOVE-${suffix}`, name: 'Planned stock target', type: 'STORAGE', parentReference: 'A-01',
+    });
+    const orderBody = {
+      orderType: 'MOVE', orderNumber: `MOVE-${suffix}`,
+      fromLocationReference: 'A-01-01', toLocationReference: target.code,
+      lines: [{ lineNumber: '1', lotReference: lot.id, requestedQuantity: 3 }],
+    };
+    await own('POST', '/warehouse-orders', { ...orderBody, toLocationReference: 'A-01-01' }, 409);
+    await own('POST', '/warehouse-orders', {
+      ...orderBody, lines: [{ ...orderBody.lines[0], skuReference: otherSku.id }],
+    }, 409);
+    const order = await own('POST', '/warehouse-orders', orderBody);
+    const path = `/warehouse-orders/${order.id}`;
+    const { taskLinks: [link] } = await own('POST', path + '/release');
+    const taskPath = `/tasks/${link.warehouseTaskId}`;
+    const work = (path, body, status = 201) => asWorker('POST', warehouse + path, body, status);
+    await work(taskPath + '/start', {});
+    await work(taskPath + '/confirm', {}, 409);
+    await own('POST', path + '/complete', {}, 409);
+    await prisma.warehouseTask.update({
+      where: { id: link.warehouseTaskId }, data: { status: 'DONE', completedAt: new Date() },
+    });
+    await own('POST', path + '/complete', {}, 409);
+    await prisma.warehouseTask.update({
+      where: { id: link.warehouseTaskId }, data: { status: 'IN_PROGRESS', completedAt: null },
+    });
+
+    const { quant: unplanned } = await own('POST', '/inventory/quants/receive', {
+      skuReference: sku.id, locationReference: 'A-01-01', quantity: 8, batch: 'UNPLANNED',
+    });
+    await work(taskPath + '/confirm', {}, 409);
+    const inbound = await own('POST', '/inbound-shipments', {
+      shipmentNumber: `MOVE-ASN-${suffix}`, supplierName: 'Movement test supplier',
+      lines: [{ lineNumber: '1', sku: sku.code, expectedQuantity: 8 }],
+    });
+    const { quant: source } = await own('POST', `/inbound-shipments/${inbound.id}/receive`, {
+      lineReference: '1', quantity: 8, locationReference: 'A-01-01', lotReference: lot.lotCode,
+      batch: 'PLANNED', createPutawayTask: false,
+    });
+    await work(taskPath + '/confirm', { toLocationReference: 'PACK-01' }, 409);
+    await work(taskPath + '/confirm', { quantity: 2 }, 409);
+    const receipts = await Promise.all([
+      work(taskPath + '/confirm', {}, [201, 409]), work(taskPath + '/confirm', {}, [201, 409]),
+    ]);
+    assert.equal(receipts.filter(receipt => receipt.status === 'DONE').length, 1);
+    const [movement] = await prisma.stockMovement.findMany({ where: { taskId: link.warehouseTaskId } });
+    assert.equal(movement.quantity, 3);
+    const destination = await own('GET', `/inventory/quants/${movement.stockQuantId}`);
+    assert.equal(destination.location.id, target.id);
+    assert.equal(destination.batch, 'PLANNED');
+    assert.equal((await prisma.stockQuant.findUniqueOrThrow({ where: { id: destination.id } })).lotId, lot.id);
+    assert.equal(destination.quantity, 3);
+    assert.equal((await own('GET', `/inventory/quants/${source.id}`)).quantity, 5);
+    assert.equal(await prisma.stockMovement.count({ where: { taskId: link.warehouseTaskId } }), 1);
+    const completed = await own('POST', path + '/complete', {});
+    assert.equal(completed.status, 'COMPLETED');
+    assert.equal(completed.lines[0].completedQuantity, 3);
+
+    const rfOrder = await own('POST', '/warehouse-orders', {
+      ...orderBody, orderNumber: `RF-MOVE-${suffix}`, lines: [{ ...orderBody.lines[0], requestedQuantity: 2 }],
+    });
+    const rfPath = `/warehouse-orders/${rfOrder.id}`;
+    const rfReleased = await own('POST', rfPath + '/release');
+    const task = { id: rfReleased.taskLinks[0].warehouseTaskId };
+    const { sessionId } = await work(`/rf/tasks/${task.id}/start`, {});
+    const scan = (body, status) => work(`/rf/sessions/${sessionId}/scan`, body, status);
+    assert.equal((await scan({ scannedValue: 'A-01-01' })).step.expected.type, 'SKU');
+    assert.equal((await scan({ scannedValue: sku.code })).step.expected.type, 'QUANTITY');
+    await scan({ scannedValue: '1' }, 409);
+    const destinationStep = await scan({ scannedValue: '2' });
+    assert.equal(destinationStep.step.expected.value, target.code);
+    assert.equal(await prisma.stockMovement.count({ where: { taskId: task.id } }), 0);
+    const queued = {
+      idempotencyKey: `MOVE-FINISH-${suffix}`, sessionReference: sessionId, taskReference: task.id,
+      stepKey: destinationStep.step.key, scannedValue: target.code,
+    };
+    const sync = () => work('/rf/offline/sync', { scans: [queued] });
+    const replays = await Promise.all([sync(), sync()]);
+    assert.deepEqual(replays.map(result => result.items[0].status).sort(), ['DUPLICATE', 'SYNCED']);
+    const [rfMovement] = await prisma.stockMovement.findMany({ where: { taskId: task.id } });
+    assert.equal(rfMovement.quantity, 2);
+    assert.equal(await prisma.stockMovement.count({ where: { taskId: task.id } }), 1);
+    assert.equal((await own('GET', `/inventory/quants/${source.id}`)).quantity, 3);
+    assert.equal((await own('GET', `/inventory/quants/${unplanned.id}`)).quantity, 8);
+    assert.equal((await own('GET', `/inventory/quants/${destination.id}`)).quantity, 5);
+    assert.equal((await own('POST', rfPath + '/complete', {})).lines[0].completedQuantity, 2);
   });
 
   await scenario('putaway moves the planned stock exactly once and rejects mismatched confirmations', async () => {

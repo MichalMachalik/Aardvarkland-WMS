@@ -417,9 +417,10 @@ function RfWorkspace() {
   const expectedQuantity = parseScanQuantity(current.expectedCode);
   const enteredQuantity = parseScanQuantity(scanValue);
   const quantityCandidate = enteredQuantity ?? expectedQuantity;
+  const moveQuantity = selectedTask?.workflow === 'MOVE';
   const putawayQuantity = selectedTask?.workflow === 'PUTAWAY';
-  const minimumQuantity = putawayQuantity ? 1 : 0;
-  const maximumQuantity = (putawayQuantity ? selectedTask.quantity : null) ?? 2_147_483_647;
+  const minimumQuantity = moveQuantity ? selectedTask.quantity ?? 1 : putawayQuantity ? 1 : 0;
+  const maximumQuantity = (moveQuantity || putawayQuantity ? selectedTask.quantity : null) ?? 2_147_483_647;
   const validQuantity = enteredQuantity !== undefined
     && enteredQuantity >= minimumQuantity && enteredQuantity <= maximumQuantity;
   const scannerReady = Boolean(selectedTask && scannerDeviceReference.trim())
