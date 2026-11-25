@@ -55,6 +55,7 @@ export interface ShipmentResponse {
   stagedLocationId: string | null;
   status: ShipmentStatus;
   carrier: string | null;
+  labelRequired: boolean;
   serviceLevel: string | null;
   trackingReference: string | null;
   metadata: unknown;
@@ -76,6 +77,8 @@ export interface ShipmentPackageResponse {
   widthCm: number | null;
   heightCm: number | null;
   trackingNumber: string | null;
+  labelReady: boolean;
+  contents: Array<{ outboundOrderLineId: string | null; sku: string; quantity: number }>;
   metadata: unknown;
 }
 

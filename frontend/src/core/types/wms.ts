@@ -94,15 +94,6 @@ export interface WavePlan {
   recommendation: string;
 }
 
-export interface PackingLine {
-  orderId: string;
-  sku: string;
-  product: string;
-  expected: number;
-  scanned: number;
-  serialRequired: boolean;
-}
-
 export interface WorkerLoad {
   id: string;
   name: string;

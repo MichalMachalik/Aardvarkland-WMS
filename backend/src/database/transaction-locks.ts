@@ -11,6 +11,7 @@ const SAFE_TABLE_NAMES = new Set([
   'warehouse_tasks',
   'cycle_count_plans',
   'inbound_shipments',
+  'shipments',
   'return_orders',
 ]);
 const SAFE_ADVISORY_LOCK_NAMESPACES = new Set([

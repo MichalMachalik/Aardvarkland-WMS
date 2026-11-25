@@ -3,7 +3,7 @@ import { ConflictException, Injectable, NotFoundException } from '@nestjs/common
 import { AuthenticatedUser } from '../access-control/types';
 import { normalizeOffsetPagination } from '../common';
 import { OwnerClientRecord, OwnerScopePrismaClient, OwnerScopeService } from '../clients/owner-scope.service';
-import { lockPostgresRowById, PrismaService, withTransactionRetry } from '../database';
+import { lockPostgresAdvisoryTransaction, lockPostgresRowById, PrismaService, withTransactionRetry } from '../database';
 import { AddShipmentPackageDto } from './dto/add-shipment-package.dto';
 import { CreatePackingStationDto } from './dto/create-packing-station.dto';
 import { CreateShipmentDto } from './dto/create-shipment.dto';
@@ -122,7 +122,25 @@ export class ShippingService {
       skip: pagination.skip,
     });
 
-    return packages.map(toPackageResponse);
+    if (packages.length === 0) return [];
+    const [contents, labels] = await Promise.all([
+      this.client.packageContent.findMany({ where: { packageId: { in: packages.map((pack) => pack.id) } } }),
+      this.client.carrierLabel.findMany({
+        where: { shipmentId: shipment.id, status: { in: [CarrierLabelStatus.GENERATED, CarrierLabelStatus.PRINTED] } },
+      }),
+    ]);
+    const contentsByPackage = new Map<string, PackageContentRecord[]>();
+    for (const content of contents) {
+      const existing = contentsByPackage.get(content.packageId);
+      if (existing) existing.push(content);
+      else contentsByPackage.set(content.packageId, [content]);
+    }
+    const labelledPackages = new Set(labels.map((label) => label.packageId));
+    return packages.map((pack) => toPackageResponse(
+      pack,
+      contentsByPackage.get(pack.id),
+      labelledPackages.has(null) || labelledPackages.has(pack.id),
+    ));
   }
 
   async createShipment(
@@ -184,7 +202,7 @@ export class ShippingService {
     const warehouse = await this.resolveWarehouse(warehouseReference);
 
     return this.transaction(async (tx: ShippingTransactionClient) => {
-      const shipment = await this.resolveShipmentWithClient(tx, warehouse.id, shipmentReference);
+      const shipment = await this.lockShipment(tx, warehouse.id, shipmentReference);
       const owner = await this.resolveOperationOwner(tx, warehouse.id, dto.ownerClientReference, [
         { resourceType: 'SHIPMENT', resourceId: shipment.id },
         { resourceType: 'OUTBOUND_ORDER', resourceId: shipment.outboundOrderId },
@@ -198,6 +216,7 @@ export class ShippingService {
 
       if (shipment.outboundOrderId) {
         await lockPostgresRowById(tx, 'outbound_orders', shipment.outboundOrderId);
+        await this.assertOrderCanShip(tx, shipment.outboundOrderId);
       }
 
       const existingPackages = await tx.shipmentPackage.findMany({
@@ -205,9 +224,9 @@ export class ShippingService {
       });
       const existingOrderPackages = shipment.outboundOrderId
         ? await tx.shipmentPackage.findMany({
-            where: { outboundOrderId: shipment.outboundOrderId },
+            where: { outboundOrderId: shipment.outboundOrderId, status: { not: ShipmentPackageStatus.CANCELLED } },
           })
-        : existingPackages;
+        : existingPackages.filter((pack) => pack.status !== ShipmentPackageStatus.CANCELLED);
       const contentPlan = await this.buildPackageContentPlan(
         tx,
         shipment,
@@ -295,7 +314,7 @@ export class ShippingService {
         },
       });
 
-      return toPackageResponse(pack);
+      return toPackageResponse(pack, contentPlan.contents);
     });
   }
 
@@ -306,71 +325,77 @@ export class ShippingService {
     actor: AuthenticatedUser,
   ): Promise<CarrierLabelResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
-    const shipment = await this.resolveShipment(warehouse.id, shipmentReference);
-    const pack = dto.packageReference
-      ? await this.resolvePackage(warehouse.id, dto.packageReference)
-      : null;
-
-    if (pack && pack.shipmentId !== shipment.id) {
-      throw new ConflictException('Package does not belong to this shipment');
-    }
-
-    const owner = await this.resolveOperationOwner(this.client, warehouse.id, dto.ownerClientReference, [
-      { resourceType: 'SHIPMENT_PACKAGE', resourceId: pack?.id ?? null },
-      { resourceType: 'SHIPMENT', resourceId: shipment.id },
-      { resourceType: 'OUTBOUND_ORDER', resourceId: shipment.outboundOrderId },
-    ]);
-    const trackingNumber =
-      dto.trackingNumber ??
-      pack?.trackingNumber ??
-      makeTrackingNumber(shipment.carrier, shipment.shipmentNumber);
-    const labelReference = normalizeCode(`LBL-${trackingNumber}`);
-    const label = await this.client.carrierLabel.create({
-      data: {
-        warehouseId: warehouse.id,
-        shipmentId: shipment.id,
-        packageId: pack?.id ?? null,
-        labelReference,
-        status: CarrierLabelStatus.GENERATED,
-        carrier: shipment.carrier,
-        serviceLevel: shipment.serviceLevel,
-        trackingNumber,
-        labelFormat: normalizeCode(dto.labelFormat ?? 'ZPL'),
-        payload: {
-          shipmentNumber: shipment.shipmentNumber,
-          packageCode: pack?.packageCode ?? null,
-          trackingNumber,
+    return this.transaction(async (tx) => {
+      const shipment = await this.lockShipment(tx, warehouse.id, shipmentReference);
+      const pack = dto.packageReference
+        ? await this.resolvePackage(tx, warehouse.id, dto.packageReference)
+        : null;
+      if (pack && pack.shipmentId !== shipment.id) {
+        throw new ConflictException('Package does not belong to this shipment');
+      }
+      if (shipment.status === ShipmentStatus.CANCELLED || pack?.status === ShipmentPackageStatus.CANCELLED) {
+        throw new ConflictException('Cancelled shipments or packages cannot receive labels');
+      }
+      const owner = await this.resolveOperationOwner(tx, warehouse.id, dto.ownerClientReference, [
+        { resourceType: 'SHIPMENT_PACKAGE', resourceId: pack?.id ?? null },
+        { resourceType: 'SHIPMENT', resourceId: shipment.id },
+        { resourceType: 'OUTBOUND_ORDER', resourceId: shipment.outboundOrderId },
+      ]);
+      const trackingNumber =
+        dto.trackingNumber ?? pack?.trackingNumber ?? makeTrackingNumber(shipment.carrier, shipment.shipmentNumber);
+      const labelReference = normalizeCode(`LBL-${trackingNumber}`);
+      const labelFormat = normalizeCode(dto.labelFormat ?? 'ZPL');
+      await lockPostgresAdvisoryTransaction(tx, 'idempotency_key', `shipment-label:${warehouse.id}:${labelReference}`);
+      const [existing] = await tx.carrierLabel.findMany({ where: { warehouseId: warehouse.id, labelReference } });
+      if (existing) {
+        if (existing.shipmentId === shipment.id && existing.packageId === (pack?.id ?? null)
+          && existing.labelFormat === labelFormat && ['GENERATED', 'PRINTED'].includes(existing.status)) {
+          return toLabelResponse(existing);
+        }
+        throw new ConflictException('A different label already uses this tracking number');
+      }
+      const label = await tx.carrierLabel.create({
+        data: {
+          warehouseId: warehouse.id,
+          shipmentId: shipment.id,
+          packageId: pack?.id ?? null,
+          labelReference,
+          status: CarrierLabelStatus.GENERATED,
           carrier: shipment.carrier,
           serviceLevel: shipment.serviceLevel,
-          customPayload: dto.payload ?? null,
+          trackingNumber,
+          labelFormat,
+          payload: {
+            shipmentNumber: shipment.shipmentNumber,
+            packageCode: pack?.packageCode ?? null,
+            trackingNumber,
+            carrier: shipment.carrier,
+            serviceLevel: shipment.serviceLevel,
+            customPayload: dto.payload ?? null,
+          },
         },
-      },
-    });
-
-    if (owner) {
-      await this.linkOwnerResources(this.client, warehouse.id, owner, [
-        {
-          resourceType: 'CARRIER_LABEL',
+      });
+      if (owner) {
+        await this.linkOwnerResources(tx, warehouse.id, owner, [
+          {
+            resourceType: 'CARRIER_LABEL',
+            resourceId: label.id,
+            metadata: { source: 'shipment.generate_label', shipmentId: shipment.id, packageId: pack?.id ?? null },
+          },
+        ]);
+      }
+      await tx.auditLog.create({
+        data: {
+          actorUserId: actor.id,
+          warehouseId: warehouse.id,
+          action: 'carrier_label.generated',
+          resourceType: 'carrier_label',
           resourceId: label.id,
-          metadata: { source: 'shipment.generate_label', shipmentId: shipment.id, packageId: pack?.id ?? null },
+          metadata: { shipmentId: shipment.id, packageId: pack?.id ?? null, trackingNumber },
         },
-      ]);
-    }
-
-    await this.writeAudit(
-      actor,
-      warehouse.id,
-      'carrier_label.generated',
-      'carrier_label',
-      label.id,
-      {
-        shipmentId: shipment.id,
-        packageId: pack?.id ?? null,
-        trackingNumber,
-      },
-    );
-
-    return toLabelResponse(label);
+      });
+      return toLabelResponse(label);
+    });
   }
 
   async stageShipment(
@@ -385,7 +410,7 @@ export class ShippingService {
       : null;
 
     return this.transaction(async (tx: ShippingTransactionClient) => {
-      const shipment = await this.resolveShipmentWithClient(tx, warehouse.id, shipmentReference);
+      const shipment = await this.lockShipment(tx, warehouse.id, shipmentReference);
 
       if (!['PACKING', 'DRAFT'].includes(shipment.status)) {
         throw new ConflictException('Shipment can only be staged from DRAFT/PACKING');
@@ -438,12 +463,16 @@ export class ShippingService {
     const warehouse = await this.resolveWarehouse(warehouseReference);
 
     return this.transaction(async (tx: ShippingTransactionClient) => {
-      const shipment = await this.resolveShipmentWithClient(tx, warehouse.id, shipmentReference);
+      const shipment = await this.lockShipment(tx, warehouse.id, shipmentReference);
 
       if (!['STAGED', 'LOADING'].includes(shipment.status)) {
         throw new ConflictException('Shipment must be staged/loading before ship confirmation');
       }
 
+      if (shipment.outboundOrderId) {
+        await lockPostgresRowById(tx, 'outbound_orders', shipment.outboundOrderId);
+        await this.assertOrderCanShip(tx, shipment.outboundOrderId);
+      }
       await this.assertShipmentReadyToShip(tx, shipment, dto.allowShipWithoutLabel ?? false);
 
       const shippedAt = dto.shippedAt ? new Date(dto.shippedAt) : new Date();
@@ -516,6 +545,19 @@ export class ShippingService {
 
       return toShipmentResponse(updatedShipment);
     });
+  }
+
+  private async lockShipment(tx: ShippingTransactionClient, warehouseId: string, reference: string): Promise<ShipmentRecord> {
+    const shipment = await this.resolveShipmentWithClient(tx, warehouseId, reference);
+    await lockPostgresRowById(tx, 'shipments', shipment.id);
+    return this.resolveShipmentWithClient(tx, warehouseId, shipment.id);
+  }
+
+  private async assertOrderCanShip(tx: ShippingTransactionClient, id: string): Promise<void> {
+    const order = await tx.outboundOrder.findFirst({ where: { id } });
+    if (!order || ['CANCELLED', 'SHIPPED'].includes(order.status)) {
+      throw new ConflictException('Outbound order is missing, cancelled or already shipped');
+    }
   }
 
   private async resolveOperationOwner(
@@ -642,10 +684,11 @@ export class ShippingService {
   }
 
   private async resolvePackage(
+    client: ShippingTransactionClient,
     warehouseId: string,
     reference: string,
   ): Promise<ShipmentPackageRecord> {
-    const pack = await this.client.shipmentPackage.findFirst({
+    const pack = await client.shipmentPackage.findFirst({
       where: { warehouseId, OR: referenceOr(reference, { packageCode: normalizeCode(reference) }) },
     });
 
@@ -887,6 +930,7 @@ function toShipmentResponse(shipment: ShipmentRecord): ShipmentResponse {
     stagedLocationId: shipment.stagedLocationId ?? null,
     status: shipment.status as ShipmentStatus,
     carrier: shipment.carrier ?? null,
+    labelRequired: carrierRequiresLabel(shipment.carrier ?? null),
     serviceLevel: shipment.serviceLevel ?? null,
     trackingReference: shipment.trackingReference ?? null,
     metadata: shipment.metadata ?? null,
@@ -896,7 +940,11 @@ function toShipmentResponse(shipment: ShipmentRecord): ShipmentResponse {
   };
 }
 
-function toPackageResponse(pack: ShipmentPackageRecord): ShipmentPackageResponse {
+function toPackageResponse(
+  pack: ShipmentPackageRecord,
+  contents: ShipmentPackageResponse['contents'] = [],
+  labelReady = false,
+): ShipmentPackageResponse {
   return {
     id: pack.id,
     warehouseId: pack.warehouseId,
@@ -910,6 +958,8 @@ function toPackageResponse(pack: ShipmentPackageRecord): ShipmentPackageResponse
     widthCm: pack.widthCm ?? null,
     heightCm: pack.heightCm ?? null,
     trackingNumber: pack.trackingNumber ?? null,
+    contents: contents.map(({ outboundOrderLineId, sku, quantity }) => ({ outboundOrderLineId, sku, quantity })),
+    labelReady,
     metadata: pack.metadata ?? null,
   };
 }

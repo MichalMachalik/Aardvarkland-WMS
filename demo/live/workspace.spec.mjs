@@ -323,6 +323,152 @@ test('receiving uses actual shipment lines, routes to the correct dock and retri
   await expect(submit).toHaveCount(0);
 });
 
+test('packing keeps orders separate and resumes packages, labels and dispatch from the server', async ({ page }) => {
+  test.skip(process.env.WMS_LIVE_UI_WRITE !== 'true', 'Enable writes only on a disposable database.');
+  test.setTimeout(90000);
+  await login(page, roles.worker);
+  const { accessToken: admin } = await liveApi(page, '/api/auth/login', {
+    data: { email: roles.system.email, password: roles.system.password },
+  });
+  const warehouse = '/api/warehouses/MAIN';
+  const run = randomUUID().slice(0, 8).toUpperCase();
+  const sku = `PACK-${run}`;
+  const barcode = `BAR-${run}`;
+  const own = (path, data) => liveApi(page, warehouse + path, { token: admin, data });
+  const product = await liveApi(page, '/api/products', { token: admin, data: { code: sku, name: 'Packing fixture' } });
+  await liveApi(page, '/api/products/skus', { token: admin, data: { productReference: product.id, code: sku, name: 'Packing fixture SKU', barcode } });
+  await own('/inventory/quants/receive', { skuReference: sku, locationReference: 'A-01-01', quantity: 5 });
+
+  async function pick(label, quantities, { prepack = true, carrier = 'EXPRESS_CARRIER' } = {}) {
+    const order = await own('/outbound-orders', {
+      orderNumber: `PACK-${label}-${run}`, carrier,
+      lines: quantities.map((orderedQuantity, index) => ({ sku, lineNumber: String((index + 1) * 10), orderedQuantity })),
+    });
+    await own(`/outbound-orders/${order.id}/allocate`, {});
+    await own(`/outbound-orders/${order.id}/release-picking`, {});
+    const tasks = (await own(`/tasks?type=PICK&sku=${encodeURIComponent(sku)}`))
+      .filter(task => task.outboundOrderId === order.id);
+    expect(tasks).toHaveLength(quantities.length);
+    for (const task of tasks) {
+      await own(`/tasks/${task.id}/confirm-pick`, { orderReference: order.id, quantity: task.quantity });
+    }
+    if (!prepack) return { order };
+    const shipment = await own('/shipments', {
+      shipmentNumber: `SHP-${label}-${run}`, outboundOrderReference: order.id, packingStationReference: 'PACK-01',
+    });
+    const initial = await own(`/shipments/${shipment.id}/packages`, {
+      packageCode: `BOX-${label}-${run}`,
+      contents: [{ sku, outboundOrderLineReference: order.lines[0].id, quantity: 1 }],
+    });
+    return { order, shipment, initial };
+  }
+
+  const older = await pick('OLDER', [2, 1]);
+  const newer = await pick('NEWER', [1]);
+  const pickup = await pick('PICKUP', [1], { prepack: false, carrier: 'PICKUP' });
+  const packagesPath = fixture => `/shipments/${fixture.shipment.id}/packages`;
+  const packages = fixture => own(packagesPath(fixture));
+  const shipments = fixture => own(`/shipments?outboundOrderReference=${fixture.order.id}`);
+  const expectNoWrite = (button) => expect(button).toBeDisabled();
+
+  await desktopNav(page).getByRole('button', { name: 'Balení', exact: true }).click();
+  const orders = page.getByRole('combobox', { name: 'Objednávka' });
+  await expect(orders.locator('option').filter({ hasText: older.order.orderNumber })).toHaveCount(1);
+  await expect(orders.locator('option').filter({ hasText: newer.order.orderNumber })).toHaveCount(1);
+  await expect(orders).toHaveValue('');
+  await orders.selectOption(older.order.id);
+  await page.setViewportSize({ width: 390, height: 844 });
+  const input = page.getByTestId('packing-scan-input');
+  const packButton = page.getByRole('button', { name: 'Vytvořit balík', exact: true });
+  const shipButton = page.getByRole('button', { name: 'Odeslat zásilku', exact: true });
+  const line = number => page.locator('.packing-lines article').filter({ has: page.getByText(`Řádek ${number}`, { exact: true }) });
+  const packageRow = code => page.locator('.packing-lines article').filter({ hasText: code });
+  const scan = async code => {
+    await input.fill(code);
+    await input.press('Enter');
+  };
+  await expect(packageRow(older.initial.packageCode)).toBeVisible();
+  await expect(line(10)).toContainText('1/2');
+  await expectNoWrite(shipButton);
+  await scan('UNKNOWN-' + run);
+  await expect(page.getByRole('alert')).toHaveText('Kód nepatří k vybrané objednávce.');
+  await expectNoWrite(packButton);
+  await scan(sku);
+  await expect(line(10)).toContainText('Naskenováno 1');
+  await expect(line(20)).toContainText('Naskenováno 0');
+  await orders.selectOption(newer.order.id);
+  await expect(packageRow(newer.initial.packageCode)).toBeVisible();
+  await expectNoWrite(packButton);
+  await orders.selectOption(older.order.id);
+  await expect(line(10)).toContainText('Naskenováno 0');
+  await scan(sku);
+  await scan(barcode);
+  await expect(line(10)).toContainText('Naskenováno 1');
+  await expect(line(20)).toContainText('Naskenováno 1');
+  const weight = page.getByRole('spinbutton', { name: 'Hmotnost balíku v g (volitelně)' });
+  await weight.fill('-1');
+  await expectNoWrite(packButton);
+  await weight.fill('620');
+  await packButton.click();
+  await expect(line(10)).toContainText('2/2');
+  await expect(line(20)).toContainText('1/1');
+  const saved = await packages(older);
+  expect(saved).toHaveLength(2);
+  const added = saved.find(pack => pack.id !== older.initial.id);
+  expect(added.weightGrams).toBe(620);
+  expect(added.contents).toEqual(expect.arrayContaining(older.order.lines.map(item => ({
+    sku, outboundOrderLineId: item.id, quantity: 1,
+  }))));
+  expect(await shipments(older)).toHaveLength(1);
+  expect(await packages(newer)).toHaveLength(1);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+  await expectNoWrite(shipButton);
+  for (const pack of saved) {
+    await packageRow(pack.packageCode).getByRole('button', { name: 'Vygenerovat štítek' }).click();
+    await expect(packageRow(pack.packageCode)).toContainText('Štítek připraven');
+  }
+  await expect(shipButton).toBeEnabled();
+  await page.route(`**/shipments/${older.shipment.id}/ship`, route => route.abort(), { times: 1 });
+  await shipButton.click();
+  await expect(page.getByText(/Odeslat zásilku selhalo/)).toBeVisible();
+  expect((await shipments(older))[0].status).toBe('STAGED');
+
+  await page.reload();
+  await orders.selectOption(older.order.id);
+  for (const pack of saved) await expect(packageRow(pack.packageCode)).toContainText('Štítek připraven');
+  await expect(shipButton).toBeEnabled();
+  const dispatch = page.waitForResponse(response => response.url().endsWith(`/shipments/${older.shipment.id}/ship`));
+  await shipButton.click();
+  expect((await dispatch).ok()).toBe(true);
+  await expect(page.getByRole('status').filter({ hasText: older.order.orderNumber })).toBeVisible();
+  expect((await shipments(older))[0].status).toBe('SHIPPED');
+  expect((await shipments(newer))[0].status).toBe('PACKING');
+
+  await orders.selectOption(pickup.order.id);
+  expect(await shipments(pickup)).toHaveLength(0);
+  let packageResponseLost = false;
+  await page.route('**/shipments/*/packages', async route => {
+    if (route.request().method() !== 'POST' || packageResponseLost) {
+      await route.continue();
+      return;
+    }
+    packageResponseLost = true;
+    expect((await route.fetch()).ok()).toBe(true);
+    await route.abort();
+  });
+  await scan(sku);
+  await packButton.click();
+  await expect(shipButton).toBeEnabled();
+  expect(packageResponseLost).toBe(true);
+  const [pickupShipment] = await shipments(pickup);
+  const pickupPackages = await own(`/shipments/${pickupShipment.id}/packages`);
+  expect(pickupPackages).toHaveLength(1);
+  expect(pickupPackages[0]).toMatchObject({ weightGrams: null, labelReady: false });
+  await shipButton.click();
+  await expect(page.getByRole('status').filter({ hasText: pickup.order.orderNumber })).toBeVisible();
+  expect((await shipments(pickup))[0].status).toBe('SHIPPED');
+});
+
 test('cycle counts isolate plans, hide the RF quantity and write only approved counts to stock', async ({ page, browser }) => {
   test.skip(process.env.WMS_LIVE_UI_WRITE !== 'true', 'Enable writes only on a disposable database.');
   test.setTimeout(60000);

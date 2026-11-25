@@ -89,7 +89,7 @@ test('warehouse workflows on a disposable database', {
     assert.equal(received.lines[0].receivedQuantity, 2);
 
     const order = await own('/outbound-orders', {
-      orderNumber: `SO-TEST-${run}`, recipientName: 'Test recipient',
+      orderNumber: `SO-TEST-${run}`, recipientName: 'Test recipient', carrier: 'EXPRESS_CARRIER',
       lines: [{ lineNumber: '1', sku, orderedQuantity: 2 }],
     });
     const before = new Set((await own('/rf/queue?limit=100')).tasks.map(task => task.id));
@@ -109,17 +109,36 @@ test('warehouse workflows on a disposable database', {
     const shipment = await own('/shipments', {
       shipmentNumber: `SHP-TEST-${run}`, outboundOrderReference: order.id, packingStationReference: 'PACK-01',
     });
-    const parcel = await own(`/shipments/${shipment.id}/packages`, {
+    const packagesPath = `/shipments/${shipment.id}/packages`;
+    const content = { sku, outboundOrderLineReference: picked.lines[0].id };
+    for (const quantity of [false, '', 0, 1.5, 2147483648]) {
+      await own(packagesPath, { contents: [{ ...content, quantity }] }, 400);
+    }
+    await own(packagesPath, { contents: [{ ...content, quantity: 3 }] }, 409);
+    assert.deepEqual(await own(packagesPath), []);
+    const parcel = await own(packagesPath, {
       packageCode: `BOX-TEST-${run}`, weightGrams: 500,
-      contents: [{ sku, outboundOrderLineReference: picked.lines[0].id, quantity: 2 }],
+      contents: [{ ...content, quantity: 2 }],
     });
     const parcelId = parcel.id ?? parcel.package?.id;
     assert.ok(parcelId);
-    const label = await own(`/shipments/${shipment.id}/labels`, { packageReference: parcelId, labelFormat: 'ZPL' });
-    assert.ok(label.id, 'A label must be generated for the test parcel');
+    const [beforeLabel] = await own(packagesPath);
+    assert.equal(beforeLabel.labelReady, false);
+    assert.deepEqual(beforeLabel.contents, [{ sku, outboundOrderLineId: picked.lines[0].id, quantity: 2 }]);
     await own(`/shipments/${shipment.id}/stage`, {});
-    const shipped = await own(`/shipments/${shipment.id}/ship`, {});
-    assert.equal(shipped.status, 'SHIPPED');
+    const shipPath = `/shipments/${shipment.id}/ship`;
+    await own(shipPath, {}, 409);
+    const labelPath = `/shipments/${shipment.id}/labels`;
+    const labelBody = { packageReference: parcelId, labelFormat: 'ZPL' };
+    const labels = await Promise.all([own(labelPath, labelBody), own(labelPath, labelBody)]);
+    assert.ok(labels[0].id, 'A label must be generated for the test parcel');
+    assert.equal(labels[1].id, labels[0].id);
+    assert.equal((await own(packagesPath))[0].labelReady, true);
+    const shipping = await Promise.allSettled([own(shipPath, {}), own(shipPath, {})]);
+    const confirmed = shipping.filter(result => result.status === 'fulfilled');
+    assert.equal(confirmed.length, 1);
+    assert.equal(confirmed[0].value.status, 'SHIPPED');
+    assert.match(shipping.find(result => result.status === 'rejected')?.reason?.message ?? '', /returned 409/);
     assert.equal((await own(`/outbound-orders/${order.id}`)).status, 'SHIPPED');
   });
 

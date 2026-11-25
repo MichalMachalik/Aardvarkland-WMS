@@ -206,6 +206,7 @@ export function listPickWaves<T>(warehouseId: string, query?: QueryParams) { ret
 export function releasePickWave<T>(warehouseId: string, waveId: string, body: MutationBody = { createMissingPickTasks: true }) { return post<T>(endpoints.releasePickWave(warehouseId, waveId), body, `storage-release-wave-${waveId}`); }
 export function listPackingStations<T>(warehouseId: string) { return apiRequest<T>(endpoints.packingStations(warehouseId)); }
 export function listShipments<T>(warehouseId: string, query?: QueryParams) { return apiRequest<T>(endpoints.shipments(warehouseId), { query }); }
+export function listShipmentPackages<T>(warehouseId: string, shipmentId: string, query?: QueryParams) { return apiRequest<T>(endpoints.shipmentPackages(warehouseId, shipmentId), { query }); }
 export function createShipment<T>(warehouseId: string, body: MutationBody) { return post<T>(endpoints.shipments(warehouseId), body, String(body.idempotencyKey ?? createWmsIdempotencyKey(`storage-create-shipment-${String(body.outboundOrderReference ?? 'shipment')}`))); }
 export function addShipmentPackage<T>(warehouseId: string, shipmentId: string, body: MutationBody) { return post<T>(endpoints.shipmentPackages(warehouseId, shipmentId), body, createWmsIdempotencyKey(`storage-package-${shipmentId}`)); }
 export function generateShipmentLabel<T>(warehouseId: string, shipmentId: string, body: MutationBody = {}) { return post<T>(endpoints.shipmentLabels(warehouseId, shipmentId), body, createWmsIdempotencyKey(`storage-label-${shipmentId}`)); }

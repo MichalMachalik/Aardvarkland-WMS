@@ -1,4 +1,4 @@
-import type { Order, PackingLine, Severity, Shipment, StockQuant, WarehouseTask, WavePlan } from '../types/wms';
+import type { Order, Severity, Shipment, StockQuant, WarehouseTask, WavePlan } from '../types/wms';
 
 type AnyRecord = Record<string, unknown>;
 
@@ -220,31 +220,6 @@ export function mapPickWaves(payload: unknown): WavePlan[] {
       progress,
       risk: severityFromIndex(index),
       recommendation: stringValue(record(row.metadata).recommendation, '—'),
-    };
-  });
-}
-
-export function mapPackingLinesFromOrders(payload: unknown): PackingLine[] {
-  const orders = mapOutboundOrders(payload);
-  const rawOrders = array(payload);
-  const selectedIndex = rawOrders.findIndex((row) => {
-    const status = stringValue(record(row).status, '').toUpperCase();
-    if (!['PICKED', 'PACKING', 'PACKED'].includes(status)) return false;
-    return array(record(row).lines).some((line) => numberValue(record(line).pickedQuantity, 0) > 0);
-  });
-  if (selectedIndex < 0) return [];
-  const selected = rawOrders[selectedIndex];
-  const selectedOrder = orders[selectedIndex] ?? orders[0];
-  return array(record(selected).lines).filter((line) => numberValue(record(line).pickedQuantity, 0) > 0).map((line, index) => {
-    const row = record(line);
-    const picked = numberValue(row.pickedQuantity, 0);
-    return {
-      orderId: selectedOrder?.id ?? '—',
-      sku: stringValue(row.sku ?? row.skuCode, `SKU-${index + 1}`),
-      product: stringValue(row.description ?? row.productName, '—'),
-      expected: picked > 0 ? picked : numberValue(row.orderedQuantity ?? row.expectedQuantity, 1),
-      scanned: numberValue(row.packedQuantity, 0),
-      serialRequired: Boolean(record(row.metadata).serialRequired),
     };
   });
 }

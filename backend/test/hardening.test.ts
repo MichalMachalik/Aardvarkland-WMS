@@ -261,6 +261,6 @@ test('development queue worker preserves Nest decorator metadata', () => {
 test('packing locks the outbound order and counts packages across all shipments', () => {
   const source = readFileSync(join(cwd(), 'src/shipping/shipping.service.ts'), 'utf8');
   assert.match(source, /lockPostgresRowById\(tx, 'outbound_orders', shipment\.outboundOrderId\)/);
-  assert.match(source, /where: \{ outboundOrderId: shipment\.outboundOrderId \}/);
+  assert.match(source, /where: \{ outboundOrderId: shipment\.outboundOrderId, status: \{ not: ShipmentPackageStatus\.CANCELLED \} \}/);
   assert.match(source, /this\.buildPackageContentPlan\(\s*tx,\s*shipment,\s*existingOrderPackages/s);
 });

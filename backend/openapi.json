@@ -18426,7 +18426,9 @@
           },
           "quantity": {
             "type": "number",
-            "example": 2
+            "example": 2,
+            "minimum": 1,
+            "maximum": 2147483647
           },
           "metadata": {
             "type": "object",
@@ -18449,19 +18451,27 @@
           },
           "weightGrams": {
             "type": "number",
-            "example": 1200
+            "example": 1200,
+            "minimum": 0,
+            "maximum": 2147483647
           },
           "lengthCm": {
             "type": "number",
-            "example": 40
+            "example": 40,
+            "minimum": 0,
+            "maximum": 2147483647
           },
           "widthCm": {
             "type": "number",
-            "example": 30
+            "example": 30,
+            "minimum": 0,
+            "maximum": 2147483647
           },
           "heightCm": {
             "type": "number",
-            "example": 20
+            "example": 20,
+            "minimum": 0,
+            "maximum": 2147483647
           },
           "contents": {
             "type": "array",

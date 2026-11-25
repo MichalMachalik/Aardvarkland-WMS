@@ -1,5 +1,5 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
-import { Type } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import {
   ArrayMaxSize,
   IsArray,
@@ -7,10 +7,17 @@ import {
   IsObject,
   IsOptional,
   IsString,
+  Max,
   MaxLength,
   Min,
   ValidateNested,
 } from 'class-validator';
+
+const maxPackageNumber = 2_147_483_647;
+
+function readWholeNumber({ value }: { value: unknown }): unknown {
+  return typeof value === 'string' && /^\d+$/.test(value.trim()) ? Number(value) : value;
+}
 
 export class PackageContentInputDto {
   @ApiPropertyOptional({ example: 'line-id' })
@@ -24,10 +31,11 @@ export class PackageContentInputDto {
   @MaxLength(120)
   sku!: string;
 
-  @ApiPropertyOptional({ example: 2 })
-  @Type(() => Number)
+  @ApiPropertyOptional({ example: 2, minimum: 1, maximum: maxPackageNumber })
+  @Transform(readWholeNumber)
   @IsInt()
   @Min(1)
+  @Max(maxPackageNumber)
   quantity!: number;
 
   @ApiPropertyOptional({ example: { serials: [] } })
@@ -49,32 +57,36 @@ export class AddShipmentPackageDto {
   @MaxLength(80)
   packageType?: string;
 
-  @ApiPropertyOptional({ example: 1200 })
+  @ApiPropertyOptional({ example: 1200, minimum: 0, maximum: maxPackageNumber })
   @IsOptional()
-  @Type(() => Number)
+  @Transform(readWholeNumber)
   @IsInt()
   @Min(0)
+  @Max(maxPackageNumber)
   weightGrams?: number;
 
-  @ApiPropertyOptional({ example: 40 })
+  @ApiPropertyOptional({ example: 40, minimum: 0, maximum: maxPackageNumber })
   @IsOptional()
-  @Type(() => Number)
+  @Transform(readWholeNumber)
   @IsInt()
   @Min(0)
+  @Max(maxPackageNumber)
   lengthCm?: number;
 
-  @ApiPropertyOptional({ example: 30 })
+  @ApiPropertyOptional({ example: 30, minimum: 0, maximum: maxPackageNumber })
   @IsOptional()
-  @Type(() => Number)
+  @Transform(readWholeNumber)
   @IsInt()
   @Min(0)
+  @Max(maxPackageNumber)
   widthCm?: number;
 
-  @ApiPropertyOptional({ example: 20 })
+  @ApiPropertyOptional({ example: 20, minimum: 0, maximum: maxPackageNumber })
   @IsOptional()
-  @Type(() => Number)
+  @Transform(readWholeNumber)
   @IsInt()
   @Min(0)
+  @Max(maxPackageNumber)
   heightCm?: number;
 
   @ApiPropertyOptional({ type: [PackageContentInputDto] })
