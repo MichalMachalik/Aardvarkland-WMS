@@ -56,6 +56,62 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.equal(savedLocation.capacity.units, 42);
   });
 
+  await scenario('product master preserves storage, ownership, documents and one default package', async () => {
+    const { product, sku } = await createSku('DETAILS');
+    const productPath = `/api/product-master/products/${product.code}`;
+    const skuPath = `/api/product-master/skus/${sku.code}`;
+    const requirements = `${skuPath}/storage-requirements`;
+    const stored = await asAdmin('PUT', requirements, {
+      temperatureMinCelsius: 2, temperatureMaxCelsius: 8, fragile: true, stackable: false,
+    });
+    await asAdmin('PUT', requirements, { temperatureMinCelsius: 9, temperatureMaxCelsius: 3 }, 409);
+    const storage = await prisma.skuStorageRequirement.findUniqueOrThrow({ where: { skuId: sku.id } });
+    assert.equal(storage.id, stored.id);
+    assert.equal(Number(storage.temperatureMinCelsius), 2);
+    assert.equal(Number(storage.temperatureMaxCelsius), 8);
+    assert.equal(storage.fragile, true);
+    assert.equal(storage.stackable, false);
+
+    const client = await asAdmin('POST', '/api/clients', { code: `DETAILS-${suffix}`, name: 'Product client fixture' });
+    await asAdmin('POST', `${productPath}/clients`, { clientReference: `NO-CLIENT-${suffix}` }, 404);
+    const ownership = await asAdmin('POST', `${productPath}/clients`, {
+      clientReference: client.code, externalArticleNumber: '  PART-1  ',
+    });
+    const amended = await asAdmin('POST', `${productPath}/clients`, {
+      clientReference: client.id, externalArticleNumber: 'PART-2',
+    });
+    assert.equal(amended.id, ownership.id);
+    assert.equal((await prisma.productClientOwnership.findUniqueOrThrow({ where: { id: ownership.id } })).externalArticleNumber, 'PART-2');
+
+    const docsPath = `${productPath}/documents`;
+    const documentBody = {
+      documentType: 'OTHER', title: 'Product test sheet', uri: 'https://files.example.invalid/sheet.pdf',
+      mimeType: 'application/pdf', checksumSha256: 'a'.repeat(64),
+    };
+    await asWorker('POST', docsPath, documentBody, 403);
+    await asAdmin('POST', docsPath, { ...documentBody, documentType: 'UNKNOWN' }, 400);
+    const document = await asAdmin('POST', docsPath, documentBody);
+    assert.ok((await asAdmin('GET', docsPath)).some(entry =>
+      entry.id === document.id && entry.uri === documentBody.uri && entry.checksumSha256 === documentBody.checksumSha256));
+
+    const packagesPath = `${skuPath}/packaging-levels`;
+    const each = { levelCode: 'EACH', uom: 'EA', unitsPerLevel: 1, isDefault: true };
+    const box = { levelCode: 'BOX', uom: 'EA', unitsPerLevel: 6, parentLevelCode: 'EACH' };
+    const pallet = { levelCode: 'PALLET', uom: 'EA', unitsPerLevel: 36, parentLevelCode: 'BOX' };
+    await asAdmin('POST', packagesPath, each);
+    await asAdmin('POST', packagesPath, { ...box, parentLevelCode: 'MISSING' }, 409);
+    await asAdmin('POST', packagesPath, { ...box, isDefault: true });
+    assert.deepEqual((await asAdmin('GET', packagesPath)).filter(level => level.isDefault).map(level => level.levelCode), ['BOX']);
+    await asAdmin('POST', packagesPath, { ...each, unitsPerLevel: 7 }, 409);
+    await Promise.all([
+      asAdmin('POST', packagesPath, { ...pallet, isDefault: true }),
+      asAdmin('POST', packagesPath, each),
+    ]);
+    const levels = await asAdmin('GET', packagesPath);
+    assert.deepEqual(levels.map(level => [level.levelCode, level.unitsPerLevel]), [['EACH', 1], ['BOX', 6], ['PALLET', 36]]);
+    assert.equal(levels.filter(level => level.isDefault).length, 1);
+  });
+
   await scenario('stock receipts replay exactly once and moving blocked stock preserves the hold', async () => {
     const { sku } = await createSku('STOCK');
     const receipt = { skuReference: sku.code, locationReference: 'A-01-01', quantity: 4 };

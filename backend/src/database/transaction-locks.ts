@@ -5,6 +5,7 @@ export interface RawSqlClient {
 }
 
 const SAFE_TABLE_NAMES = new Set([
+  'skus',
   'stock_quants',
   'reservations',
   'outbound_orders',

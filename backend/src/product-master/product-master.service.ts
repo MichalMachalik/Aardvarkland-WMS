@@ -1,7 +1,7 @@
 import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 
 import { AuthenticatedUser } from '../access-control/types';
-import { PrismaService } from '../database';
+import { lockPostgresRowById, PrismaService, withTransactionRetry } from '../database';
 import { AttachProductClientDto } from './dto/attach-product-client.dto';
 import { CreateProductCategoryDto } from './dto/create-product-category.dto';
 import { CreateProductDocumentDto } from './dto/create-product-document.dto';
@@ -284,70 +284,80 @@ export class ProductMasterService {
     actor: AuthenticatedUser,
   ): Promise<SkuPackagingLevelResponse> {
     const sku = await this.resolveSku(skuReference);
-    const existing = await this.query<SkuPackagingLevelRow>(
-      `SELECT * FROM sku_packaging_levels WHERE sku_id = $1::uuid`,
-      sku.id,
-    );
-    validatePackagingHierarchy([
-      ...existing
-        .filter((level) => normalizeMasterCode(level.level_code) !== normalizeMasterCode(dto.levelCode))
-        .map((level) => ({
-          levelCode: level.level_code,
-          unitsPerLevel: level.units_per_level,
-          parentLevelCode: level.parent_level_code,
-          isDefault: level.is_default,
-        })),
-      {
-        levelCode: dto.levelCode,
-        unitsPerLevel: dto.unitsPerLevel,
-        parentLevelCode: dto.parentLevelCode,
-        isDefault: dto.isDefault,
-      },
-    ]);
+    const levelCode = normalizeMasterCode(dto.levelCode);
 
-    if (dto.isDefault) {
-      await this.execute(`UPDATE sku_packaging_levels SET is_default = false, updated_at = now() WHERE sku_id = $1::uuid`, sku.id);
-    }
+    return withTransactionRetry(() => this.prisma.$transaction(async (tx) => {
+      await lockPostgresRowById(tx, 'skus', sku.id);
+      const existing = await tx.$queryRawUnsafe<SkuPackagingLevelRow[]>(
+        `SELECT * FROM sku_packaging_levels WHERE sku_id = $1::uuid`,
+        sku.id,
+      );
+      validatePackagingHierarchy([
+        ...existing
+          .filter((level) => normalizeMasterCode(level.level_code) !== levelCode)
+          .map((level) => ({
+            levelCode: level.level_code,
+            unitsPerLevel: level.units_per_level,
+            parentLevelCode: level.parent_level_code,
+            isDefault: dto.isDefault ? false : level.is_default,
+          })),
+        {
+          levelCode,
+          unitsPerLevel: dto.unitsPerLevel,
+          parentLevelCode: dto.parentLevelCode,
+          isDefault: dto.isDefault,
+        },
+      ]);
 
-    const rows = await this.query<SkuPackagingLevelRow>(
-      `INSERT INTO sku_packaging_levels
-        (sku_id, level_code, uom, units_per_level, parent_level_code, weight_grams, length_mm, width_mm, height_mm, volume_cm3, barcode, is_default, metadata)
-       VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb)
-       ON CONFLICT (sku_id, level_code) DO UPDATE SET
-         uom = EXCLUDED.uom,
-         units_per_level = EXCLUDED.units_per_level,
-         parent_level_code = EXCLUDED.parent_level_code,
-         weight_grams = EXCLUDED.weight_grams,
-         length_mm = EXCLUDED.length_mm,
-         width_mm = EXCLUDED.width_mm,
-         height_mm = EXCLUDED.height_mm,
-         volume_cm3 = EXCLUDED.volume_cm3,
-         barcode = EXCLUDED.barcode,
-         is_default = EXCLUDED.is_default,
-         metadata = EXCLUDED.metadata,
-         updated_at = now()
-       RETURNING *`,
-      sku.id,
-      normalizeMasterCode(dto.levelCode),
-      normalizeMasterCode(dto.uom),
-      dto.unitsPerLevel,
-      dto.parentLevelCode ? normalizeMasterCode(dto.parentLevelCode) : null,
-      dto.weightGrams ?? null,
-      dto.lengthMm ?? null,
-      dto.widthMm ?? null,
-      dto.heightMm ?? null,
-      dto.volumeCm3 ?? deriveVolume(dto.lengthMm, dto.widthMm, dto.heightMm),
-      dto.barcode ? normalizeBarcode(dto.barcode) : null,
-      dto.isDefault ?? false,
-      json(dto.metadata),
-    );
-    const level = requiredRow(rows, 'SKU packaging level was not saved');
-    await this.writeAudit(actor, 'sku_packaging_level.upserted', 'sku_packaging_level', level.id, null, {
-      skuId: sku.id,
-      levelCode: level.level_code,
-      unitsPerLevel: level.units_per_level,
-    });
-    return toPackagingLevelResponse(level);
+      if (dto.isDefault) {
+        await tx.$executeRawUnsafe(
+          `UPDATE sku_packaging_levels SET is_default = false, updated_at = now()
+           WHERE sku_id = $1::uuid AND is_default AND level_code <> $2`,
+          sku.id,
+          levelCode,
+        );
+      }
+
+      const rows = await tx.$queryRawUnsafe<SkuPackagingLevelRow[]>(
+        `INSERT INTO sku_packaging_levels
+          (sku_id, level_code, uom, units_per_level, parent_level_code, weight_grams, length_mm, width_mm, height_mm, volume_cm3, barcode, is_default, metadata)
+         VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb)
+         ON CONFLICT (sku_id, level_code) DO UPDATE SET
+           uom = EXCLUDED.uom,
+           units_per_level = EXCLUDED.units_per_level,
+           parent_level_code = EXCLUDED.parent_level_code,
+           weight_grams = EXCLUDED.weight_grams,
+           length_mm = EXCLUDED.length_mm,
+           width_mm = EXCLUDED.width_mm,
+           height_mm = EXCLUDED.height_mm,
+           volume_cm3 = EXCLUDED.volume_cm3,
+           barcode = EXCLUDED.barcode,
+           is_default = EXCLUDED.is_default,
+           metadata = EXCLUDED.metadata,
+           updated_at = now()
+         RETURNING *`,
+        sku.id,
+        levelCode,
+        normalizeMasterCode(dto.uom),
+        dto.unitsPerLevel,
+        dto.parentLevelCode ? normalizeMasterCode(dto.parentLevelCode) : null,
+        dto.weightGrams ?? null,
+        dto.lengthMm ?? null,
+        dto.widthMm ?? null,
+        dto.heightMm ?? null,
+        dto.volumeCm3 ?? deriveVolume(dto.lengthMm, dto.widthMm, dto.heightMm),
+        dto.barcode ? normalizeBarcode(dto.barcode) : null,
+        dto.isDefault ?? false,
+        json(dto.metadata),
+      );
+      const level = requiredRow(rows, 'SKU packaging level was not saved');
+      await this.writeAudit(actor, 'sku_packaging_level.upserted', 'sku_packaging_level', level.id, null, {
+        skuId: sku.id,
+        levelCode: level.level_code,
+        unitsPerLevel: level.units_per_level,
+      }, tx);
+      return toPackagingLevelResponse(level);
+    }));
   }
 
   async attachProductClient(
@@ -482,8 +492,9 @@ export class ProductMasterService {
     resourceId: string,
     warehouseId: string | null,
     metadata: Record<string, unknown>,
+    db: Pick<PrismaService, '$executeRawUnsafe'> = this.prisma,
   ): Promise<void> {
-    await this.execute(
+    await db.$executeRawUnsafe(
       `INSERT INTO audit_logs (actor_user_id, warehouse_id, action, resource_type, resource_id, metadata)
        VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6::jsonb)`,
       actor.id,
