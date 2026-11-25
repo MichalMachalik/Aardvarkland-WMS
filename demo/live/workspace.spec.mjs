@@ -686,6 +686,63 @@ interceptedTest('the RF browser uploads stored scans in order and keeps every un
   expect(calls[2].scans.map(scan => scan.idempotencyKey)).toEqual(scans.slice(1).map(scan => scan.idempotencyKey));
 });
 
+test('RF putaway validates the quantity and moves stock after an offline confirmation is uploaded', async ({ page }) => {
+  test.skip(process.env.WMS_LIVE_UI_WRITE !== 'true', 'Requires a disposable warehouse database.');
+  const warehouse = '/api/warehouses/MAIN';
+  const { accessToken: admin } = await liveApi(page, '/api/auth/login', {
+    data: { email: roles.system.email, password: roles.system.password },
+  });
+  const own = (path, data) => liveApi(page, warehouse + path, { token: admin, data });
+  const code = `RF-BIN-${randomUUID().slice(0, 8).toUpperCase()}`;
+  const product = await liveApi(page, '/api/products', { token: admin, data: { code, name: 'RF putaway product' } });
+  await liveApi(page, '/api/products/skus', { token: admin, data: { code, productReference: product.id, name: 'RF putaway SKU' } });
+  const target = await own('/locations', {
+    code: `${code}-TARGET`, name: 'RF putaway test bin', type: 'STORAGE', parentReference: 'A-01',
+  });
+  const { quant: stock } = await own('/inventory/quants/receive', {
+    skuReference: code, locationReference: 'A-01-01', quantity: 6,
+  });
+  const { task } = await own('/putaway/tasks', { stockQuantReference: stock.id, toLocationReference: target.id, quantity: 3 });
+
+  await login(page, roles.worker);
+  await desktopNav(page).getByRole('button', { name: 'Skenování', exact: true }).click();
+  await page.locator(`[data-e2e-row="rf-task"][data-e2e-value="${task.id}"]`).click();
+  await page.locator('[data-e2e-action="rf-start-resume"]').click();
+  const expected = page.getByTestId('rf-expected-scan');
+  const input = page.getByTestId('rf-scan-input');
+  const confirm = page.locator('[data-e2e-action="rf-confirm-scan"]');
+  const sendQueue = page.locator('[data-e2e-action="rf-sync-offline"]');
+  for (const value of [code, 'A-01-01', target.code]) {
+    await expect(expected).toHaveText(value, { ignoreCase: true });
+    await input.fill(value);
+    await confirm.click();
+    await expect(input).toHaveValue('');
+  }
+  await expect(expected).toHaveText('3');
+  for (const value of ['0', '4']) {
+    await input.fill(value);
+    await expect(confirm).toBeDisabled();
+  }
+  await page.context().setOffline(true);
+  try {
+    await expect(page.locator('[data-e2e-action="rf-toggle-offline"]')).toHaveText('Offline zapnuto');
+    await input.fill('2');
+    await confirm.click();
+    await expect(sendQueue).toContainText('(1)');
+  } finally {
+    await page.context().setOffline(false);
+  }
+  expect((await own(`/inventory/quants/${stock.id}`)).quantity).toBe(6);
+  await sendQueue.click();
+  await expect(page.getByRole('heading', { name: 'Dokončeno', exact: true })).toBeVisible();
+  await expect(sendQueue).toHaveCount(0);
+  expect(await own(`/tasks/${task.id}`)).toMatchObject({ status: 'DONE', quantity: 2 });
+  expect((await own(`/inventory/quants/${stock.id}`)).quantity).toBe(4);
+  const stored = await own(`/inventory/quants?skuReference=${code}&locationReference=${target.code}`);
+  expect(stored).toHaveLength(1);
+  expect(stored[0].quantity).toBe(2);
+});
+
 test('an open RF count advances without a connection and submits only after reconnecting', async ({ page }) => {
   test.skip(process.env.WMS_LIVE_UI_WRITE !== 'true', 'Requires a disposable warehouse database.');
   const warehouse = '/api/warehouses/MAIN';

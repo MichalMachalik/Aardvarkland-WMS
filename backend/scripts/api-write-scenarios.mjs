@@ -685,6 +685,107 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.ok(picking.tasks.every(task => task.workflow === 'PICK'));
   });
 
+  await scenario('RF putaway moves stock once and rolls back rejected offline confirmations', async () => {
+    const { sku } = await createSku('RF-PUTAWAY');
+    const target = await own('POST', '/locations', {
+      code: `RF-PA-${suffix}`, name: 'RF putaway target', type: 'STORAGE', parentReference: 'A-01',
+    });
+    const { quant: source } = await own('POST', '/inventory/quants/receive', {
+      skuReference: sku.code, locationReference: 'A-01-01', quantity: 8,
+    });
+    const work = (path, body, expected = 201) => asWorker('POST', warehouse + path, body, expected);
+    const startPutaway = async () => {
+      const { task } = await own('POST', '/putaway/tasks', {
+        stockQuantReference: source.id, toLocationReference: target.id, quantity: 3,
+      });
+      const started = await work(`/rf/tasks/${task.id}/start`, {});
+      const sessionPath = `/rf/sessions/${started.sessionId}`;
+      const scan = (body, expected) => work(sessionPath + '/scan', body, expected);
+      const item = await scan({ scannedValue: sku.code });
+      assert.equal(item.step.expected.type, 'LOCATION');
+      const origin = await scan({ scannedValue: 'A-01-01' });
+      assert.equal(origin.step.expected.value, target.code);
+      const wrong = await scan({ scannedValue: 'A-01-01' });
+      assert.equal(wrong.step.errorCode, 'SCAN_MISMATCH');
+      const amount = await scan({ scannedValue: target.code });
+      assert.equal(amount.step.expected.type, 'QUANTITY');
+      assert.equal(await prisma.stockMovement.count({ where: { taskId: task.id } }), 0);
+      return { task, started, sessionPath, scan, amount };
+    };
+
+    const online = await startPutaway();
+    for (const quantity of ['not-a-quantity', '0', '4']) {
+      await online.scan({ scannedValue: quantity }, 409);
+    }
+    assert.equal((await own('GET', online.sessionPath)).step.key, online.amount.step.key);
+    const completed = await online.scan({ scannedValue: '3' });
+    assert.equal(completed.status, 'COMPLETED');
+    assert.equal(completed.task.status, 'DONE');
+    await online.scan({ quantity: 3 }, 409);
+    const movementWhere = { taskId: online.task.id, type: 'PUTAWAY' };
+    const movements = await prisma.stockMovement.findMany({ where: movementWhere });
+    assert.equal(movements.length, 1);
+    assert.equal(movements[0].quantity, 3);
+    const targetId = movements[0].stockQuantId;
+    assert.equal((await own('GET', `/inventory/quants/${source.id}`)).quantity, 5);
+    assert.equal((await own('GET', `/inventory/quants/${targetId}`)).quantity, 3);
+
+    const offline = await startPutaway();
+    const queued = {
+      idempotencyKey: `RF-PA-FROZEN-${suffix}`,
+      sessionReference: offline.started.sessionId, taskReference: offline.task.id,
+      stepKey: offline.amount.step.key, quantity: 2,
+    };
+    const sync = scan => work('/rf/offline/sync', { scans: [scan] });
+    const freeze = await prisma.stockFreeze.create({
+      data: { warehouseId: offline.task.warehouseId, locationId: target.id, reason: 'RF putaway test freeze' },
+    });
+    try {
+      const rejected = await sync(queued);
+      assert.equal(rejected.items[0].status, 'FAILED');
+      assert.equal(rejected.items[0].errorCode, 'REPLAY_FAILED');
+      assert.match(rejected.items[0].errorMessage, /active stock freeze/);
+      assert.equal((await own('GET', offline.sessionPath)).step.key, offline.amount.step.key);
+      assert.equal((await own('GET', `/tasks/${offline.task.id}`)).status, 'IN_PROGRESS');
+      assert.equal((await own('GET', `/inventory/quants/${source.id}`)).quantity, 5);
+      assert.equal(await prisma.stockMovement.count({ where: { taskId: offline.task.id } }), 0);
+    } finally {
+      await prisma.stockFreeze.delete({ where: { id: freeze.id } });
+    }
+    const corrected = { ...queued, idempotencyKey: `RF-PA-READY-${suffix}` };
+    const results = await Promise.all([sync(corrected), sync(corrected)]);
+    assert.deepEqual(results.flatMap(result => result.items).map(item => item.status).sort(), ['DUPLICATE', 'SYNCED']);
+    assert.equal((await own('GET', offline.sessionPath)).status, 'COMPLETED');
+    assert.equal((await own('GET', `/tasks/${offline.task.id}`)).quantity, 2);
+    assert.equal((await own('GET', `/inventory/quants/${source.id}`)).quantity, 3);
+    assert.equal((await own('GET', `/inventory/quants/${targetId}`)).quantity, 5);
+    assert.equal(await prisma.stockMovement.count({ where: { taskId: offline.task.id, type: 'PUTAWAY' } }), 1);
+
+    const { task: protectedTask } = await own('POST', '/putaway/tasks', {
+      stockQuantReference: source.id, toLocationReference: target.id, quantity: 1,
+    });
+    const role = await prisma.role.create({ data: {
+      code: `RF-ONLY-${suffix}`, name: 'RF without stock permission',
+      permissions: { create: [{ permission: { connect: { code: 'rf.manage' } } }] },
+    } });
+    const email = `rf-only-${suffix.toLowerCase()}@example.invalid`;
+    const password = `Test-${randomUUID()}-42!`;
+    const restricted = await asAdmin('POST', '/api/users', {
+      email, password, displayName: 'Restricted RF operator', roleCode: 'WAREHOUSE_WORKER', warehouseCode: 'MAIN',
+    });
+    const membership = { userId: restricted.id, warehouseId: protectedTask.warehouseId };
+    await prisma.$transaction([
+      prisma.userRole.deleteMany({ where: membership }),
+      prisma.userRole.create({ data: { ...membership, roleId: role.id } }),
+    ]);
+    const asRestricted = bind((await login(email, password)).accessToken);
+    const profile = await asRestricted('GET', '/api/auth/me');
+    assert.deepEqual(profile.warehouses.find(item => item.warehouseCode === 'MAIN').permissionCodes, ['rf.manage']);
+    await asRestricted('POST', `${warehouse}/rf/tasks/${protectedTask.id}/start`, {}, 403);
+    await asRestricted('POST', `${warehouse}/rf/sessions`, { taskReference: protectedTask.id }, 403);
+    assert.equal((await own('GET', `/tasks/${protectedTask.id}`)).status, 'OPEN');
+  });
+
   await scenario('RF replay preserves mismatches and stores each offline scan once', async () => {
     const runtime = '/operations-runtime';
     const scanPath = `${runtime}/rf/scans`;

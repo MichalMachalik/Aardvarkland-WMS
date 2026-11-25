@@ -1,11 +1,12 @@
-import { BadRequestException, ConflictException, HttpException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException, HttpException, Injectable, NotFoundException } from '@nestjs/common';
 
 import { AuthenticatedUser } from '../access-control/types';
 import { calculateCountVariance, MAX_COUNT_QUANTITY } from '../cycle-counts/cycle-counts.helpers';
 import { CycleCountPlanStatus, CycleCountTaskStatus } from '../cycle-counts/cycle-counts.types';
 import { lockPostgresRowById, PrismaService, withTransactionRetry } from '../database';
-import { WarehouseTaskType } from '../generated/prisma/client';
+import { Prisma, WarehouseTaskType } from '../generated/prisma/client';
 import { assertNoBlockingStockFreeze, StockFreezeClient } from '../inventory/stock-freeze.helpers';
+import { PutawayService } from '../putaway/putaway.service';
 import { CancelRfSessionDto } from './dto/cancel-rf-session.dto';
 import { ReportRfExceptionDto } from './dto/report-rf-exception.dto';
 import { ScanRfStepDto } from './dto/scan-rf-step.dto';
@@ -44,7 +45,10 @@ const taskInclude = {
 export class RfWorkflowsService {
   private offlineSchemaReady?: Promise<void>;
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly putawayService: PutawayService,
+  ) {}
 
   async getQueue(
     warehouseReference: string,
@@ -217,6 +221,7 @@ export class RfWorkflowsService {
       ? await this.resolveScanner(warehouse.id, dto.scannerDeviceReference)
       : null;
     const task = dto.taskReference ? await this.resolveTask(warehouse.id, dto.taskReference) : null;
+    if (task?.type === 'PUTAWAY') assertRfPutawayPermission(actor, warehouse.id);
     const workflow = dto.workflow ?? (task ? workflowFromTaskType(task.type) : RfWorkflowType.MOVE);
 
     const session = await this.client.scannerSession.create({
@@ -280,6 +285,7 @@ export class RfWorkflowsService {
       const task = await this.resolveTaskWithClient(tx, warehouse.id, taskReference);
       await lockPostgresRowById(tx, 'warehouse_tasks', task.id);
       const lockedTask = await this.resolveTaskWithClient(tx, warehouse.id, task.id);
+      if (lockedTask.type === 'PUTAWAY') assertRfPutawayPermission(actor, warehouse.id);
 
       if (!['OPEN', 'ASSIGNED', 'BLOCKED'].includes(lockedTask.status)) {
         throw new ConflictException('Task cannot be started from the current status');
@@ -472,7 +478,8 @@ export class RfWorkflowsService {
         },
       },
     });
-    return this.toInstruction(updatedSession, task, null);
+    const completedTask = task ? await this.resolveTaskWithClient(tx, warehouseId, task.id) : null;
+    return this.toInstruction(updatedSession, completedTask, null);
   }
 
   async reportTaskException(
@@ -616,6 +623,19 @@ export class RfWorkflowsService {
       return;
     }
 
+    if (task.type === 'PUTAWAY') {
+      assertRfPutawayPermission(actor, warehouseId);
+      const quantity = resolveRfQuantity(dto);
+      if (quantity === null || quantity <= 0 || (task.quantity !== null && quantity > task.quantity)) {
+        throw new ConflictException('RF putaway requires a positive quantity within the planned amount');
+      }
+      await this.putawayService.confirmTaskInTransaction(tx as unknown as Prisma.TransactionClient, warehouseId, task.id, {
+        quantity,
+        metadata: { ...dto.metadata, source: 'rf' },
+      }, actor);
+      return;
+    }
+
     if (task.type === 'COUNT') {
       const submitted = await this.submitCycleCountFromRf(tx, warehouseId, task, dto, actor);
 
@@ -669,7 +689,7 @@ export class RfWorkflowsService {
       throw new ConflictException('Cycle count task cannot be submitted from current status');
     }
 
-    const countedQuantity = resolveRfCountedQuantity(dto);
+    const countedQuantity = resolveRfQuantity(dto);
 
     if (countedQuantity === null) {
       throw new ConflictException('RF cycle count requires a counted quantity');
@@ -1447,7 +1467,14 @@ function normalizeNullableString(value: string | null | undefined): string | nul
   return normalized.length === 0 ? null : normalized;
 }
 
-function resolveRfCountedQuantity(dto: ScanRfStepDto): number | null {
+function assertRfPutawayPermission(actor: AuthenticatedUser, warehouseId: string): void {
+  const permissions = actor.warehouses.find(access => access.warehouseId === warehouseId)?.permissionCodes ?? [];
+  if (!permissions.includes('*') && !(permissions.includes('inventory.move') && permissions.includes('task.manage'))) {
+    throw new ForbiddenException('RF putaway requires inventory movement and task permissions');
+  }
+}
+
+function resolveRfQuantity(dto: ScanRfStepDto): number | null {
   const scannedValue = dto.scannedValue?.trim() ?? '';
   const quantity = dto.quantity ?? (/^\d+$/.test(scannedValue) ? Number(scannedValue) : NaN);
   return Number.isInteger(quantity) && quantity >= 0 && quantity <= MAX_COUNT_QUANTITY ? quantity : null;

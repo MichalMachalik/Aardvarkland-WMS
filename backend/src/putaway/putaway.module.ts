@@ -8,5 +8,6 @@ import { PutawayService } from './putaway.service';
   imports: [DatabaseModule],
   controllers: [PutawayController],
   providers: [PutawayService],
+  exports: [PutawayService],
 })
 export class PutawayModule {}

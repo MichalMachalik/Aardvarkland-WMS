@@ -5,6 +5,7 @@ import { ConflictException } from '@nestjs/common';
 
 import { AuthenticatedUser } from '../src/access-control/types';
 import { PrismaService } from '../src/database';
+import { PutawayService } from '../src/putaway/putaway.service';
 import { RfWorkflowsService } from '../src/rf-workflows/rf-workflows.service';
 
 const sessionId = '10000000-0000-4000-8000-000000000001';
@@ -213,10 +214,8 @@ function createRfCycleCountService(taskQuantity: number | null = 10): {
     },
   };
 
-  return {
-    calls,
-    service: new RfWorkflowsService(prisma as unknown as PrismaService),
-  };
+  const prismaService = prisma as unknown as PrismaService;
+  return { calls, service: new RfWorkflowsService(prismaService, new PutawayService(prismaService)) };
 }
 
 function actor(): AuthenticatedUser {

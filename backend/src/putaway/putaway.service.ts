@@ -1,5 +1,6 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { ConflictException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 
+import { hasClientAccess, shouldEnforceClientAccess } from '../access-control/client-access.helpers';
 import { AuthenticatedUser } from '../access-control/types';
 import { lockPostgresAdvisoryTransaction, lockPostgresRowById, PrismaService, withTransactionRetry } from '../database';
 import {
@@ -164,155 +165,167 @@ export class PutawayService {
     actor: AuthenticatedUser,
   ): Promise<PutawayConfirmResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
+    return withTransactionRetry(() => this.prisma.$transaction((tx) =>
+      this.confirmTaskInTransaction(tx, warehouse.id, taskReference, dto, actor),
+    ));
+  }
+
+  async confirmTaskInTransaction(
+    tx: PutawayTransactionClient,
+    warehouseId: string,
+    taskReference: string,
+    dto: ConfirmPutawayTaskDto,
+    actor: AuthenticatedUser,
+  ): Promise<PutawayConfirmResponse> {
     const idempotencyKey = normalizeOptionalString(dto.idempotencyKey);
     const requestFingerprint = stockRequestFingerprint({ actorId: actor.id, dto: { ...dto, idempotencyKey } });
 
-    return withTransactionRetry(() => this.prisma.$transaction(async (tx) => {
-      const candidate = await this.resolveTaskInClient(tx, warehouse.id, taskReference);
-      await lockPostgresRowById(tx, 'warehouse_tasks', candidate.id);
-      const task = await this.resolveTaskInClient(tx, warehouse.id, candidate.id);
+    const candidate = await this.resolveTaskInClient(tx, warehouseId, taskReference);
+    await lockPostgresRowById(tx, 'warehouse_tasks', candidate.id);
+    const task = await this.resolveTaskInClient(tx, warehouseId, candidate.id);
 
-      if (task.type !== WarehouseTaskType.PUTAWAY) {
-        throw new ConflictException('Only PUTAWAY tasks can be confirmed through putaway flow');
-      }
+    if (task.type !== WarehouseTaskType.PUTAWAY) {
+      throw new ConflictException('Only PUTAWAY tasks can be confirmed through putaway flow');
+    }
 
-      if (idempotencyKey) {
-        await lockPostgresAdvisoryTransaction(tx, 'idempotency_key', `putaway:${idempotencyKey}`);
-        const replay = await this.findIdempotentConfirmation(tx, task, idempotencyKey, requestFingerprint);
-        if (replay) return replay;
-      }
+    if (idempotencyKey) {
+      await lockPostgresAdvisoryTransaction(tx, 'idempotency_key', `putaway:${idempotencyKey}`);
+      const replay = await this.findIdempotentConfirmation(tx, task, idempotencyKey, requestFingerprint, actor);
+      if (replay) return replay;
+    }
 
-      if (
-        task.status !== WarehouseTaskStatus.OPEN &&
-        task.status !== WarehouseTaskStatus.ASSIGNED &&
-        task.status !== WarehouseTaskStatus.IN_PROGRESS
-      ) {
-        throw new ConflictException(`Cannot confirm PUTAWAY task in ${task.status} status`);
-      }
+    if (
+      task.status !== WarehouseTaskStatus.OPEN &&
+      task.status !== WarehouseTaskStatus.ASSIGNED &&
+      task.status !== WarehouseTaskStatus.IN_PROGRESS
+    ) {
+      throw new ConflictException(`Cannot confirm PUTAWAY task in ${task.status} status`);
+    }
 
-      const candidateQuant = await this.resolveConfirmationSourceQuant(tx, warehouse.id, task, dto);
-      await lockPostgresRowById(tx, 'stock_quants', candidateQuant.id);
-      const sourceQuant = await this.resolveQuantInClient(tx, warehouse.id, candidateQuant.id);
-      const sourceLocationId = dto.fromLocationReference
-        ? (await this.resolveLocationInClient(tx, warehouse.id, dto.fromLocationReference)).id
-        : task.fromLocationId;
+    const candidateQuant = await this.resolveConfirmationSourceQuant(tx, warehouseId, task, dto);
+    await lockPostgresRowById(tx, 'stock_quants', candidateQuant.id);
+    const sourceQuant = await this.resolveQuantInClient(tx, warehouseId, candidateQuant.id);
+    assertPutawayStockAccess(actor, sourceQuant);
+    const sourceLocationId = dto.fromLocationReference
+      ? (await this.resolveLocationInClient(tx, warehouseId, dto.fromLocationReference)).id
+      : task.fromLocationId;
 
-      if ((sourceLocationId && sourceLocationId !== sourceQuant.locationId) ||
-          (task.fromLocationId && task.fromLocationId !== sourceQuant.locationId)) {
-        throw new ConflictException('Scanned source location does not match source stock quant');
-      }
-      if ((task.skuId && task.skuId !== sourceQuant.skuId) ||
-          (task.handlingUnitId && task.handlingUnitId !== sourceQuant.handlingUnitId)) {
-        throw new ConflictException('Source stock quant does not match the putaway task');
-      }
+    if ((sourceLocationId && sourceLocationId !== sourceQuant.locationId) ||
+        (task.fromLocationId && task.fromLocationId !== sourceQuant.locationId)) {
+      throw new ConflictException('Scanned source location does not match source stock quant');
+    }
+    if ((task.skuId && task.skuId !== sourceQuant.skuId) ||
+        (task.ownerClientId && task.ownerClientId !== sourceQuant.ownerClientId) ||
+        (task.handlingUnitId && task.handlingUnitId !== sourceQuant.handlingUnitId)) {
+      throw new ConflictException('Source stock quant does not match the putaway task');
+    }
 
-      const targetLocation = dto.toLocationReference
-        ? await this.resolveLocationInClient(tx, warehouse.id, dto.toLocationReference)
-        : task.toLocation;
+    const targetLocation = dto.toLocationReference
+      ? await this.resolveLocationInClient(tx, warehouseId, dto.toLocationReference)
+      : task.toLocation;
 
-      if (!targetLocation) {
-        throw new ConflictException('Putaway task is missing a target location');
-      }
+    if (!targetLocation) {
+      throw new ConflictException('Putaway task is missing a target location');
+    }
 
-      if (targetLocation.id === sourceQuant.locationId) {
-        throw new ConflictException(
-          'Putaway target location must be different from source location',
-        );
-      }
-
-      const quantity = dto.quantity ?? task.quantity ?? quantAvailableQuantity(sourceQuant);
-      this.assertPutawayQuantity(sourceQuant, quantity);
-
-      await assertNoBlockingStockFreeze(tx, {
-        warehouseId: warehouse.id,
-        stockQuantId: sourceQuant.id,
-        locationId: sourceQuant.locationId,
-        skuId: sourceQuant.skuId,
-        operation: 'putaway from source',
-      });
-      await assertNoBlockingStockFreeze(tx, {
-        warehouseId: warehouse.id,
-        locationId: targetLocation.id,
-        skuId: sourceQuant.skuId,
-        operation: 'putaway into destination',
-      });
-
-      const updatedSourceQuant = await tx.stockQuant.update({
-        where: { id: sourceQuant.id },
-        data: { quantity: { decrement: quantity } },
-        include: { location: true, sku: true },
-      });
-      const targetQuant = await this.incrementOrCreateTargetQuant(
-        tx,
-        sourceQuant,
-        targetLocation,
-        quantity,
+    if (targetLocation.id === sourceQuant.locationId) {
+      throw new ConflictException(
+        'Putaway target location must be different from source location',
       );
-      const movement = await tx.stockMovement.create({
-        data: {
-          warehouseId: warehouse.id,
-          ownerClientId: sourceQuant.ownerClientId,
-          skuId: sourceQuant.skuId,
-          stockQuantId: targetQuant.id,
-          taskId: task.id,
-          actorUserId: actor.id,
-          type: StockMovementType.PUTAWAY,
-          quantity,
-          fromLocationId: sourceQuant.locationId,
-          toLocationId: targetLocation.id,
-          referenceType: 'PUTAWAY_TASK',
-          referenceId: task.id,
-          sourceSystem: idempotencyKey ? 'WMS' : null,
-          idempotencyKey,
-          metadata: toJsonInput({
-            ...(dto.metadata ?? {}),
-            sourceStockQuantId: sourceQuant.id,
-            targetStockQuantId: targetQuant.id,
-            quantityDelta: 0,
-            requestFingerprint,
-          }),
-        },
-      });
-      const updatedTask = await tx.warehouseTask.update({
-        where: { id: task.id },
-        data: {
-          status: WarehouseTaskStatus.DONE,
-          startedAt: task.startedAt ?? new Date(),
-          completedAt: new Date(),
-          fromLocationId: sourceQuant.locationId,
-          toLocationId: targetLocation.id,
-          quantity,
-          version: { increment: 1 },
-          metadata: toJsonInput(
-            mergeMetadata(task.metadata, {
-              putawayConfirmedAt: new Date().toISOString(),
-              sourceStockQuantId: sourceQuant.id,
-              targetStockQuantId: targetQuant.id,
-              targetLocationId: targetLocation.id,
-              idempotencyKey,
-              confirmationMetadata: dto.metadata ?? null,
-            }),
-          ),
-        },
-        include: taskInclude,
-      });
+    }
 
-      await this.writeAuditInClient(
-        tx,
-        actor,
-        warehouse.id,
-        'putaway.task_confirmed',
-        updatedTask,
-        {
+    const quantity = dto.quantity ?? task.quantity ?? quantAvailableQuantity(sourceQuant);
+    this.assertPutawayQuantity(sourceQuant, quantity);
+
+    await assertNoBlockingStockFreeze(tx, {
+      warehouseId,
+      stockQuantId: sourceQuant.id,
+      locationId: sourceQuant.locationId,
+      skuId: sourceQuant.skuId,
+      operation: 'putaway from source',
+    });
+    await assertNoBlockingStockFreeze(tx, {
+      warehouseId,
+      locationId: targetLocation.id,
+      skuId: sourceQuant.skuId,
+      operation: 'putaway into destination',
+    });
+
+    const updatedSourceQuant = await tx.stockQuant.update({
+      where: { id: sourceQuant.id },
+      data: { quantity: { decrement: quantity }, version: { increment: 1 } },
+      include: { location: true, sku: true },
+    });
+    const targetQuant = await this.incrementOrCreateTargetQuant(
+      tx,
+      sourceQuant,
+      targetLocation,
+      quantity,
+    );
+    const movement = await tx.stockMovement.create({
+      data: {
+        warehouseId,
+        ownerClientId: sourceQuant.ownerClientId,
+        skuId: sourceQuant.skuId,
+        stockQuantId: targetQuant.id,
+        taskId: task.id,
+        actorUserId: actor.id,
+        type: StockMovementType.PUTAWAY,
+        quantity,
+        fromLocationId: sourceQuant.locationId,
+        toLocationId: targetLocation.id,
+        referenceType: 'PUTAWAY_TASK',
+        referenceId: task.id,
+        sourceSystem: idempotencyKey ? 'WMS' : null,
+        idempotencyKey,
+        metadata: toJsonInput({
+          ...(dto.metadata ?? {}),
           sourceStockQuantId: sourceQuant.id,
           targetStockQuantId: targetQuant.id,
-          movementId: movement.id,
-          quantity,
-        },
-      );
+          quantityDelta: 0,
+          requestFingerprint,
+        }),
+      },
+    });
+    const updatedTask = await tx.warehouseTask.update({
+      where: { id: task.id },
+      data: {
+        status: WarehouseTaskStatus.DONE,
+        startedAt: task.startedAt ?? new Date(),
+        completedAt: new Date(),
+        fromLocationId: sourceQuant.locationId,
+        toLocationId: targetLocation.id,
+        quantity,
+        version: { increment: 1 },
+        metadata: toJsonInput(
+          mergeMetadata(task.metadata, {
+            putawayConfirmedAt: new Date().toISOString(),
+            sourceStockQuantId: sourceQuant.id,
+            targetStockQuantId: targetQuant.id,
+            targetLocationId: targetLocation.id,
+            idempotencyKey,
+            confirmationMetadata: dto.metadata ?? null,
+          }),
+        ),
+      },
+      include: taskInclude,
+    });
 
-      return toConfirmResponse(updatedTask, updatedSourceQuant, targetQuant, movement);
-    }));
+    await this.writeAuditInClient(
+      tx,
+      actor,
+      warehouseId,
+      'putaway.task_confirmed',
+      updatedTask,
+      {
+        sourceStockQuantId: sourceQuant.id,
+        targetStockQuantId: targetQuant.id,
+        movementId: movement.id,
+        quantity,
+      },
+    );
+
+    return toConfirmResponse(updatedTask, updatedSourceQuant, targetQuant, movement);
   }
 
   private async findIdempotentConfirmation(
@@ -320,6 +333,7 @@ export class PutawayService {
     task: WarehouseTaskWithRelations,
     idempotencyKey: string,
     requestFingerprint: string,
+    actor: AuthenticatedUser,
   ): Promise<PutawayConfirmResponse | null> {
     const movement = await tx.stockMovement.findFirst({
       where: {
@@ -350,6 +364,7 @@ export class PutawayService {
     const sourceQuant = sourceStockQuantId
       ? await this.resolveQuantInClient(tx, task.warehouseId, sourceStockQuantId)
       : targetQuant;
+    assertPutawayStockAccess(actor, sourceQuant);
 
     return toConfirmResponse(task, sourceQuant, targetQuant, movement);
   }
@@ -637,7 +652,7 @@ export class PutawayService {
     if (existing) {
       return client.stockQuant.update({
         where: { id: existing.id },
-        data: { quantity: { increment: quantity } },
+        data: { quantity: { increment: quantity }, version: { increment: 1 } },
         include: { location: true, sku: true },
       });
     }
@@ -714,6 +729,16 @@ export class PutawayService {
         },
       },
     });
+  }
+}
+
+function assertPutawayStockAccess(actor: AuthenticatedUser, stock: StockQuant): void {
+  if (shouldEnforceClientAccess(actor) && (!stock.ownerClientId || !hasClientAccess({
+    user: actor,
+    clientReference: stock.ownerClientId,
+    warehouseReference: stock.warehouseId,
+  }))) {
+    throw new ForbiddenException('Putaway stock is outside the active client scope');
   }
 }
 

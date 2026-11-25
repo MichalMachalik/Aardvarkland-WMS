@@ -417,9 +417,14 @@ function RfWorkspace() {
   const expectedQuantity = parseScanQuantity(current.expectedCode);
   const enteredQuantity = parseScanQuantity(scanValue);
   const quantityCandidate = enteredQuantity ?? expectedQuantity;
+  const putawayQuantity = selectedTask?.workflow === 'PUTAWAY';
+  const minimumQuantity = putawayQuantity ? 1 : 0;
+  const maximumQuantity = (putawayQuantity ? selectedTask.quantity : null) ?? 2_147_483_647;
+  const validQuantity = enteredQuantity !== undefined
+    && enteredQuantity >= minimumQuantity && enteredQuantity <= maximumQuantity;
   const scannerReady = Boolean(selectedTask && scannerDeviceReference.trim())
     && !sessionCompleted && !waitingForUpload && (!offline || Boolean(offlineStep));
-  const canConfirmScan = scannerReady && Boolean(scanValue.trim()) && (!isQuantityStep || enteredQuantity !== undefined);
+  const canConfirmScan = scannerReady && Boolean(scanValue.trim()) && (!isQuantityStep || validQuantity);
   const showTestAssist = import.meta.env.DEV || config.enableMocks;
   const activeScanner = scannerResource.data.find((scanner) => scanner.code === scannerDeviceReference);
   const registeredScannerReference = !activeScanner && scannerDeviceReference === defaultScannerReference(warehouseId)
@@ -495,7 +500,7 @@ function RfWorkspace() {
     }
   };
   const adjustQuantityScan = (delta: number) => {
-    setScanValue(String(Math.min(2_147_483_647, Math.max(0, (quantityCandidate ?? 0) + delta))));
+    setScanValue(String(Math.min(maximumQuantity, Math.max(minimumQuantity, (quantityCandidate ?? 0) + delta))));
   };
   const startSession = async () => {
     if (!online || !selectedTask || sessionCompleted) return undefined;
@@ -707,9 +712,9 @@ function RfWorkspace() {
             </div>}
             {isQuantityStep && (
               <div className="rf-quantity-controls" aria-label={text.quantityControls}>
-                <Button size="lg" type="button" onClick={() => adjustQuantityScan(-1)} disabled={!selectedTask || !quantityCandidate}>-1</Button>
+                <Button size="lg" type="button" onClick={() => adjustQuantityScan(-1)} disabled={!selectedTask || (quantityCandidate ?? 0) <= minimumQuantity}>-1</Button>
                 <div className="rf-quantity-controls__value"><span>{text.quantityNow}</span><strong>{enteredQuantity ?? '—'}</strong></div>
-                <Button size="lg" type="button" onClick={() => adjustQuantityScan(1)} disabled={!selectedTask || quantityCandidate === 2_147_483_647}>+1</Button>
+                <Button size="lg" type="button" onClick={() => adjustQuantityScan(1)} disabled={!selectedTask || (quantityCandidate ?? 0) >= maximumQuantity}>+1</Button>
                 {expectedQuantity !== undefined && <Button size="lg" type="button" onClick={() => setScanValue(String(expectedQuantity))} disabled={!selectedTask}>{text.useExpected}</Button>}
               </div>
             )}
