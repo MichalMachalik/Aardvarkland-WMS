@@ -33,9 +33,10 @@ export interface StockQuant {
 
 export interface Order {
   id: string;
+  orderNumber: string;
   channel: string;
   priority: 'Low' | 'Normal' | 'High' | 'Rush';
-  status: 'New' | 'Allocated' | 'Picking' | 'Packed' | 'Shipped';
+  status: 'Draft' | 'New' | 'Allocated' | 'Picking' | 'Picked' | 'Packing' | 'Packed' | 'Shipped' | 'Cancelled' | 'Exception' | 'Unknown';
   lines: number;
   wave: string;
   cutoff: string;

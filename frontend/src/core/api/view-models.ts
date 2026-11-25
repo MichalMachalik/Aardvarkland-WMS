@@ -74,12 +74,11 @@ function statusQuant(value: unknown): StockQuant['status'] {
 }
 
 function statusOrder(value: unknown): Order['status'] {
-  const status = stringValue(value, '').toUpperCase();
-  if (status.includes('SHIP')) return 'Shipped';
-  if (status.includes('PACK')) return status.includes('PACKED') ? 'Packed' : 'Packed';
-  if (status.includes('PICK')) return 'Picking';
-  if (status.includes('ALLOC')) return 'Allocated';
-  return 'New';
+  const labels: Record<string, Order['status']> = {
+    DRAFT: 'Draft', CREATED: 'New', ALLOCATED: 'Allocated', PICKING: 'Picking', PICKED: 'Picked',
+    PACKING: 'Packing', PACKED: 'Packed', SHIPPED: 'Shipped', CANCELLED: 'Cancelled', EXCEPTION: 'Exception',
+  };
+  return labels[stringValue(value, '').toUpperCase()] ?? 'Unknown';
 }
 
 function statusTask(value: unknown): WarehouseTask['status'] {
@@ -174,7 +173,8 @@ export function mapOutboundOrders(payload: unknown): Order[] {
     const lines = array(row.lines);
     const metadata = record(row.metadata);
     return {
-      id: stringValue(row.orderNumber ?? row.id, `SO-${index + 1}`),
+      id: stringValue(row.id, ''),
+      orderNumber: stringValue(row.orderNumber ?? row.id, `SO-${index + 1}`),
       channel: stringValue(metadata.channel ?? row.customerReference, '—'),
       priority: stringValue(metadata.priority, 'Normal') as Order['priority'],
       status: statusOrder(row.status),
@@ -182,7 +182,7 @@ export function mapOutboundOrders(payload: unknown): Order[] {
       wave: stringValue(metadata.waveId ?? metadata.wave, '—'),
       cutoff: timeLabel(row.shipBy, '—'),
     };
-  });
+  }).filter(order => order.id);
 }
 
 export function mapWarehouseTasks(payload: unknown): WarehouseTask[] {

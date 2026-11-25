@@ -205,6 +205,72 @@ test('manager inventory includes manual correction and wave details are keyboard
   await expect(trigger).toBeFocused();
 });
 
+test('outbound actions stay on a visible order and a new allocation can reserve added stock', async ({ page }) => {
+  test.skip(process.env.WMS_LIVE_UI_WRITE !== 'true', 'Requires a disposable warehouse database.');
+  const { accessToken: admin } = await liveApi(page, '/api/auth/login', {
+    data: { email: roles.system.email, password: roles.system.password },
+  });
+  const run = randomUUID().slice(0, 8).toUpperCase();
+  const sku = `OUT-${run}`;
+  const warehouse = '/api/warehouses/MAIN';
+  const own = (path, data) => liveApi(page, warehouse + path, { token: admin, data });
+  const product = await liveApi(page, '/api/products', { token: admin, data: { code: sku, name: 'Outbound test product' } });
+  await liveApi(page, '/api/products/skus', { token: admin, data: { productReference: product.id, code: sku, name: 'Outbound test SKU' } });
+  const receive = quantity => own('/inventory/quants/receive', { skuReference: sku, locationReference: 'A-01-01', quantity });
+  await receive(2);
+  const shipped = await own('/outbound-orders', { orderNumber: `OUT-SHIPPED-${run}`, status: 'SHIPPED' });
+  const order = await own('/outbound-orders', {
+    orderNumber: sku, lines: [{ lineNumber: '10', sku, orderedQuantity: 2 }],
+  });
+
+  await login(page, roles.manager);
+  await desktopNav(page).getByRole('button', { name: 'Objednávky', exact: true }).click();
+  const allocate = page.getByRole('button', { name: 'Alokovat vybranou' });
+  const release = page.getByRole('button', { name: 'Uvolnit picking' });
+  const currentOrder = page.getByRole('radio', { name: order.orderNumber, exact: true });
+  await expect(currentOrder).toBeVisible();
+  await expect(allocate).toBeDisabled();
+  await currentOrder.check();
+  await expect(allocate).toBeEnabled();
+  await expect(release).toBeDisabled();
+
+  await page.getByRole('button', { name: 'Odeslané', exact: true }).click();
+  await expect(currentOrder).toHaveCount(0);
+  await expect(allocate).toBeDisabled();
+  await page.getByRole('radio', { name: shipped.orderNumber }).check();
+  await expect(allocate).toBeDisabled();
+  await expect(release).toBeDisabled();
+  await page.getByRole('button', { name: 'Aktivní', exact: true }).click();
+  await currentOrder.check();
+
+  const allocationPath = `${warehouse}/outbound-orders/${order.id}/allocate`;
+  async function allocateOnce() {
+    const response = page.waitForResponse(item => new URL(item.url()).pathname === allocationPath && item.request().method() === 'POST');
+    await allocate.click();
+    const result = await response;
+    expect(result.ok()).toBe(true);
+    const body = await result.json();
+    return { key: result.request().headers()['idempotency-key'], lines: (body.data ?? body).lines };
+  }
+  const first = await allocateOnce();
+  expect(first.lines[0].allocatedQuantity).toBe(2);
+  await expect(release).toBeEnabled();
+  const changed = await page.request.patch(new URL(`${warehouse}/outbound-orders/${order.id}`, base).href, {
+    headers: { Authorization: `Bearer ${admin}`, 'Idempotency-Key': randomUUID() },
+    data: { lines: [{ lineReference: '10', orderedQuantity: 5 }] },
+  });
+  expect(changed.ok()).toBe(true);
+  await receive(3);
+  const second = await allocateOnce();
+  expect(second.key).not.toBe(first.key);
+  expect(second.lines[0]).toMatchObject({ allocatedQuantity: 3, remainingQuantity: 0 });
+  await release.click();
+  await expect(page.getByRole('row').filter({ has: currentOrder })).toContainText('Vychystává se');
+  await expect(allocate).toBeDisabled();
+  await expect(release).toBeDisabled();
+  expect((await own(`/outbound-orders/${shipped.id}`)).status).toBe('SHIPPED');
+});
+
 test('worker deep links to restricted pages return to the scanner', async ({ page }) => {
   await login(page, roles.worker);
   await page.evaluate(() => { location.hash = '#/settings'; });

@@ -528,7 +528,7 @@ export const generatedTranslations = {
   "permission is missing": { fr: "l'autorisation manque", de: "Erlaubnis fehlt", es: "falta el permiso" },
   "Phone": { fr: "Téléphone", de: "Telefon", es: "Teléfono" },
   "Pick": { fr: "Choisir", de: "Auswahl", es: "Seleccionar" },
-  "Picked": { fr: "Sélectionné", de: "Ausgewählt", es: "Elegido" },
+  "Picked": { fr: "Préparé", de: "Kommissioniert", es: "Preparado" },
   "Picking": { fr: "Prélèvement", de: "Kommissionierung", es: "Recogiendo" },
   "picking · replenishment": { fr: "prélèvement · réapprovisionnement", de: "Kommissionierung · Nachschub", es: "selección · reabastecimiento" },
   "Pilsen cross-dock": { fr: "Cross-dock de Pilsen", de: "Crossdock Pilsen", es: "Muelle cruzado de Pilsen" },

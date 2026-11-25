@@ -17,6 +17,7 @@ import { mapOutboundOrders } from '../../core/api/view-models';
 import type { Order } from '../../core/types/wms';
 
 const emptyOrders: Order[] = [];
+const allocationStatuses = new Set<Order['status']>(['Draft', 'New', 'Allocated', 'Exception']);
 
 function priorityLabel(priority: Order['priority'], language: Language): string {
   if (language === 'fr' || language === 'de' || language === 'es') {
@@ -40,22 +41,35 @@ function priorityLabel(priority: Order['priority'], language: Language): string 
 }
 
 export function OutboundPage() {
-  const { warehouseId, language } = useWorkspace();
+  const { warehouseId } = useWorkspace();
+  return <OutboundWorkspace key={warehouseId} />;
+}
+
+function OutboundWorkspace() {
+  const { warehouseId, language, can } = useWorkspace();
   const text = pickLanguage(language, { cs: czech, en: english, ua: ukrainian });
   const resource = useApiResource({ fallback: emptyOrders, productionFallback: emptyOrders, loader: () => listOutboundOrders<unknown[]>(warehouseId), map: mapOutboundOrders, dependencies: [warehouseId] });
   const mutation = useApiMutation();
   const sourceRows = resource.data;
   const [filter, setFilter] = useState('active');
-  const [selectedId, setSelectedId] = useState(sourceRows[0]?.id ?? '');
-  const selected = sourceRows.find((order) => order.id === selectedId) ?? sourceRows[0];
+  const [selectedId, setSelectedId] = useState('');
+  const [refreshingFrom, setRefreshingFrom] = useState<Order[]>();
   const rows = useMemo(() => {
     if (filter === 'all') return sourceRows;
     if (filter === 'shipped') return sourceRows.filter((order) => order.status === 'Shipped');
-    return sourceRows.filter((order) => order.status !== 'Shipped');
+    return sourceRows.filter((order) => !['Shipped', 'Cancelled'].includes(order.status));
   }, [filter, sourceRows]);
+  const selected = rows.find(order => order.id === selectedId);
+  const mayAllocate = can('outbound.manage');
+  const mayRelease = mayAllocate || can('fulfillment.manage');
+  const ready = resource.status === 'live' && mutation.status !== 'running' && refreshingFrom !== sourceRows;
+  const canAllocate = ready && selected && mayAllocate && allocationStatuses.has(selected.status);
+  const canRelease = ready && selected?.status === 'Allocated' && mayRelease;
   const columns: Column<Order>[] = [
-    { key: 'select', label: '', render: (row) => <input type="radio" name="order" data-e2e-row="order" data-e2e-value={row.id} checked={selected?.id === row.id} onChange={() => setSelectedId(row.id)} /> },
-    { key: 'id', label: text.columns.order, render: (row) => <strong>{row.id}</strong> },
+    { key: 'select', label: '', render: (row) => <input type="radio" name="order" aria-label={row.orderNumber}
+      data-e2e-row="order" data-e2e-value={row.orderNumber} checked={selected?.id === row.id}
+      disabled={mutation.status === 'running'} onChange={() => { setSelectedId(row.id); mutation.reset(); }} /> },
+    { key: 'id', label: text.columns.order, render: (row) => <strong>{row.orderNumber}</strong> },
     { key: 'channel', label: text.columns.channel, render: (row) => row.channel || '-' },
     { key: 'priority', label: text.columns.priority, render: (row) => <Badge tone={row.priority === 'Rush' ? 'critical' : row.priority === 'High' ? 'warning' : 'neutral'}>{priorityLabel(row.priority, language)}</Badge> },
     { key: 'status', label: text.columns.status, render: (row) => <StatusPill value={row.status} /> },
@@ -63,37 +77,48 @@ export function OutboundPage() {
     { key: 'wave', label: text.columns.wave, render: (row) => row.wave || '-' },
     { key: 'cutoff', label: text.columns.deadline, render: (row) => row.cutoff || '-' },
   ];
-  const allocated = sourceRows.filter((order) => ['Allocated', 'Picking', 'Packed'].includes(order.status)).length;
+  const allocated = sourceRows.filter((order) => ['Allocated', 'Picking', 'Picked', 'Packing', 'Packed'].includes(order.status)).length;
   const progress = sourceRows.length ? Math.round((sourceRows.filter((order) => order.status === 'Shipped').length / sourceRows.length) * 100) : 0;
-  const allocate = () => {
-    if (!selected) return;
-    void mutation.run(text.allocateAction, () => allocateOutboundOrder(warehouseId, selected.id, { allocationStrategy: 'FEFO', metadata: { source: 'storage-ui' } })).then((result) => { if (result) resource.refresh(); });
-  };
-  const release = () => {
-    if (!selected) return;
-    void mutation.run(text.releaseAction, () => releasePicking(warehouseId, selected.id, { metadata: { source: 'storage-ui' } })).then((result) => { if (result) resource.refresh(); });
-  };
+  function refreshAfterWrite() {
+    setRefreshingFrom(sourceRows);
+    resource.refresh();
+  }
+
+  async function allocate() {
+    if (!selected || !canAllocate) return;
+    const result = await mutation.run(text.allocateAction, () => allocateOutboundOrder(warehouseId, selected.id, {
+      allocationStrategy: 'FEFO', metadata: { source: 'storage-ui' },
+    }));
+    if (result) refreshAfterWrite();
+  }
+
+  async function release() {
+    if (!selected || !canRelease) return;
+    await mutation.run(text.releaseAction, () => releasePicking(warehouseId, selected.id, {
+      metadata: { source: 'storage-ui' },
+    }));
+    refreshAfterWrite();
+  }
 
   return (
     <div className="page-grid">
       <div className="span-12"><DataSourceBanner label={text.banner} resource={resource} /></div>
       <Card
         title={text.tableTitle}
-        eyebrow={text.tableEyebrow}
         className="span-8"
         action={<SegmentedControl value={filter} onChange={setFilter} options={[{ value: 'active', label: text.filters.active }, { value: 'all', label: text.filters.all }, { value: 'shipped', label: text.filters.shipped }]} />}
       >
         <DataTable rows={rows} columns={columns} getRowKey={(row) => row.id} emptyTitle={text.emptyTitle} emptyText={text.emptyText} />
       </Card>
-      <Card title={text.allocationTitle} eyebrow={text.allocationEyebrow} className="span-4">
+      <Card title={text.allocationTitle} className="span-4">
         <div className="metric-stack">
-          <article><span>{text.selectedOrder}</span><strong>{selected?.id ?? '-'}</strong></article>
+          <article><span>{text.selectedOrder}</span><strong>{selected?.orderNumber ?? '—'}</strong></article>
           <article><span>{text.allocated}</span><strong>{allocated}</strong></article>
           <article><span>{text.shippingProgress}</span><strong>{progress}%</strong><ProgressBar value={progress} /></article>
         </div>
         <div className="action-panel">
-          <Button tone="primary" data-e2e-action="outbound-allocate-selected" disabled={!selected || mutation.status === 'running'} onClick={allocate}>{text.allocateButton}</Button>
-          <Button tone="secondary" data-e2e-action="outbound-release-picking" disabled={!selected || mutation.status === 'running'} onClick={release}>{text.releaseButton}</Button>
+          {mayAllocate && <Button tone="primary" data-e2e-action="outbound-allocate-selected" disabled={!canAllocate} onClick={() => { void allocate(); }}>{text.allocateButton}</Button>}
+          {mayRelease && <Button tone="secondary" data-e2e-action="outbound-release-picking" disabled={!canRelease} onClick={() => { void release(); }}>{text.releaseButton}</Button>}
           <Button tone="secondary" data-e2e-action="outbound-open-packing" onClick={() => { window.location.hash = '/packing'; }}>{text.openPacking}</Button>
           <ActionStatus mutation={mutation} />
         </div>
@@ -105,9 +130,7 @@ export function OutboundPage() {
 const czech = {
   banner: 'API expedice',
   tableTitle: 'Objednávky',
-  tableEyebrow: 'živý výdej a expedice',
   allocationTitle: 'Alokace',
-  allocationEyebrow: 'rezervace · balení · expedice',
   selectedOrder: 'Vybraná objednávka',
   allocated: 'Alokováno / pickuje se',
   shippingProgress: 'Průběh odeslání',
@@ -116,11 +139,6 @@ const czech = {
   releaseButton: 'Uvolnit picking',
   releaseAction: 'Uvolnit picking',
   openPacking: 'Otevřít balení',
-  deadlineTitle: 'Fronta termínů',
-  deadlineEyebrow: 'řazeno podle termínu',
-  lineCount: 'řádků',
-  waveLabel: 'vlna',
-  timelineEmpty: 'Žádné expediční objednávky nejsou načtené.',
   emptyTitle: 'Žádné objednávky',
   emptyText: 'Server zatím nevrátil žádné objednávky.',
   filters: { active: 'Aktivní', all: 'Vše', shipped: 'Odeslané' },
@@ -130,9 +148,7 @@ const czech = {
 const english = {
   banner: 'Shipping API',
   tableTitle: 'Orders',
-  tableEyebrow: 'live outbound and shipping',
   allocationTitle: 'Allocation',
-  allocationEyebrow: 'reservation · packing · shipping',
   selectedOrder: 'Selected order',
   allocated: 'Allocated / picking',
   shippingProgress: 'Shipping progress',
@@ -141,11 +157,6 @@ const english = {
   releaseButton: 'Release picking',
   releaseAction: 'Release picking',
   openPacking: 'Open packing',
-  deadlineTitle: 'Deadline queue',
-  deadlineEyebrow: 'sorted by deadline',
-  lineCount: 'lines',
-  waveLabel: 'wave',
-  timelineEmpty: 'No outbound orders are loaded.',
   emptyTitle: 'No orders',
   emptyText: 'The server has not returned any orders yet.',
   filters: { active: 'Active', all: 'All', shipped: 'Shipped' },
@@ -155,9 +166,7 @@ const english = {
 const ukrainian = {
   banner: 'API експедиції',
   tableTitle: 'Замовлення',
-  tableEyebrow: 'жива видача та доставка',
   allocationTitle: 'Алокація',
-  allocationEyebrow: 'резерв · пакування · доставка',
   selectedOrder: 'Вибране замовлення',
   allocated: 'Алоковано / відбір',
   shippingProgress: 'Прогрес відправки',
@@ -166,11 +175,6 @@ const ukrainian = {
   releaseButton: 'Відкрити відбір',
   releaseAction: 'Відкрити відбір',
   openPacking: 'Відкрити пакування',
-  deadlineTitle: 'Черга термінів',
-  deadlineEyebrow: 'сортування за терміном',
-  lineCount: 'рядків',
-  waveLabel: 'хвиля',
-  timelineEmpty: 'Немає завантажених замовлень на відправку.',
   emptyTitle: 'Немає замовлень',
   emptyText: 'Сервер поки не повернув жодних замовлень.',
   filters: { active: 'Активні', all: 'Усі', shipped: 'Відправлені' },

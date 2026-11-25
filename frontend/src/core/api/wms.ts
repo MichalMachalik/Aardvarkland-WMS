@@ -197,7 +197,7 @@ export function adjustInventoryStock<T>(warehouseId: string, body: MutationBody)
 export function listInboundShipments<T>(warehouseId: string, query?: QueryParams) { return apiRequest<T>(endpoints.inboundShipments(warehouseId), { query }); }
 export function receiveInboundShipment<T>(warehouseId: string, shipmentId: string, body: MutationBody) { return post<T>(endpoints.receiveInbound(warehouseId, shipmentId), body, String(body.idempotencyKey ?? '')); }
 export function listOutboundOrders<T>(warehouseId: string, query?: QueryParams) { return apiRequest<T>(endpoints.outboundOrders(warehouseId), { query }); }
-export function allocateOutboundOrder<T>(warehouseId: string, orderId: string, body: MutationBody = {}) { return post<T>(endpoints.allocateOrder(warehouseId, orderId), body, `storage-allocate-${orderId}`); }
+export function allocateOutboundOrder<T>(warehouseId: string, orderId: string, body: MutationBody = {}) { return post<T>(endpoints.allocateOrder(warehouseId, orderId), body, createWmsIdempotencyKey('storage-allocate')); }
 export function releasePicking<T>(warehouseId: string, orderId: string, body: MutationBody = {}) { return post<T>(endpoints.releasePicking(warehouseId, orderId), body, `storage-release-picking-${orderId}`); }
 export function listTasks<T>(warehouseId: string, query?: QueryParams) { return apiRequest<T>(endpoints.warehouseTasks(warehouseId), { query }); }
 export function claimNextWarehouseTask<T>(warehouseId: string, body: MutationBody = {}) { return post<T>(endpoints.claimNextTask(warehouseId), body, createWmsIdempotencyKey('storage-claim-next')); }
