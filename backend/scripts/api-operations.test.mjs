@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import test from 'node:test';
 import { runWriteScenarios } from './api-write-scenarios.mjs';
 
@@ -18,12 +19,51 @@ test('OpenAPI operations on a disposable PostgreSQL database', { timeout: 180000
   assert.match(database.pathname, /test|regression/i, 'Use a database dedicated to tests');
   const connectionOptions = database.searchParams.get('options');
   database.searchParams.set('options', [connectionOptions, '-c timezone=Europe/Prague'].filter(Boolean).join(' '));
+  const baseComToken = randomUUID();
+  const baseComOrders = new Map();
+  const baseComShippedStatus = 7200;
+  const connector = createServer(async (incoming, outgoing) => {
+    const send = (data, status = 200) => {
+      outgoing.writeHead(status, { 'Content-Type': 'application/json' });
+      outgoing.end(JSON.stringify(data));
+    };
+    if (incoming.method !== 'POST' || incoming.url !== '/connector.php' || incoming.headers['x-bltoken'] !== baseComToken) {
+      return send({ status: 'ERROR' }, 400);
+    }
+    const chunks = [];
+    for await (const chunk of incoming) chunks.push(chunk);
+    const form = new URLSearchParams(Buffer.concat(chunks).toString('utf8'));
+    const parameters = JSON.parse(form.get('parameters') ?? '{}');
+    const order = baseComOrders.get(parameters.order_id);
+    if (form.get('method') === 'getOrders' && parameters.get_unconfirmed_orders === false) {
+      return send({
+        status: 'SUCCESS',
+        orders: order ? [{
+          order_id: parameters.order_id, order_status_id: order.statusId,
+          confirmed: order.confirmed, products: order.products,
+        }] : [],
+      });
+    }
+    if (order && form.get('method') === 'setOrderStatus' && parameters.status_id === baseComShippedStatus) {
+      order.statusWrites++;
+      order.statusId = parameters.status_id;
+      return send({ status: 'SUCCESS' });
+    }
+    return send({ status: 'ERROR' }, 400);
+  });
+  await new Promise((resolve, reject) => connector.listen(0, '127.0.0.1', resolve).once('error', reject));
+  suite.after(async () => {
+    connector.closeAllConnections();
+    await new Promise(resolve => connector.close(resolve));
+  });
   Object.assign(process.env, {
     DATABASE_URL: database.href,
     DATABASE_DIRECT_URL: database.href,
     NODE_ENV: 'test',
     CARRIER_ADAPTER_MODE: 'mock',
-    BASE_COM_API_TOKEN: '',
+    BASE_COM_API_URL: `http://127.0.0.1:${connector.address().port}/connector.php`,
+    BASE_COM_API_TOKEN: baseComToken,
+    BASE_COM_SHIPPED_STATUS_ID: String(baseComShippedStatus),
     EXTERNAL_HTTP_ALLOWED_HOSTS: '127.0.0.1',
     OPERATIONAL_ALERT_DELIVERY_ENABLED: 'false',
     RATE_LIMIT_BACKEND: 'memory',
@@ -205,6 +245,7 @@ test('OpenAPI operations on a disposable PostgreSQL database', { timeout: 180000
     request,
     login,
     prisma: app.get(PrismaService),
+    baseCom: { orders: baseComOrders, shippedStatus: baseComShippedStatus },
     runQueueCycle: () => app.get(QueueWorkerService).runLoop({
       stopAfterCycles: 1,
       eventType: 'STORAGE_OCCUPANCY_FIXTURE',

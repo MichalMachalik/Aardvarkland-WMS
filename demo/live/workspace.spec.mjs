@@ -101,6 +101,58 @@ for (const [name, role] of Object.entries(roles)) {
   });
 }
 
+test('Base.com gives actionable feedback for import and dispatch on a phone', async ({ page }) => {
+  let imported = false;
+  let dispatched = false;
+  let synced = false;
+  let observedOrderId;
+  await page.route(/\/api\/warehouses\/[^/]+\/integrations\/base-com(?:\/orders\/(?:import|sync-dispatch))?$/, async route => {
+    const request = route.request();
+    if (request.method() === 'GET') {
+      return route.fulfill({ json: { configured: true, dispatchSyncConfigured: true } });
+    }
+    observedOrderId = request.postDataJSON().orderId;
+    const orderNumber = `BASE-${observedOrderId}`;
+    if (new URL(request.url()).pathname.endsWith('/import')) {
+      const created = !imported;
+      imported = true;
+      return route.fulfill({ json: { created, order: { orderNumber } } });
+    }
+    if (!dispatched) {
+      return route.fulfill({ status: 422, json: { message: 'Dispatch the order in WMS before sending its status.' } });
+    }
+    const updated = !synced;
+    synced = true;
+    return route.fulfill({ json: { updated, orderNumber } });
+  });
+
+  await login(page, roles.system);
+  await desktopNav(page).getByRole('button', { name: 'Integrace', exact: true }).click();
+  await page.setViewportSize({ width: 390, height: 844 });
+  const card = page.locator('section.card').filter({ has: page.getByRole('heading', { name: 'Base.com', exact: true }) });
+  const orderId = card.getByRole('textbox', { name: 'ID objednávky v Base.com' });
+  const importOrder = card.getByRole('button', { name: 'Importovat objednávku' });
+  const sync = card.getByRole('button', { name: 'Odeslat stav expedice' });
+  await expect(importOrder).toBeDisabled();
+  await orderId.fill('9007199254740992');
+  await expect(sync).toBeDisabled();
+  await orderId.fill(' 1042 ');
+  await expect(orderId).toHaveValue('1042');
+  await importOrder.click();
+  await expect(card.getByRole('status')).toContainText('Objednávka importována do WMS');
+  expect(observedOrderId).toBe(1042);
+  await importOrder.click();
+  await expect(card.getByRole('status')).toContainText('Objednávka už je ve WMS');
+  await sync.click();
+  await expect(card.getByRole('alert')).toContainText('Zkontrolujte, že je objednávka odeslaná ve WMS a potvrzená v Base.com.');
+  dispatched = true;
+  await sync.click();
+  await expect(card.getByRole('status')).toContainText('Stav expedice odeslán do Base.com');
+  await sync.click();
+  await expect(card.getByRole('status')).toContainText('Base.com už má stav expedice');
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+});
+
 test('phone navigation groups secondary pages and restores focus on Escape', async ({ page }) => {
   const isQueue = url => new URL(url).pathname.endsWith('/rf/queue');
   let releaseQueue;

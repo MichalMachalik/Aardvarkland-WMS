@@ -99,6 +99,11 @@ const manualOverrides: Readonly<Record<string, TranslationRow>> = {
   'Order imported into WMS': { fr: 'Commande importée dans le WMS', de: 'Bestellung ins WMS importiert', es: 'Pedido importado al WMS' },
   'Send dispatch status': { fr: 'Envoyer le statut d’expédition', de: 'Versandstatus senden', es: 'Enviar estado de expedición' },
   'Send the status after dispatch is complete in WMS.': { fr: 'Envoyez le statut une fois l’expédition terminée dans le WMS.', de: 'Senden Sie den Status nach Abschluss des Versands im WMS.', es: 'Envía el estado una vez completada la expedición en el WMS.' },
+  'Check that the order has shipped in WMS and is confirmed in Base.com.': {
+    fr: 'Vérifiez que la commande est expédiée dans le WMS et confirmée dans Base.com.',
+    de: 'Prüfen Sie, ob die Bestellung im WMS versandt und in Base.com bestätigt wurde.',
+    es: 'Comprueba que el pedido se haya expedido en el WMS y esté confirmado en Base.com.',
+  },
   'Set the Base.com target status ID on the server to enable dispatch updates.': { fr: 'Configurez l’ID du statut cible Base.com sur le serveur pour activer les mises à jour.', de: 'Hinterlegen Sie die Base.com-Zielstatus-ID auf dem Server, um Statusmeldungen zu ermöglichen.', es: 'Configura en el servidor el ID del estado de Base.com para habilitar los avisos de expedición.' },
   'Setup required': { fr: 'Configuration requise', de: 'Einrichtung erforderlich', es: 'Requiere configuración' },
 };

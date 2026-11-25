@@ -1,3 +1,5 @@
+import { BadRequestException } from '@nestjs/common';
+
 const SECRET_KEY_PATTERN = /(secret|password|token|api.?key|authorization|credential|private)/i;
 
 export interface IntegrationRouteConfig {
@@ -63,6 +65,22 @@ export function maskIntegrationConfig(value: unknown): unknown {
     masked[key] = SECRET_KEY_PATTERN.test(key) ? maskSecretValue(child) : maskIntegrationConfig(child);
   }
   return masked;
+}
+
+export function restoreMaskedIntegrationConfig(candidate: unknown, previous: unknown): unknown {
+  if (Array.isArray(candidate)) {
+    return candidate.map((item, index) => restoreMaskedIntegrationConfig(item, Array.isArray(previous) ? previous[index] : undefined));
+  }
+  if (!candidate || typeof candidate !== 'object') return candidate;
+  const original = previous && typeof previous === 'object' ? previous as Record<string, unknown> : {};
+  return Object.fromEntries(Object.entries(candidate as Record<string, unknown>).map(([key, value]) => {
+    const saved = Object.hasOwn(original, key) ? original[key] : undefined;
+    if (SECRET_KEY_PATTERN.test(key) && typeof value === 'string' && /^(?:\*{4}|\*{4,12}.{4})$/.test(value)) {
+      if (saved != null && value === maskSecretValue(saved)) return [key, saved];
+      throw new BadRequestException('A masked configuration value no longer matches the saved credential');
+    }
+    return [key, restoreMaskedIntegrationConfig(value, saved)];
+  }));
 }
 
 export function routeMatchesEvent(route: IntegrationRouteConfig, eventType: string): boolean {

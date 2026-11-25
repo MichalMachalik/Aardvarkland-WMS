@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { BadGatewayException, BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 
 import { PrismaService } from '../database';
 import { IntegrationEnterpriseService } from './integration-enterprise.service';
@@ -7,11 +7,14 @@ import {
   HttpIntegrationDeliveryResult,
   HttpIntegrationEvent,
   HttpIntegrationEndpoint,
+  HttpIntegrationPingResult,
   pingHttpIntegrationEndpoint,
 } from './http-integration-adapter';
 import {
   endpointAcceptsEvent,
+  joinIntegrationUrl,
   maskIntegrationConfig,
+  normalizeIntegrationMethod,
   toIntegrationEndpointConfig,
 } from './integration-config.helpers';
 
@@ -83,23 +86,22 @@ export class IntegrationDispatchService {
     input: { eventType?: string; path?: string; payload?: unknown } = {},
   ): Promise<IntegrationEndpointPingResponse> {
     const endpoint = await this.resolveEndpoint(endpointReference);
-    const result = await pingHttpIntegrationEndpoint(endpoint, input);
-    await this.client.integrationDispatchLog.create({
-      data: {
-        endpointId: endpoint.id,
-        outboxEventId: null,
-        eventType: input.eventType ?? 'WMS_INTEGRATION_PING',
-        destinationUrl: result.url,
-        requestMethod: result.method,
-        statusCode: result.statusCode,
-        success: result.success,
-        attempts: 1,
-        errorMessage: result.success ? null : `HTTP ${result.statusCode}`,
-        requestBodyHash: null,
-        responseBody: result.responseBody,
-        metadata: { kind: 'ping', config: maskIntegrationConfig(endpoint.config) },
-      },
-    });
+    const config = toIntegrationEndpointConfig(endpoint.config);
+    const base = URL.parse(endpoint.baseUrl);
+    const target = URL.parse(joinIntegrationUrl(endpoint.baseUrl, input.path ?? config.path ?? '/health'));
+    if (!base || !target || target.origin !== base.origin || target.username || target.password) {
+      throw new BadRequestException('The test path must use the configured endpoint origin');
+    }
+
+    let result: HttpIntegrationPingResult;
+    try {
+      result = await pingHttpIntegrationEndpoint(endpoint, input);
+    } catch {
+      const message = 'Could not reach the integration endpoint or read its response';
+      await this.writePingLog(endpoint, input.eventType, target.href, null, message);
+      throw new BadGatewayException(message);
+    }
+    await this.writePingLog(endpoint, input.eventType, result.url, result, result.success ? null : `HTTP ${result.statusCode}`);
 
     return {
       endpointId: endpoint.id,
@@ -110,6 +112,31 @@ export class IntegrationDispatchService {
       method: result.method,
       responseBody: result.responseBody,
     };
+  }
+
+  private async writePingLog(
+    endpoint: HttpIntegrationEndpoint,
+    eventType: string | undefined,
+    destinationUrl: string,
+    result: HttpIntegrationPingResult | null,
+    errorMessage: string | null,
+  ): Promise<void> {
+    await this.client.integrationDispatchLog.create({
+      data: {
+        endpointId: endpoint.id,
+        outboxEventId: null,
+        eventType: eventType ?? 'WMS_INTEGRATION_PING',
+        destinationUrl,
+        requestMethod: result?.method ?? normalizeIntegrationMethod(toIntegrationEndpointConfig(endpoint.config).method),
+        statusCode: result?.statusCode ?? null,
+        success: result?.success ?? false,
+        attempts: 1,
+        errorMessage,
+        requestBodyHash: null,
+        responseBody: result?.responseBody ?? null,
+        metadata: { kind: 'ping', config: maskIntegrationConfig(endpoint.config) },
+      },
+    });
   }
 
 
@@ -153,7 +180,7 @@ export class IntegrationDispatchService {
     });
 
     if (!endpoint) {
-      throw new Error('Integration endpoint was not found');
+      throw new NotFoundException('Integration endpoint was not found');
     }
 
     return endpoint;

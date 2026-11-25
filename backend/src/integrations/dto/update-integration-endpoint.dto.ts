@@ -37,7 +37,7 @@ export class UpdateIntegrationEndpointDto {
   @ApiPropertyOptional({ example: 'https://erp.example.com/api' })
   @IsOptional()
   @IsString()
-  @IsUrl({ require_protocol: true, require_tld: false })
+  @IsUrl({ protocols: ['http', 'https'], require_protocol: true, require_tld: false, disallow_auth: true })
   @MaxLength(500)
   baseUrl?: string;
 

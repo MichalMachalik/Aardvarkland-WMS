@@ -125,6 +125,9 @@ export class BaseComService {
     const db = transaction ?? this.prisma;
     const system = await db.externalSystem.findUnique({ where: { code: SYSTEM_CODE } });
     if (!system) return null;
+    if (system.systemType !== SYSTEM_CODE || system.status !== 'ACTIVE') {
+      throw new ConflictException('The Base.com external system is inactive or has a different connector type.');
+    }
 
     const mapping = await db.externalIdMapping.findUnique({
       where: { externalSystemId_resourceType_externalId: {

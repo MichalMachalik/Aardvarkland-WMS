@@ -6,11 +6,11 @@ import {
 } from '@nestjs/common';
 
 import { AuthenticatedUser } from '../access-control/types';
-import { PrismaService } from '../database';
+import { lockPostgresRowById, PrismaService, withTransactionRetry } from '../database';
 import { Prisma } from '../generated/prisma/client';
 import { CreateIntegrationEndpointDto } from './dto/create-integration-endpoint.dto';
 import { UpdateIntegrationEndpointDto } from './dto/update-integration-endpoint.dto';
-import { maskIntegrationConfig } from './integration-config.helpers';
+import { maskIntegrationConfig, restoreMaskedIntegrationConfig } from './integration-config.helpers';
 import { IntegrationEndpointResponse, IntegrationStatus } from './integrations.types';
 
 interface IntegrationEndpointRecord {
@@ -34,16 +34,6 @@ type IntegrationEndpointWhereInput = {
 
 type IntegrationEndpointJsonInput = Prisma.InputJsonValue | typeof Prisma.DbNull;
 
-interface IntegrationEndpointCreateInput {
-  code: string;
-  name: string;
-  type: string;
-  baseUrl: string;
-  authType: string;
-  status: IntegrationStatus;
-  config?: IntegrationEndpointJsonInput;
-}
-
 interface IntegrationEndpointUpdateInput {
   code?: string;
   name?: string;
@@ -54,28 +44,12 @@ interface IntegrationEndpointUpdateInput {
   config?: IntegrationEndpointJsonInput;
 }
 
-interface IntegrationEndpointDelegate {
-  findMany(args: { orderBy: { code: 'asc' } }): Promise<IntegrationEndpointRecord[]>;
-  findFirst(args: {
-    where: IntegrationEndpointWhereInput;
-  }): Promise<IntegrationEndpointRecord | null>;
-  create(args: { data: IntegrationEndpointCreateInput }): Promise<IntegrationEndpointRecord>;
-  update(args: {
-    where: { id: string };
-    data: IntegrationEndpointUpdateInput;
-  }): Promise<IntegrationEndpointRecord>;
-}
-
-type PrismaWithIntegrations = PrismaService & {
-  integrationEndpoint: IntegrationEndpointDelegate;
-};
-
 @Injectable()
 export class IntegrationsService {
   constructor(private readonly prisma: PrismaService) {}
 
   async findMany(): Promise<IntegrationEndpointResponse[]> {
-    const endpoints = await this.endpoints.findMany({
+    const endpoints = await this.prisma.integrationEndpoint.findMany({
       orderBy: { code: 'asc' },
     });
 
@@ -87,19 +61,22 @@ export class IntegrationsService {
     actor: AuthenticatedUser,
   ): Promise<IntegrationEndpointResponse> {
     try {
-      const endpoint = await this.endpoints.create({
-        data: {
-          code: normalizeCode(dto.code),
-          name: dto.name.trim(),
-          type: normalizeCode(dto.type),
-          baseUrl: dto.baseUrl.trim(),
-          authType: normalizeCode(dto.authType ?? 'NONE'),
-          status: dto.status ?? 'INACTIVE',
-          ...(dto.config === undefined ? {} : { config: toJsonInput(dto.config) }),
-        },
-      });
-
-      await this.writeIntegrationAudit(actor, 'integration_endpoint.created', endpoint);
+      const endpoint = await withTransactionRetry(() => this.prisma.$transaction(async tx => {
+        const config = restoreMaskedIntegrationConfig(dto.config, null);
+        const saved = await tx.integrationEndpoint.create({
+          data: {
+            code: normalizeRequiredLabel(dto.code, 'Code').toUpperCase(),
+            name: normalizeRequiredLabel(dto.name, 'Name'),
+            type: normalizeRequiredLabel(dto.type, 'Type').toUpperCase(),
+            baseUrl: dto.baseUrl.trim(),
+            authType: normalizeRequiredLabel(dto.authType ?? 'NONE', 'Authentication type', 1).toUpperCase(),
+            status: dto.status ?? 'INACTIVE',
+            ...(config === undefined ? {} : { config: toJsonInput(config) }),
+          },
+        });
+        await this.writeIntegrationAudit(tx, actor, 'integration_endpoint.created', saved);
+        return saved;
+      }));
 
       return toIntegrationEndpointResponse(endpoint);
     } catch (error: unknown) {
@@ -116,20 +93,24 @@ export class IntegrationsService {
     dto: UpdateIntegrationEndpointDto,
     actor: AuthenticatedUser,
   ): Promise<IntegrationEndpointResponse> {
-    const existingEndpoint = await this.resolveEndpoint(endpointReference);
-    const data = toUpdateInput(dto);
-
-    if (Object.keys(data).length === 0) {
-      throw new BadRequestException('No integration endpoint changes were provided');
-    }
-
     try {
-      const endpoint = await this.endpoints.update({
-        where: { id: existingEndpoint.id },
-        data,
-      });
-
-      await this.writeIntegrationAudit(actor, 'integration_endpoint.updated', endpoint);
+      const endpoint = await withTransactionRetry(() => this.prisma.$transaction(async tx => {
+        const candidate = await tx.integrationEndpoint.findFirst({
+          where: endpointReferenceWhere(endpointReference),
+          select: { id: true },
+        });
+        if (!candidate) throw new NotFoundException('Integration endpoint was not found');
+        await lockPostgresRowById(tx, 'integration_endpoints', candidate.id);
+        const existing = await tx.integrationEndpoint.findUnique({ where: { id: candidate.id } });
+        if (!existing) throw new NotFoundException('Integration endpoint was not found');
+        const data = toUpdateInput(dto, existing);
+        if (!Object.keys(data).length) {
+          throw new BadRequestException('No integration endpoint changes were provided');
+        }
+        const saved = await tx.integrationEndpoint.update({ where: { id: existing.id }, data });
+        await this.writeIntegrationAudit(tx, actor, 'integration_endpoint.updated', saved);
+        return saved;
+      }));
 
       return toIntegrationEndpointResponse(endpoint);
     } catch (error: unknown) {
@@ -141,28 +122,13 @@ export class IntegrationsService {
     }
   }
 
-  private get endpoints(): IntegrationEndpointDelegate {
-    return (this.prisma as PrismaWithIntegrations).integrationEndpoint;
-  }
-
-  private async resolveEndpoint(endpointReference: string): Promise<IntegrationEndpointRecord> {
-    const endpoint = await this.endpoints.findFirst({
-      where: endpointReferenceWhere(endpointReference),
-    });
-
-    if (!endpoint) {
-      throw new NotFoundException('Integration endpoint was not found');
-    }
-
-    return endpoint;
-  }
-
   private async writeIntegrationAudit(
+    tx: Prisma.TransactionClient,
     actor: AuthenticatedUser,
     action: string,
     endpoint: IntegrationEndpointRecord,
   ): Promise<void> {
-    await this.prisma.auditLog.create({
+    await tx.auditLog.create({
       data: {
         actorUserId: actor.id,
         warehouseId: null,
@@ -179,15 +145,17 @@ export class IntegrationsService {
   }
 }
 
-function toUpdateInput(dto: UpdateIntegrationEndpointDto): IntegrationEndpointUpdateInput {
+function toUpdateInput(dto: UpdateIntegrationEndpointDto, existing: IntegrationEndpointRecord): IntegrationEndpointUpdateInput {
+  const baseUrl = dto.baseUrl?.trim();
+  const sameOrigin = !baseUrl || new URL(baseUrl).origin === URL.parse(existing.baseUrl)?.origin;
   return {
-    ...(dto.code === undefined ? {} : { code: normalizeCode(dto.code) }),
-    ...(dto.name === undefined ? {} : { name: dto.name.trim() }),
-    ...(dto.type === undefined ? {} : { type: normalizeCode(dto.type) }),
-    ...(dto.baseUrl === undefined ? {} : { baseUrl: dto.baseUrl.trim() }),
-    ...(dto.authType === undefined ? {} : { authType: normalizeCode(dto.authType) }),
-    ...(dto.status === undefined ? {} : { status: dto.status }),
-    ...(dto.config === undefined ? {} : { config: toJsonInput(dto.config) }),
+    ...(dto.code == null ? {} : { code: normalizeRequiredLabel(dto.code, 'Code').toUpperCase() }),
+    ...(dto.name == null ? {} : { name: normalizeRequiredLabel(dto.name, 'Name') }),
+    ...(dto.type == null ? {} : { type: normalizeRequiredLabel(dto.type, 'Type').toUpperCase() }),
+    ...(baseUrl ? { baseUrl } : {}),
+    ...(dto.authType == null ? {} : { authType: normalizeRequiredLabel(dto.authType, 'Authentication type', 1).toUpperCase() }),
+    ...(dto.status == null ? {} : { status: dto.status }),
+    ...(dto.config === undefined ? {} : { config: toJsonInput(restoreMaskedIntegrationConfig(dto.config, sameOrigin ? existing.config : null)) }),
   };
 }
 
@@ -222,8 +190,14 @@ function normalizeCode(value: string): string {
   return value.trim().toUpperCase();
 }
 
+function normalizeRequiredLabel(value: string, field: string, minLength = 2): string {
+  const trimmed = value.trim();
+  if (trimmed.length < minLength) throw new BadRequestException(`${field} is too short`);
+  return trimmed;
+}
+
 function toJsonInput(
-  value: Record<string, unknown> | null | undefined,
+  value: unknown,
 ): IntegrationEndpointJsonInput | undefined {
   if (value === undefined) {
     return undefined;

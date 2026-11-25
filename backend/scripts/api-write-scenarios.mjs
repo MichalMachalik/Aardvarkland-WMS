@@ -4,7 +4,7 @@ import { createServer } from 'node:http';
 
 const warehouse = '/api/warehouses/MAIN';
 
-export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, bind, request, login, prisma, runQueueCycle }) {
+export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, bind, request, login, prisma, runQueueCycle, baseCom }) {
   const suffix = randomUUID().slice(0, 8).toUpperCase();
   const own = (method, path, ...args) => asAdmin(method, warehouse + path, ...args);
   let scenarios = 0;
@@ -1515,6 +1515,141 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
       receiver.closeAllConnections();
       await new Promise(resolve => receiver.close(resolve));
     }
+  });
+
+  await scenario('configured endpoints validate changes, hide credentials and report test results', async () => {
+    const calls = [];
+    const key = randomUUID();
+    const receiver = createServer(async (incoming, outgoing) => {
+      const chunks = [];
+      for await (const chunk of incoming) chunks.push(chunk);
+      calls.push({ path: incoming.url, key: incoming.headers['x-fixture-key'], body: JSON.parse(Buffer.concat(chunks).toString('utf8')) });
+      if (incoming.url === '/disconnected') return outgoing.destroy();
+      outgoing.writeHead(incoming.url === '/declined' ? 422 : 200);
+      outgoing.end('Fixture response');
+    });
+    await new Promise((resolve, reject) => receiver.listen(0, '127.0.0.1', resolve).once('error', reject));
+    try {
+      const endpoints = '/api/integrations/endpoints';
+      const body = {
+        code: ` endpoint-${suffix.toLowerCase()} `, type: 'WEBHOOK', name: 'Fixture endpoint',
+        baseUrl: `http://127.0.0.1:${receiver.address().port}`, authType: 'API_KEY',
+        config: { auth: { apiKeyHeader: 'X-Fixture-Key', apiKey: key }, path: '/health' },
+      };
+      await asWorker('POST', endpoints, body, 403);
+      await asAdmin('POST', endpoints, { ...body, code: '   ' }, 400);
+      await asAdmin('POST', endpoints, { ...body, baseUrl: 'ftp://127.0.0.1' }, 400);
+      const initial = await asAdmin('POST', endpoints, body);
+      assert.equal(initial.code, body.code.trim().toUpperCase());
+      assert.notEqual(initial.config.auth.apiKey, key);
+      await asAdmin('POST', endpoints, { ...body, code: initial.code }, 409);
+      const path = `${endpoints}/${initial.id}`;
+      await asAdmin('PATCH', path, { name: null }, 400);
+      await asAdmin('PATCH', path, { name: '   ' }, 400);
+      const changed = await asAdmin('PATCH', path, { name: 'Renamed fixture', config: { ...initial.config, path: '/ready' } });
+      assert.equal(changed.name, 'Renamed fixture');
+      assert.equal(changed.config.path, '/ready');
+      assert.notEqual(changed.config.auth.apiKey, key);
+      const stored = await prisma.integrationEndpoint.findUniqueOrThrow({ where: { id: initial.id } });
+      assert.equal(stored.config.auth.apiKey, key);
+      await asAdmin('POST', `${endpoints}/${randomUUID()}/test`, {}, 404);
+      await asAdmin('POST', path + '/test', { path: 'http://127.0.0.1:1/other' }, 400);
+      assert.deepEqual(calls, []);
+      const ping = await asAdmin('POST', path + '/test', { eventType: 'FIXTURE_HEALTH', payload: { ping: true } });
+      assert.equal(ping.success, true);
+      assert.equal(ping.statusCode, 200);
+      assert.equal(new URL(ping.url).pathname, '/ready');
+      assert.deepEqual(calls[0], { path: '/ready', key, body: { eventType: 'FIXTURE_HEALTH', payload: { ping: true }, generatedAt: calls[0].body.generatedAt } });
+      const rejected = await asAdmin('POST', path + '/test', { path: '/declined' });
+      assert.equal(rejected.statusCode, 422);
+      assert.equal(rejected.success, false);
+      await asAdmin('POST', path + '/test', { path: '/disconnected' }, 502);
+      const logs = await prisma.integrationDispatchLog.findMany({
+        where: { endpointId: initial.id }, orderBy: { createdAt: 'asc' },
+      });
+      assert.deepEqual(logs.map(log => [log.statusCode, log.success]), [[200, true], [422, false], [null, false]]);
+      assert.equal(JSON.stringify(logs).includes(key), false);
+    } finally {
+      receiver.closeAllConnections();
+      await new Promise(resolve => receiver.close(resolve));
+    }
+  });
+
+  await scenario('Base.com imports confirmed orders and syncs only after real warehouse dispatch', async () => {
+    const path = `${warehouse}/integrations/base-com`;
+    const importPath = path + '/orders/import';
+    const syncPath = path + '/orders/sync-dispatch';
+    const { sku } = await createSku('BASE-COM');
+    const orderId = Number.parseInt(suffix, 16) + 1;
+    const remote = { confirmed: false, statusId: 7100, statusWrites: 0, products: [{ sku: sku.code.toLowerCase(), quantity: 2 }] };
+    baseCom.orders.set(orderId, remote);
+    const input = { orderId };
+    assert.deepEqual(await asAdmin('GET', path), { configured: true, dispatchSyncConfigured: true });
+    await asWorker('POST', importPath, input, 403);
+    await asAdmin('POST', importPath, { orderId: orderId + 1 }, 404);
+    await asAdmin('POST', importPath, input, 422);
+    remote.confirmed = true;
+    const lines = remote.products;
+    remote.products = [{ sku: 'UNKNOWN-FIXTURE', quantity: 1 }];
+    await asAdmin('POST', importPath, input, 422);
+    assert.equal(await prisma.outboundOrder.count({ where: { orderNumber: `BASE-${orderId}` } }), 0);
+    remote.products = lines;
+    await asAdmin('POST', syncPath, input, 404);
+    const imports = await Promise.all([
+      asAdmin('POST', importPath, input, 200),
+      asAdmin('POST', importPath, input, 200),
+    ]);
+    assert.deepEqual(imports.map(item => item.created).sort(), [false, true]);
+    const { order } = imports[0];
+    assert.equal(imports[1].order.id, order.id);
+    assert.deepEqual(order.lines.map(line => [line.sku, line.orderedQuantity]), [[sku.code, 2]]);
+    assert.equal(await prisma.externalIdMapping.count({ where: { resourceId: order.id } }), 1);
+    await asAdmin('POST', syncPath, input, 422);
+    assert.equal(remote.statusWrites, 0);
+
+    await own('POST', '/inventory/quants/receive', { skuReference: sku.code, locationReference: 'A-01-01', quantity: 2 });
+    const orderPath = `/outbound-orders/${order.id}`;
+    await own('POST', orderPath + '/allocate', {});
+    await own('POST', orderPath + '/release-picking', {});
+    const tasks = (await own('GET', `/tasks?type=PICK&sku=${encodeURIComponent(sku.code)}`))
+      .filter(task => task.outboundOrderId === order.id);
+    assert.equal(tasks.reduce((total, task) => total + task.quantity, 0), 2);
+    for (const task of tasks) {
+      await own('POST', `/tasks/${task.id}/confirm-pick`, { orderReference: order.id, quantity: task.quantity });
+    }
+    const shipment = await own('POST', '/shipments', {
+      shipmentNumber: `SHP-BASE-${suffix}`, outboundOrderReference: order.id, packingStationReference: 'PACK-01',
+      carrier: 'EXPRESS_CARRIER',
+    });
+    const shipmentPath = `/shipments/${shipment.id}`;
+    const pack = await own('POST', shipmentPath + '/packages', {
+      packageCode: `BOX-BASE-${suffix}`,
+      contents: [{ sku: sku.code, outboundOrderLineReference: order.lines[0].id, quantity: 2 }],
+    });
+    const staged = await own('POST', shipmentPath + '/stage', {});
+    assert.equal(staged.status, 'STAGED');
+    await own('POST', shipmentPath + '/ship', {}, 409);
+    await own('POST', shipmentPath + '/labels', { packageReference: pack.id, labelFormat: 'ZPL' });
+    assert.equal((await own('POST', shipmentPath + '/ship', {})).status, 'SHIPPED');
+    assert.equal((await own('GET', orderPath)).status, 'SHIPPED');
+
+    const externalSystem = { where: { code: 'BASE_COM' } };
+    await prisma.externalSystem.update({ ...externalSystem, data: { status: 'INACTIVE' } });
+    try {
+      await asAdmin('POST', importPath, input, 409);
+      await asAdmin('POST', syncPath, input, 409);
+      assert.equal(remote.statusWrites, 0);
+    } finally {
+      await prisma.externalSystem.update({ ...externalSystem, data: { status: 'ACTIVE' } });
+    }
+    const updates = await Promise.all([
+      asAdmin('POST', syncPath, input, 200),
+      asAdmin('POST', syncPath, input, 200),
+    ]);
+    assert.deepEqual(updates.map(item => item.updated).sort(), [false, true]);
+    assert.equal(remote.statusId, baseCom.shippedStatus);
+    assert.equal(remote.statusWrites, 1);
+    assert.equal(await prisma.auditLog.count({ where: { action: 'base_com.dispatch_synced', resourceId: order.id } }), 1);
   });
 
   await scenario('quality checks handle a missing stock reference and quarantine and release real stock', async () => {

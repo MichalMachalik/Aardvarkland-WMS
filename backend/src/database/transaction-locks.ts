@@ -24,6 +24,7 @@ const SAFE_TABLE_NAMES = new Set([
   'billing_invoices',
   'outbox_events',
   'inbox_events',
+  'integration_endpoints',
   'scanner_sessions',
 ]);
 const SAFE_ADVISORY_LOCK_NAMESPACES = new Set([

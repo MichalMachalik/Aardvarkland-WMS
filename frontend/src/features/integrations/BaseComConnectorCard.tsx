@@ -4,6 +4,7 @@ import { ActionStatus } from '../../components/ops/ActionStatus';
 import { Badge } from '../../components/ui/Badge';
 import { Button } from '../../components/ui/Button';
 import { Card } from '../../components/ui/Card';
+import { ApiError } from '../../core/api/http';
 import { useApiMutation } from '../../core/api/useApiMutation';
 import { useApiResource } from '../../core/api/useApiResource';
 import { getBaseComConnectorStatus, importBaseComOrder, syncBaseComDispatch } from '../../core/api/wms';
@@ -47,8 +48,14 @@ export function BaseComConnectorCard() {
   const syncDispatch = async () => {
     if (!syncReady) return;
     setResult(undefined);
-    const response = await mutation.run(text.syncDispatch, () =>
-      syncBaseComDispatch<{ updated: boolean; orderNumber: string }>(warehouseId, orderId));
+    const response = await mutation.run(text.syncDispatch, async () => {
+      try {
+        return await syncBaseComDispatch<{ updated: boolean; orderNumber: string }>(warehouseId, orderId);
+      } catch (error: unknown) {
+        if (error instanceof ApiError && error.status === 422) throw new Error(text.dispatchRejected);
+        throw error;
+      }
+    });
     if (response) setResult({ message: response.updated ? 'synced' : 'alreadySynced', orderNumber: response.orderNumber });
   };
   const badge = resource.status === 'live' ? (
@@ -71,7 +78,7 @@ export function BaseComConnectorCard() {
               autoComplete="off"
               required
               readOnly={busy}
-              onChange={(event) => { setValue(event.target.value); setResult(undefined); mutation.reset(); }}
+              onChange={(event) => { setValue(event.target.value.trim()); setResult(undefined); mutation.reset(); }}
             />
           </label>
           <div className="form-actions">
@@ -80,7 +87,8 @@ export function BaseComConnectorCard() {
           </div>
           <p className="form-hint">{resource.data.dispatchSyncConfigured ? text.shippedOnly : text.configureStatus}</p>
           {result && <p className="inline-banner" role="status">{text[result.message]} · <strong>{result.orderNumber}</strong></p>}
-          {mutation.status !== 'success' && <ActionStatus mutation={mutation} />}
+          {mutation.status === 'running' && <div role="status"><ActionStatus mutation={mutation} /></div>}
+          {mutation.status === 'error' && <div role="alert"><ActionStatus mutation={mutation} /></div>}
         </form>
       )}
     </Card>
@@ -93,6 +101,7 @@ const copy = {
     setup: 'API token Base.com se nastavuje na serveru WMS.', orderId: 'ID objednávky v Base.com',
     importOrder: 'Importovat objednávku', syncDispatch: 'Odeslat stav expedice',
     shippedOnly: 'Stav lze odeslat po dokončení expedice ve WMS.',
+    dispatchRejected: 'Zkontrolujte, že je objednávka odeslaná ve WMS a potvrzená v Base.com.',
     configureStatus: 'Pro odesílání expedice nastavte na serveru ID cílového stavu v Base.com.',
     imported: 'Objednávka importována do WMS', existing: 'Objednávka už je ve WMS',
     synced: 'Stav expedice odeslán do Base.com', alreadySynced: 'Base.com už má stav expedice',
@@ -102,6 +111,7 @@ const copy = {
     setup: 'Configure the Base.com API token on the WMS server.', orderId: 'Base.com order ID',
     importOrder: 'Import order', syncDispatch: 'Send dispatch status',
     shippedOnly: 'Send the status after dispatch is complete in WMS.',
+    dispatchRejected: 'Check that the order has shipped in WMS and is confirmed in Base.com.',
     configureStatus: 'Set the Base.com target status ID on the server to enable dispatch updates.',
     imported: 'Order imported into WMS', existing: 'Order already in WMS',
     synced: 'Dispatch status sent to Base.com', alreadySynced: 'Base.com already has the dispatch status',
@@ -111,6 +121,7 @@ const copy = {
     setup: 'Налаштуйте токен API Base.com на сервері WMS.', orderId: 'Ідентифікатор замовлення в Base.com',
     importOrder: 'Імпортувати замовлення', syncDispatch: 'Надіслати статус відправлення',
     shippedOnly: 'Надсилайте статус після завершення відправлення в WMS.',
+    dispatchRejected: 'Перевірте, чи замовлення відправлено у WMS і підтверджено в Base.com.',
     configureStatus: 'Для надсилання налаштуйте ідентифікатор цільового статусу Base.com на сервері.',
     imported: 'Замовлення імпортовано до WMS', existing: 'Замовлення вже є у WMS',
     synced: 'Статус відправлення надіслано до Base.com', alreadySynced: 'Base.com уже має статус відправлення',
