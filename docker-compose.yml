@@ -54,6 +54,7 @@ services:
       MFA_TOTP_ISSUER: Aardvarkland Storage System
       MFA_SECRET_ENCRYPTION_KEY: ${MFA_SECRET_ENCRYPTION_KEY:-local-mfa-secret-key-at-least-32chars}
       MFA_SECRET_ENCRYPTION_KEY_ID: storage-system-mfa-v1
+      PRIVILEGED_MFA_ENFORCEMENT: ${PRIVILEGED_MFA_ENFORCEMENT:-off}
       CORS_ALLOWED_ORIGINS: http://localhost:4000,http://127.0.0.1:4000
       ENABLE_SWAGGER: "false"
       ENABLE_DEMO_ROUTES: "false"
@@ -99,6 +100,7 @@ services:
       MFA_TOTP_ISSUER: Aardvarkland Storage System
       MFA_SECRET_ENCRYPTION_KEY: ${MFA_SECRET_ENCRYPTION_KEY:-local-mfa-secret-key-at-least-32chars}
       MFA_SECRET_ENCRYPTION_KEY_ID: storage-system-mfa-v1
+      PRIVILEGED_MFA_ENFORCEMENT: ${PRIVILEGED_MFA_ENFORCEMENT:-off}
       CORS_ALLOWED_ORIGINS: http://localhost:4000,http://127.0.0.1:4000
       ENABLE_SWAGGER: "false"
       ENABLE_DEMO_ROUTES: "false"

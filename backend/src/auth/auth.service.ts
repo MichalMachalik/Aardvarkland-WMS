@@ -3,6 +3,7 @@ import {
   ForbiddenException,
   Injectable,
   Logger,
+  NotFoundException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -46,6 +47,7 @@ interface RefreshSessionRow {
   family_id: string;
   status: string;
   expires_at: Date | string;
+  metadata: { mfaDisabledAtLogin?: boolean } | null;
 }
 
 interface CreatedRefreshSessionRow {
@@ -122,7 +124,8 @@ export class AuthService {
       throw new UnauthorizedException('Invalid credentials');
     }
 
-    const activeMfaSecret = await this.findActiveMfaSecret(user.id);
+    const mfaEnabled = this.isMfaEnabled();
+    const activeMfaSecret = mfaEnabled ? await this.findActiveMfaSecret(user.id) : null;
     if (activeMfaSecret) {
       if (!dto.mfaCode) {
         await this.writeSecurityAudit(user.id, 'auth.mfa_challenge_required', {
@@ -150,7 +153,7 @@ export class AuthService {
     }
 
     const authenticatedUser = this.usersService.toAuthenticatedUser(user);
-    const privilegedMfaRequired = requiresPrivilegedMfa(authenticatedUser);
+    const privilegedMfaRequired = mfaEnabled && requiresPrivilegedMfa(authenticatedUser);
     if (privilegedMfaRequired && !activeMfaSecret) {
       await this.writeSecurityAudit(user.id, 'auth.mfa_enrollment_required', {
         roleCodes: authenticatedUser.warehouses.flatMap((warehouse) => warehouse.roleCodes),
@@ -196,7 +199,7 @@ export class AuthService {
       if (users[0]?.status !== 'ACTIVE') return null;
       const rows = await client.$queryRawUnsafe<RefreshSessionRow[]>(
         `
-          SELECT id, user_id, family_id, status, expires_at
+          SELECT id, user_id, family_id, status, expires_at, metadata
           FROM refresh_token_sessions
           WHERE token_hash = $1
           FOR UPDATE
@@ -230,6 +233,15 @@ export class AuthService {
         return null;
       }
 
+      const mfaDisabledAtLogin = session.metadata?.mfaDisabledAtLogin === true;
+      if (this.isMfaEnabled() && mfaDisabledAtLogin) {
+        await client.$executeRawUnsafe(
+          `UPDATE refresh_token_sessions SET status = 'REVOKED', revoked_at = NOW(), updated_at = NOW() WHERE id = $1::uuid`,
+          session.id,
+        );
+        return null;
+      }
+
       const inserted = await client.$queryRawUnsafe<CreatedRefreshSessionRow[]>(
         `
           INSERT INTO refresh_token_sessions
@@ -244,7 +256,7 @@ export class AuthService {
         expiresAt,
         metadata.ipAddress ?? null,
         metadata.userAgent ?? null,
-        JSON.stringify({ rotatedFromSessionId: session.id }),
+        JSON.stringify({ rotatedFromSessionId: session.id, mfaDisabledAtLogin }),
       );
       const created = inserted[0];
       if (!created) {
@@ -318,7 +330,7 @@ export class AuthService {
   }
 
   async getMfaStatus(user: AuthenticatedUser): Promise<MfaStatusResponse> {
-    const row = await this.findActiveMfaSecret(user.id);
+    const row = this.isMfaEnabled() ? await this.findActiveMfaSecret(user.id) : null;
     return { enabled: Boolean(row), verifiedAt: row?.verified_at ? toDate(row.verified_at) : null };
   }
 
@@ -471,6 +483,7 @@ export class AuthService {
   }
 
   async startMfaSetup(user: AuthenticatedUser): Promise<MfaSetupResponse> {
+    this.assertMfaEnabled();
     const issuer = this.config.get('MFA_TOTP_ISSUER', { infer: true });
     const secret = generateTotpSecret();
     const encrypted = encryptMfaSecret(
@@ -509,6 +522,7 @@ export class AuthService {
   }
 
   async verifyMfaSetup(user: AuthenticatedUser, dto: VerifyMfaDto): Promise<MfaStatusResponse> {
+    this.assertMfaEnabled();
     const enabled = await this.prisma.$transaction(async (client) => {
       await lockPostgresRowById(client, 'users', user.id);
       const pending = await this.findPendingMfaSecret(client, user.id);
@@ -540,6 +554,7 @@ export class AuthService {
   }
 
   async disableMfa(user: AuthenticatedUser, dto: VerifyMfaDto): Promise<MfaStatusResponse> {
+    this.assertMfaEnabled();
     const secretId = await this.prisma.$transaction(async (client) => {
       await lockPostgresRowById(client, 'users', user.id);
       const active = await this.findActiveMfaSecret(user.id, client);
@@ -583,9 +598,13 @@ export class AuthService {
     }
 
     const authenticatedUser = this.usersService.toAuthenticatedUser(user);
-    const mfaRequired = requiresPrivilegedMfa(authenticatedUser);
-    const activeMfaSecret = Boolean(await this.findActiveMfaSecret(user.id));
+    const mfaEnabled = this.isMfaEnabled();
+    const mfaRequired = mfaEnabled && requiresPrivilegedMfa(authenticatedUser);
+    const activeMfaSecret = mfaEnabled && Boolean(await this.findActiveMfaSecret(user.id));
     const mfaSatisfied = Boolean(payload.mfaSatisfied && activeMfaSecret);
+    if (activeMfaSecret && !mfaSatisfied) {
+      throw new UnauthorizedException('Sign in again with an MFA code');
+    }
 
     return {
       user: authenticatedUser,
@@ -598,6 +617,14 @@ export class AuthService {
         tokenIssuedAt: payload.iat ? new Date(payload.iat * 1000).toISOString() : null,
       },
     };
+  }
+
+  private isMfaEnabled(): boolean {
+    return this.config.get('PRIVILEGED_MFA_ENFORCEMENT', { infer: true }) !== 'off';
+  }
+
+  private assertMfaEnabled(): void {
+    if (!this.isMfaEnabled()) throw new NotFoundException('MFA is disabled');
   }
 
   private getMfaEncryptionSecret(): string {
@@ -613,9 +640,10 @@ export class AuthService {
     const expiresIn = this.config.get('JWT_ACCESS_TOKEN_TTL_SECONDS', { infer: true });
     const refreshTtlSeconds = this.config.get('JWT_REFRESH_TOKEN_TTL_SECONDS', { infer: true });
     const sessionVersion = await this.getUserSessionVersion(user.id);
-    const activeMfaSecret = mfaOverride?.activeMfaSecret ?? Boolean(await this.findActiveMfaSecret(user.id));
-    const mfaSatisfied = mfaOverride?.mfaSatisfied ?? activeMfaSecret;
-    const mfaRequired = requiresPrivilegedMfa(user);
+    const mfaEnabled = this.isMfaEnabled();
+    const activeMfaSecret = mfaEnabled && (mfaOverride?.activeMfaSecret ?? Boolean(await this.findActiveMfaSecret(user.id)));
+    const mfaSatisfied = activeMfaSecret && (mfaOverride?.mfaSatisfied ?? true);
+    const mfaRequired = mfaEnabled && requiresPrivilegedMfa(user);
     const payload: AccessTokenPayload = {
       sub: user.id,
       email: user.email,
@@ -633,7 +661,7 @@ export class AuthService {
       header: { alg: 'HS256', kid: this.config.get('JWT_KEY_ID', { infer: true }) },
     });
 
-    const refresh = refreshOverride ?? await this.createRefreshSession(user, metadata, refreshTtlSeconds);
+    const refresh = refreshOverride ?? await this.createRefreshSession(user, metadata, refreshTtlSeconds, !mfaEnabled);
 
     return {
       accessToken,
@@ -652,6 +680,7 @@ export class AuthService {
     user: AuthenticatedUser,
     metadata: AuthRequestMetadata,
     ttlSeconds: number,
+    mfaDisabledAtLogin: boolean,
   ): Promise<{ refreshToken: string; refreshExpiresAt: Date }> {
     const refreshToken = generateRefreshToken();
     const expiresAt = new Date(Date.now() + ttlSeconds * 1000);
@@ -669,7 +698,7 @@ export class AuthService {
       expiresAt,
       metadata.ipAddress ?? null,
       metadata.userAgent ?? null,
-      JSON.stringify({ createdBy: 'login' }),
+      JSON.stringify({ createdBy: 'login', mfaDisabledAtLogin }),
     );
 
     const created = rows[0];

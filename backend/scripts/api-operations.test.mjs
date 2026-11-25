@@ -75,9 +75,11 @@ test('OpenAPI operations on a disposable PostgreSQL database', { timeout: 180000
     PRIVILEGED_MFA_ENFORCEMENT: 'warn',
   });
   const { createWmsApp } = await import('../dist/bootstrap.js');
+  const { ConfigService } = await import('@nestjs/config');
   const { PrismaService } = await import('../dist/database/prisma.service.js');
   const { QueueWorkerService } = await import('../dist/jobs/queue-worker.service.js');
   const app = await createWmsApp({ enableSwagger: false });
+  const config = app.get(ConfigService);
   suite.after(() => app.close());
   app.useLogger(['error', 'warn']);
   await app.listen(0, '127.0.0.1');
@@ -267,6 +269,7 @@ test('OpenAPI operations on a disposable PostgreSQL database', { timeout: 180000
     bind: boundRequest,
     request,
     login,
+    setMfaMode: mode => config.set('PRIVILEGED_MFA_ENFORCEMENT', mode),
     prisma: app.get(PrismaService),
     baseCom: { orders: baseComOrders, shippedStatus: baseComShippedStatus },
     carrierWebhookSecret,

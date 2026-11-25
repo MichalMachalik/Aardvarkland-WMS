@@ -99,7 +99,7 @@ export interface Env {
   MFA_SECRET_ENCRYPTION_KEY: string;
   MFA_SECRET_ENCRYPTION_KEY_ID: string;
   MFA_PREVIOUS_SECRET_ENCRYPTION_KEYS: SecretKeyMaterial[];
-  PRIVILEGED_MFA_ENFORCEMENT: 'warn' | 'block';
+  PRIVILEGED_MFA_ENFORCEMENT: 'off' | 'warn' | 'block';
   STRUCTURED_LOGS_ENABLED: boolean;
   OPERATIONAL_ALERT_DELIVERY_ENABLED: boolean;
   OPERATIONAL_ALERT_CHANNELS: string[];
@@ -520,19 +520,30 @@ export function validateEnv(config: Record<string, unknown>): Env {
     throw new Error('JWT_REFRESH_TOKEN_TTL_SECONDS must be an integer between 3600 and 31536000');
   }
 
+  const privilegedMfaEnforcement = readOptionalString(
+    config,
+    'PRIVILEGED_MFA_ENFORCEMENT',
+    nodeEnv === 'production' || nodeEnv === 'staging' ? 'block' : 'off',
+  ).trim().toLowerCase();
+  if (privilegedMfaEnforcement !== 'off' && privilegedMfaEnforcement !== 'warn' && privilegedMfaEnforcement !== 'block') {
+    throw new Error('PRIVILEGED_MFA_ENFORCEMENT must be off, warn, or block');
+  }
+
   const mfaTotpIssuer = readOptionalString(config, 'MFA_TOTP_ISSUER', 'Aardvarkland').trim();
   if (mfaTotpIssuer.length === 0 || mfaTotpIssuer.length > 120) {
     throw new Error('MFA_TOTP_ISSUER must be between 1 and 120 characters long');
   }
 
   const mfaSecretEncryptionKey = readNullableString(config, 'MFA_SECRET_ENCRYPTION_KEY') ?? (nodeEnv === 'production' ? '' : jwtSecret);
-  if (mfaSecretEncryptionKey.length < 32) {
-    throw new Error('MFA_SECRET_ENCRYPTION_KEY must be at least 32 characters long');
+  if (privilegedMfaEnforcement !== 'off') {
+    if (mfaSecretEncryptionKey.length < 32) {
+      throw new Error('MFA_SECRET_ENCRYPTION_KEY must be at least 32 characters long');
+    }
+    if (nodeEnv === 'production' && mfaSecretEncryptionKey === jwtSecret) {
+      throw new Error('MFA_SECRET_ENCRYPTION_KEY must be separate from JWT_SECRET in production');
+    }
+    assertNoProductionPlaceholder('MFA_SECRET_ENCRYPTION_KEY', mfaSecretEncryptionKey, nodeEnv);
   }
-  if (nodeEnv === 'production' && mfaSecretEncryptionKey === jwtSecret) {
-    throw new Error('MFA_SECRET_ENCRYPTION_KEY must be separate from JWT_SECRET in production');
-  }
-  assertNoProductionPlaceholder('MFA_SECRET_ENCRYPTION_KEY', mfaSecretEncryptionKey, nodeEnv);
 
   const mfaSecretEncryptionKeyId = readOptionalString(config, 'MFA_SECRET_ENCRYPTION_KEY_ID', 'mfa-default-v1').trim();
   if (mfaSecretEncryptionKeyId.length === 0 || mfaSecretEncryptionKeyId.length > 80) {
@@ -544,15 +555,6 @@ export function validateEnv(config: Record<string, unknown>): Env {
     'MFA_PREVIOUS_SECRET_ENCRYPTION_KEYS',
     nodeEnv,
   );
-
-  const privilegedMfaEnforcement = readOptionalString(
-    config,
-    'PRIVILEGED_MFA_ENFORCEMENT',
-    nodeEnv === 'production' || nodeEnv === 'staging' ? 'block' : 'warn',
-  ).toLowerCase();
-  if (privilegedMfaEnforcement !== 'warn' && privilegedMfaEnforcement !== 'block') {
-    throw new Error('PRIVILEGED_MFA_ENFORCEMENT must be warn or block');
-  }
 
   const structuredLogsEnabled = readOptionalBoolean(
     config,
@@ -741,7 +743,7 @@ export function validateEnv(config: Record<string, unknown>): Env {
     MFA_SECRET_ENCRYPTION_KEY: mfaSecretEncryptionKey,
     MFA_SECRET_ENCRYPTION_KEY_ID: mfaSecretEncryptionKeyId,
     MFA_PREVIOUS_SECRET_ENCRYPTION_KEYS: mfaPreviousSecretEncryptionKeys,
-    PRIVILEGED_MFA_ENFORCEMENT: privilegedMfaEnforcement as Env['PRIVILEGED_MFA_ENFORCEMENT'],
+    PRIVILEGED_MFA_ENFORCEMENT: privilegedMfaEnforcement,
     STRUCTURED_LOGS_ENABLED: structuredLogsEnabled,
     OPERATIONAL_ALERT_DELIVERY_ENABLED: operationalAlertDeliveryEnabled,
     OPERATIONAL_ALERT_CHANNELS: operationalAlertChannels,

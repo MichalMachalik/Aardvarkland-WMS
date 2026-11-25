@@ -15,7 +15,7 @@ function authenticatorCodeForFixture(secret) {
   return String((digest.readUInt32BE(offset) & 0x7fff_ffff) % 1_000_000).padStart(6, '0');
 }
 
-export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, bind, request, login, prisma, runQueueCycle, baseCom, carrierWebhookSecret }) {
+export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, bind, request, login, setMfaMode, prisma, runQueueCycle, baseCom, carrierWebhookSecret }) {
   const suffix = randomUUID().slice(0, 8).toUpperCase();
   const own = (method, path, ...args) => asAdmin(method, warehouse + path, ...args);
   let scenarios = 0;
@@ -68,6 +68,31 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.equal(enrolled.mfaSatisfied, true);
     const asEnrolled = bind(enrolled.accessToken);
     assert.deepEqual(await asEnrolled('GET', path), enabled);
+
+    let passwordSession;
+    setMfaMode('off');
+    try {
+      const passwordLogin = await login(email, password);
+      assert.equal(passwordLogin.mfaRequired, false);
+      assert.equal(passwordLogin.mfaSatisfied, false);
+      const asPassword = bind(passwordLogin.accessToken);
+      assert.equal((await asPassword('GET', '/api/auth/me')).email, email);
+      assert.deepEqual(await asPassword('GET', path), { enabled: false, verifiedAt: null });
+      await asPassword('POST', path + '/setup', undefined, 404);
+      const code = authenticatorCodeForFixture(setup.secret);
+      await asPassword('POST', path + '/verify', { code }, 404);
+      await asPassword('POST', path + '/disable', { code }, 404);
+      passwordSession = (await request('POST', '/api/auth/refresh', {
+        body: { refreshToken: passwordLogin.refreshToken }, expected: 201,
+      })).data;
+      assert.equal((await bind(passwordSession.accessToken)('GET', '/api/auth/me')).email, email);
+    } finally {
+      setMfaMode('warn');
+    }
+    await bind(passwordSession.accessToken)('GET', '/api/auth/me', undefined, 401);
+    await request('POST', '/api/auth/refresh', { body: { refreshToken: passwordSession.refreshToken }, expected: 401 });
+    assert.deepEqual(await asEnrolled('GET', path), enabled);
+
     await asEnrolled('POST', path + '/disable', { code: 'invalid' }, 400);
     const disabled = await asEnrolled('POST', path + '/disable', { code: authenticatorCodeForFixture(setup.secret) });
     assert.deepEqual(disabled, { enabled: false, verifiedAt: null });

@@ -85,7 +85,7 @@ test('environment defaults use backend runtime values', () => {
   assert.equal(env.AUTH_FAILED_LOGIN_BACKOFF_THRESHOLD, 5);
   assert.equal(env.AUTH_FAILED_LOGIN_BACKOFF_BASE_SECONDS, 30);
   assert.equal(env.AUTH_FAILED_LOGIN_BACKOFF_MAX_SECONDS, 900);
-  assert.equal(env.PRIVILEGED_MFA_ENFORCEMENT, 'warn');
+  assert.equal(env.PRIVILEGED_MFA_ENFORCEMENT, 'off');
   assert.equal(env.STRUCTURED_LOGS_ENABLED, false);
   assert.equal(env.OPERATIONAL_ALERT_DELIVERY_ENABLED, false);
   assert.deepEqual(env.OPERATIONAL_ALERT_CHANNELS, ['log']);
@@ -119,6 +119,20 @@ test('production environment rejects unsafe placeholders and wildcard outbound h
     }),
     /EXTERNAL_HTTP_ALLOWED_HOSTS cannot contain \* in production/,
   );
+});
+
+test('explicitly disabling MFA in production starts without an authenticator key', () => {
+  const input = {
+    NODE_ENV: 'production',
+    DATABASE_URL: 'postgresql://wms_app:fixture-db-password@db.internal:5432/aardvarkland_storage',
+    JWT_SECRET: 'fixture-jwt-secret-for-production-tests-42',
+    WEBHOOK_SHARED_SECRET: 'fixture-webhook-secret-for-production-tests-42',
+    CARRIER_CREDENTIAL_ENCRYPTION_KEY: 'fixture-carrier-key-for-production-tests-42',
+  };
+  assert.throws(() => validateEnv(input), /MFA_SECRET_ENCRYPTION_KEY must be at least 32 characters long/);
+  const off = validateEnv({ ...input, PRIVILEGED_MFA_ENFORCEMENT: 'off' });
+  assert.equal(off.PRIVILEGED_MFA_ENFORCEMENT, 'off');
+  assert.equal(off.MFA_SECRET_ENCRYPTION_KEY, '');
 });
 
 test('production environment rejects local and docker sample secrets', () => {

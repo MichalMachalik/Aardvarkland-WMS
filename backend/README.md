@@ -40,9 +40,10 @@ Production/staging runtime validates and uses these backend hardening settings:
   `auth_login_attempts` and temporarily locks repeated failures.
 - `JWT_KEY_ID`, `JWT_PREVIOUS_SECRETS`, `MFA_SECRET_ENCRYPTION_KEY_ID`, and
   `MFA_PREVIOUS_SECRET_ENCRYPTION_KEYS` support controlled key rotation.
-- `PRIVILEGED_MFA_ENFORCEMENT=block` makes privileged admin and warehouse lead
-  routes require an access token with satisfied MFA. Local development defaults
-  to `warn`.
+- Local development defaults to `PRIVILEGED_MFA_ENFORCEMENT=off`. Sign-in
+  uses the account password and enrollment endpoints are unavailable.
+  Production and staging default to `block` for privileged routes. Apply
+  the same setting to all backend instances when changing the mode.
 - `CARRIER_CREDENTIAL_ENCRYPTION_KEY_ID` and
   `CARRIER_CREDENTIAL_PREVIOUS_ENCRYPTION_KEYS` support carrier credential
   decryption during key rotation.
