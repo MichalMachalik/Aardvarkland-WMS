@@ -600,6 +600,40 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.equal(submittedCount.countedQuantity, 0);
   });
 
+  await scenario('scanner session completion and cancellation are mutually exclusive', async () => {
+    const session = await asWorker('POST', `${warehouse}/rf/sessions`, { workflow: 'MOVE' });
+    const path = `${warehouse}/rf/sessions/${session.sessionId}`;
+    assert.equal((await asWorker('POST', `${path}/resume`)).status, 'ACTIVE');
+    assert.equal((await asWorker('POST', `${path}/heartbeat`)).status, 'ACTIVE');
+    assert.equal((await asWorker('POST', `${path}/scan`, { scannedValue: 'COMPLETE' })).status, 'COMPLETED');
+    await asWorker('POST', `${path}/cancel`, { reason: 'Completed session' }, 409);
+    await asWorker('POST', `${path}/resume`, undefined, 409);
+    await asWorker('POST', `${path}/heartbeat`, undefined, 409);
+    assert.equal((await asWorker('GET', path)).status, 'COMPLETED');
+
+    const next = await asWorker('POST', `${warehouse}/rf/sessions`, { workflow: 'MOVE' });
+    const nextPath = `${warehouse}/rf/sessions/${next.sessionId}`;
+    const competing = await Promise.all([
+      asWorker('POST', `${nextPath}/scan`, { scannedValue: 'COMPLETE' }, [201, 409]),
+      asWorker('POST', `${nextPath}/cancel`, { reason: 'Stopped by operator' }, [201, 409]),
+    ]);
+    const terminal = competing.filter(result => ['COMPLETED', 'CANCELLED'].includes(result.status));
+    assert.equal(terminal.length, 1);
+    assert.equal((await asWorker('GET', nextPath)).status, terminal[0].status);
+
+    const stopped = await asWorker('POST', `${warehouse}/rf/sessions`, { workflow: 'MOVE' });
+    const stoppedPath = `${warehouse}/rf/sessions/${stopped.sessionId}`;
+    await asWorker('POST', `${stoppedPath}/cancel`, { reason: 'First cancellation' });
+    const replay = await asWorker('POST', `${stoppedPath}/cancel`, { reason: 'Later cancellation' });
+    assert.equal(replay.status, 'CANCELLED');
+    assert.equal(replay.metadata.cancelReason, 'First cancellation');
+    const persisted = await asWorker('GET', stoppedPath);
+    assert.equal(persisted.step.key, null);
+    assert.equal(await prisma.auditLog.count({
+      where: { resourceId: stopped.sessionId, action: 'rf.session_cancelled' },
+    }), 1);
+  });
+
   await scenario('fake print agents claim, finish and replay a job without touching hardware', async () => {
     const printerCode = `TEST-PRINTER-${suffix}`;
     const agentCode = `TEST-AGENT-${suffix}`;

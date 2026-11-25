@@ -115,23 +115,7 @@ export class RfWorkflowsService {
     warehouseReference: string,
     sessionReference: string,
   ): Promise<RfInstructionResponse> {
-    const warehouse = await this.resolveWarehouse(warehouseReference);
-    const session = await this.resolveSession(warehouse.id, sessionReference);
-
-    if (session.status !== ScannerSessionStatus.ACTIVE) {
-      throw new ConflictException('Only an active RF session can be resumed');
-    }
-
-    const updatedSession = await this.client.scannerSession.update({
-      where: { id: session.id },
-      data: { heartbeatAt: new Date() },
-    });
-    const task = updatedSession.taskId
-      ? await this.resolveTask(warehouse.id, updatedSession.taskId)
-      : null;
-    const step = await this.getOpenStep(updatedSession.id);
-
-    return this.toInstruction(updatedSession, task, step);
+    return this.refreshActiveSession(warehouseReference, sessionReference);
   }
 
   async cancelSession(
@@ -141,39 +125,35 @@ export class RfWorkflowsService {
     actor: AuthenticatedUser,
   ): Promise<RfInstructionResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
-    const session = await this.resolveSession(warehouse.id, sessionReference);
-    const updatedSession = await this.client.scannerSession.update({
-      where: { id: session.id },
-      data: {
-        status: ScannerSessionStatus.CANCELLED,
-        currentStepKey: null,
-        heartbeatAt: new Date(),
-        completedAt: new Date(),
-        metadata: mergeMetadata(session.metadata, {
-          cancelReason: dto.reason ?? null,
-          cancelledByUserId: actor.id,
-          cancelledAt: new Date().toISOString(),
-          ...(dto.metadata ?? {}),
-        }),
-      },
+    return this.transaction(async tx => {
+      const session = await this.lockSession(tx, warehouse.id, sessionReference);
+      const task = session.taskId ? await this.resolveTaskWithClient(tx, warehouse.id, session.taskId) : null;
+      if (session.status === ScannerSessionStatus.CANCELLED) return this.toInstruction(session, task, null);
+      if (session.status !== ScannerSessionStatus.ACTIVE) {
+        throw new ConflictException('Only an active RF session can be cancelled');
+      }
+
+      const cancelledAt = new Date();
+      const updatedSession = await tx.scannerSession.update({
+        where: { id: session.id },
+        data: {
+          status: ScannerSessionStatus.CANCELLED,
+          currentStepKey: null,
+          heartbeatAt: cancelledAt,
+          completedAt: cancelledAt,
+          metadata: mergeMetadata(session.metadata, {
+            ...(dto.metadata ?? {}),
+            cancelReason: dto.reason ?? null,
+            cancelledByUserId: actor.id,
+            cancelledAt: cancelledAt.toISOString(),
+          }),
+        },
+      });
+      await this.writeAudit(actor, warehouse.id, 'rf.session_cancelled', 'scanner_session', session.id, {
+        reason: dto.reason ?? null, taskId: task?.id ?? null,
+      }, tx);
+      return this.toInstruction(updatedSession, task, null);
     });
-    const task = updatedSession.taskId
-      ? await this.resolveTask(warehouse.id, updatedSession.taskId)
-      : null;
-
-    await this.writeAudit(
-      actor,
-      warehouse.id,
-      'rf.session_cancelled',
-      'scanner_session',
-      session.id,
-      {
-        reason: dto.reason ?? null,
-        taskId: task?.id ?? null,
-      },
-    );
-
-    return this.toInstruction(updatedSession, task, null);
   }
 
   async syncOfflineQueue(
@@ -367,7 +347,7 @@ export class RfWorkflowsService {
     const warehouse = await this.resolveWarehouse(warehouseReference);
     const session = await this.resolveSession(warehouse.id, sessionReference);
     const task = session.taskId ? await this.resolveTask(warehouse.id, session.taskId) : null;
-    const step = await this.getOpenStep(session.id);
+    const step = session.status === ScannerSessionStatus.ACTIVE ? await this.getOpenStep(session.id) : null;
 
     return this.toInstruction(session, task, step);
   }
@@ -376,18 +356,21 @@ export class RfWorkflowsService {
     warehouseReference: string,
     sessionReference: string,
   ): Promise<RfInstructionResponse> {
-    const warehouse = await this.resolveWarehouse(warehouseReference);
-    const session = await this.resolveSession(warehouse.id, sessionReference);
-    const updatedSession = await this.client.scannerSession.update({
-      where: { id: session.id },
-      data: { heartbeatAt: new Date() },
-    });
-    const task = updatedSession.taskId
-      ? await this.resolveTask(warehouse.id, updatedSession.taskId)
-      : null;
-    const step = await this.getOpenStep(updatedSession.id);
+    return this.refreshActiveSession(warehouseReference, sessionReference);
+  }
 
-    return this.toInstruction(updatedSession, task, step);
+  private async refreshActiveSession(warehouseReference: string, sessionReference: string): Promise<RfInstructionResponse> {
+    const warehouse = await this.resolveWarehouse(warehouseReference);
+    return this.transaction(async tx => {
+      const session = await this.lockSession(tx, warehouse.id, sessionReference);
+      if (session.status !== ScannerSessionStatus.ACTIVE) {
+        throw new ConflictException('RF session is not active');
+      }
+      const updated = await tx.scannerSession.update({ where: { id: session.id }, data: { heartbeatAt: new Date() } });
+      const task = session.taskId ? await this.resolveTaskWithClient(tx, warehouse.id, session.taskId) : null;
+      const step = await this.getOpenStepWithClient(tx, session.id);
+      return this.toInstruction(updated, task, step);
+    });
   }
 
   async scan(
@@ -409,9 +392,7 @@ export class RfWorkflowsService {
     actor: AuthenticatedUser,
     offlineStepKey?: string,
   ): Promise<RfInstructionResponse> {
-    const candidate = await this.resolveSessionWithClient(tx, warehouseId, sessionReference);
-    await lockPostgresRowById(tx, 'scanner_sessions', candidate.id);
-    const session = await this.resolveSessionWithClient(tx, warehouseId, candidate.id);
+    const session = await this.lockSession(tx, warehouseId, sessionReference);
     if (session.status !== ScannerSessionStatus.ACTIVE) {
       throw new ConflictException('RF session is not active');
     }
@@ -1233,6 +1214,7 @@ export class RfWorkflowsService {
     warehouseId: string,
     reference: string,
   ): Promise<ScannerSessionRecord> {
+    if (!isUuid(reference)) throw new NotFoundException('RF session was not found');
     const session = await tx.scannerSession.findFirst({
       where: { warehouseId, id: reference },
     });
@@ -1244,6 +1226,12 @@ export class RfWorkflowsService {
     return session;
   }
 
+  private async lockSession(tx: RfTransactionClient, warehouseId: string, reference: string): Promise<ScannerSessionRecord> {
+    const candidate = await this.resolveSessionWithClient(tx, warehouseId, reference);
+    await lockPostgresRowById(tx, 'scanner_sessions', candidate.id);
+    return this.resolveSessionWithClient(tx, warehouseId, candidate.id);
+  }
+
   private async writeAudit(
     actor: AuthenticatedUser,
     warehouseId: string,
@@ -1251,8 +1239,9 @@ export class RfWorkflowsService {
     resourceType: string,
     resourceId: string,
     metadata: Record<string, unknown>,
+    client: RfTransactionClient = this.client,
   ): Promise<void> {
-    await this.client.auditLog.create({
+    await client.auditLog.create({
       data: {
         actorUserId: actor.id,
         warehouseId,

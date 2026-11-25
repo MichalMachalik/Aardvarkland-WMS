@@ -7,6 +7,8 @@ import { AuthenticatedUser } from '../src/access-control/types';
 import { PrismaService } from '../src/database';
 import { RfWorkflowsService } from '../src/rf-workflows/rf-workflows.service';
 
+const sessionId = '10000000-0000-4000-8000-000000000001';
+
 interface WriteCall {
   where?: Record<string, unknown>;
   data?: Record<string, unknown>;
@@ -25,7 +27,7 @@ test('RF count completion submits the linked cycle-count task with counted varia
 
   const result = await service.scan(
     'MAIN',
-    'session-1',
+    sessionId,
     { scannedValue: '7', metadata: { deviceTime: '2026-05-22T10:00:00.000Z' } },
     actor(),
   );
@@ -67,7 +69,7 @@ test('RF count completion rejects a linked cycle-count task without a counted qu
   const { calls, service } = createRfCycleCountService();
 
   await assert.rejects(
-    () => service.scan('MAIN', 'session-1', { scannedValue: 'not-a-count' }, actor()),
+    () => service.scan('MAIN', sessionId, { scannedValue: 'not-a-count' }, actor()),
     (error) =>
       error instanceof ConflictException &&
       error.message === 'RF cycle count requires a counted quantity',
@@ -79,10 +81,11 @@ test('RF count completion rejects a linked cycle-count task without a counted qu
 
 test('an open blind count from an earlier version hides the stored RF quantity', async () => {
   const { service } = createRfCycleCountService(null);
-  const result = await service.getSession('MAIN', 'session-1');
+  const result = await service.getSession('MAIN', sessionId);
   assert.equal(result.task?.quantity, null);
   assert.deepEqual(result.step.expected, { type: 'QUANTITY', value: null });
   assert.doesNotMatch(result.step.instruction, /10/);
+  assert.deepEqual(result.remainingSteps.map(step => step.expected), [{ type: 'QUANTITY', value: null }]);
 });
 
 function createRfCycleCountService(taskQuantity: number | null = 10): {
@@ -98,7 +101,7 @@ function createRfCycleCountService(taskQuantity: number | null = 10): {
   };
   const warehouse = { id: 'warehouse-1', code: 'MAIN' };
   const session = {
-    id: 'session-1',
+    id: sessionId,
     warehouseId: warehouse.id,
     scannerDeviceId: null,
     userId: 'worker-1',

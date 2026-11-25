@@ -92,13 +92,12 @@ test('warehouse workflows on a disposable database', {
       orderNumber: `SO-TEST-${run}`, recipientName: 'Test recipient', carrier: 'EXPRESS_CARRIER',
       lines: [{ lineNumber: '1', sku, orderedQuantity: 2 }],
     });
-    const before = new Set((await own('/rf/queue?limit=100')).tasks.map(task => task.id));
     await own(`/outbound-orders/${order.id}/allocate`, {});
     const release = await own(`/outbound-orders/${order.id}/release-picking`, {});
     assert.equal(release.order.status, 'PICKING');
 
-    const queue = await own('/rf/queue?limit=100');
-    const picks = queue.tasks.filter(task => task.workflow === 'PICK' && !before.has(task.id));
+    const picks = (await own(`/tasks?type=PICK&sku=${encodeURIComponent(sku)}`))
+      .filter(task => task.outboundOrderId === order.id);
     assert.equal(picks.reduce((sum, task) => sum + task.quantity, 0), 2);
     for (const task of picks) {
       await own(`/tasks/${task.id}/confirm-pick`, { orderReference: order.id, lineReference: '1', quantity: task.quantity });
