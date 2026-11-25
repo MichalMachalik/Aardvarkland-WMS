@@ -239,6 +239,36 @@ test('phone navigation groups secondary pages and restores focus on Escape', asy
   expect(box.x + box.width).toBeLessThanOrEqual(321);
 });
 
+test('system search keeps keyboard focus in the dialog and opens a result on Enter', async ({ page }) => {
+  await login(page, roles.manager);
+  const previousControl = desktopNav(page).getByRole('button', { name: 'Přehled', exact: true });
+  await previousControl.focus();
+  const dialog = page.getByRole('dialog', { name: 'Vyhledávání v systému' });
+  const search = dialog.getByRole('textbox', { name: 'Hledat v systému' });
+
+  await page.keyboard.press('Control+k');
+  await expect(search).toBeFocused();
+  await previousControl.evaluate(element => element.focus());
+  await expect(search).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(dialog).toBeHidden();
+  await expect(previousControl).toBeFocused();
+
+  await page.setViewportSize({ width: 320, height: 590 });
+  await page.keyboard.press('Control+k');
+  await expect(search).toBeFocused();
+  const bounds = await dialog.boundingBox();
+  expect(bounds.x).toBeGreaterThanOrEqual(0);
+  expect(bounds.x + bounds.width).toBeLessThanOrEqual(320);
+  expect(bounds.y + bounds.height).toBeLessThanOrEqual(590);
+  await search.fill('nenalezeny-vysledek');
+  await expect(dialog.getByRole('status')).toBeVisible();
+  await search.fill('zasoby');
+  await search.press('Enter');
+  await expect(page).toHaveURL(/#\/inventory$/);
+  await expect(dialog).toBeHidden();
+});
+
 test('inventory distinguishes no matches and blocks invalid moves and unauthorized corrections', async ({ page }) => {
   await login(page, roles.worker);
   await desktopNav(page).getByRole('button', { name: 'Zásoby' }).click();

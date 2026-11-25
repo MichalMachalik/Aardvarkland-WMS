@@ -116,7 +116,6 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => void }) {
         event.preventDefault();
         setCommandOpen(true);
       }
-      if (event.key === 'Escape') setCommandOpen(false);
     };
 
     window.addEventListener('keydown', handler);
