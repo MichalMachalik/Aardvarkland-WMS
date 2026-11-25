@@ -112,6 +112,55 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.deepEqual(saved.lines.map(line => line.expectedQuantity), [4, 5]);
   });
 
+  await scenario('outbound picking waits for stock after an allocated line grows', async () => {
+    const { sku } = await createSku('SHORT');
+    const receipt = { skuReference: sku.code, locationReference: 'A-01-01', quantity: 2 };
+    await own('POST', '/inventory/quants/receive', receipt);
+    const order = await own('POST', '/outbound-orders', {
+      orderNumber: `SHORT-${suffix}`,
+      lines: [{ lineNumber: '10', sku: sku.code, orderedQuantity: 2 }],
+    });
+    const path = `/outbound-orders/${order.id}`;
+    const tasksForOrder = async () => (await own('GET', `/tasks?type=PICK&sku=${sku.code}`))
+      .filter(task => task.outboundOrderId === order.id);
+    const initial = await own('POST', `${path}/allocate`, {});
+    assert.equal(initial.lines[0].remainingQuantity, 0);
+    assert.deepEqual((await tasksForOrder()).map(task => task.quantity), [2]);
+
+    await own('PATCH', path, {
+      recipientName: 'Rolled-back update',
+      lines: [
+        { lineReference: '10', orderedQuantity: 5 },
+        { lineReference: 'missing', orderedQuantity: 2 },
+      ],
+    }, 404);
+    const unchanged = await own('GET', path);
+    assert.equal(unchanged.recipientName, null);
+    assert.equal(unchanged.lines[0].orderedQuantity, 2);
+
+    await own('PATCH', path, { lines: [{ lineReference: '10', orderedQuantity: 5 }] });
+    await own('POST', `${path}/allocate`, {}, 409);
+    await own('POST', `${path}/release-picking`, {}, 409);
+    assert.equal((await own('GET', path)).status, 'ALLOCATED');
+    assert.deepEqual((await tasksForOrder()).map(task => task.quantity), [2]);
+
+    await own('POST', '/inventory/quants/receive', { ...receipt, quantity: 3 });
+    const full = await own('POST', `${path}/allocate`, {});
+    assert.equal(full.lines[0].alreadyReservedQuantity, 2);
+    assert.equal(full.lines[0].allocatedQuantity, 3);
+    assert.equal(full.lines[0].remainingQuantity, 0);
+    const released = await own('POST', `${path}/release-picking`, {});
+    assert.equal(released.order.status, 'PICKING');
+    const tasks = await tasksForOrder();
+    assert.deepEqual(tasks.map(task => task.quantity).sort((a, b) => a - b), [2, 3]);
+    for (const task of tasks) {
+      await own('POST', `/tasks/${task.id}/confirm-pick`, { orderReference: order.id, quantity: task.quantity });
+    }
+    const picked = await own('GET', path);
+    assert.equal(picked.status, 'PICKED');
+    assert.equal(picked.lines[0].pickedQuantity, 5);
+  });
+
   await scenario('parcels, tracking, operational exceptions and notifications can be updated', async () => {
     const parcelBody = { trackingNumber: `PARCEL-${suffix}`, currentLocationReference: 'A-01-01' };
     const parcel = await own('POST', '/parcels', parcelBody);

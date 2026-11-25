@@ -53,6 +53,7 @@ export class FulfillmentService {
       const existingOpenPickTasks = await this.countOpenPickTasks(tx, warehouse.id, order.id);
       const owner = await this.resolveOrderOwner(tx, warehouse.id, order.id);
       this.assertActorCanAccessOwner(actor, owner, warehouse.id);
+      const reservationsByLine = await this.requireCompleteReservations(tx, warehouse.id, order);
       const updatedOrder = await this.updateOrderStatus(tx, order, FulfillmentStatus.PICKING, {
         releaseMetadata: dto.metadata,
         existingOpenPickTasks,
@@ -69,7 +70,7 @@ export class FulfillmentService {
       }
       const tasksCreated = existingOpenPickTasks > 0
         ? 0
-        : await this.createPickTasks(tx, warehouse.id, updatedOrder, dto, owner);
+        : await this.createPickTasks(tx, warehouse.id, updatedOrder, dto, owner, reservationsByLine);
 
       await this.writeAudit(tx, actor, warehouse.id, 'fulfillment.picking_released', updatedOrder, {
         tasksCreated,
@@ -489,12 +490,44 @@ export class FulfillmentService {
     return tasks.length;
   }
 
+  private async requireCompleteReservations(
+    client: FulfillmentTransactionClient,
+    warehouseId: string,
+    order: OutboundOrderWithLines,
+  ): Promise<Map<string, Reservation[]>> {
+    const reservations = await client.reservation?.findMany({
+      where: {
+        warehouseId,
+        outboundOrderLineId: { in: order.lines.map(line => line.id) },
+        status: 'ACTIVE',
+      },
+    }) ?? [];
+    const reservationsByLine = new Map<string, Reservation[]>();
+    for (const reservation of reservations) {
+      if (!reservation.outboundOrderLineId) continue;
+      const lineReservations = reservationsByLine.get(reservation.outboundOrderLineId);
+      if (lineReservations) lineReservations.push(reservation);
+      else reservationsByLine.set(reservation.outboundOrderLineId, [reservation]);
+    }
+    for (const line of order.lines) {
+      const remaining = line.orderedQuantity - line.pickedQuantity;
+      const reserved = (reservationsByLine.get(line.id) ?? []).reduce((sum, reservation) => sum + reservation.quantity, 0);
+      if (reserved !== remaining) {
+        throw new ConflictException(
+          `Outbound line ${line.lineNumber} needs ${remaining} units for picking and has ${reserved} reserved.`,
+        );
+      }
+    }
+    return reservationsByLine;
+  }
+
   private async createPickTasks(
     client: FulfillmentTransactionClient,
     warehouseId: string,
     order: OutboundOrderWithLines,
     dto: ReleasePickingDto,
     owner: OwnerClientRecord | null,
+    reservationsByLine: Map<string, Reservation[]>,
   ): Promise<number> {
     if (!client.warehouseTask) {
       return 0;
@@ -509,15 +542,7 @@ export class FulfillmentService {
         continue;
       }
 
-      const reservations = await this.findLineReservations(client, warehouseId, line.id);
-
-      if (reservations.length === 0) {
-        throw new ConflictException(
-          `Outbound line ${line.lineNumber} has no active reservation; allocate the order before releasing picking.`,
-        );
-      }
-
-      for (const reservation of reservations) {
+      for (const reservation of reservationsByLine.get(line.id) ?? []) {
         const stockQuant = await this.resolveStockQuant(client, reservation.stockQuantId);
         const created = await this.createPickTask(
           client,

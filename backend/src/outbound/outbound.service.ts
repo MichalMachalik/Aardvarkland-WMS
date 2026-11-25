@@ -3,7 +3,7 @@ import { ConflictException, Injectable, NotFoundException } from '@nestjs/common
 import { AuthenticatedUser } from '../access-control/types';
 import { normalizeOffsetPagination } from '../common';
 import { OwnerClientRecord, OwnerScopePrismaClient, OwnerScopeService } from '../clients/owner-scope.service';
-import { PrismaService } from '../database';
+import { lockPostgresRowById, PrismaService, withTransactionRetry } from '../database';
 import { Parcel, Prisma, Warehouse } from '../generated/prisma/client';
 import { CreateOutboundOrderDto } from './dto/create-outbound-order.dto';
 import { ListOutboundOrdersQueryDto } from './dto/list-outbound-orders-query.dto';
@@ -163,29 +163,33 @@ export class OutboundService {
     dto: UpdateOutboundOrderDto,
     actor: AuthenticatedUser,
   ): Promise<OutboundOrderResponse> {
-    const client = this.getClient();
-    const warehouse = await this.resolveWarehouse(warehouseReference);
-    const existingOrder = await this.resolveOrder(warehouse.id, orderReference);
     const data = this.toOrderUpdateInput(dto);
 
     try {
-      const order =
-        Object.keys(data).length === 0
-          ? existingOrder
-          : await client.outboundOrder.update({
-              where: { id: existingOrder.id },
-              data,
-              include: outboundOrderInclude,
-            });
+      return await withTransactionRetry(() => this.prisma.$transaction(async (transaction) => {
+        const client = this.getClient(transaction);
+        const warehouse = await this.resolveWarehouse(warehouseReference, client);
+        const candidate = await this.resolveOrder(warehouse.id, orderReference, client);
+        await lockPostgresRowById(transaction, 'outbound_orders', candidate.id);
+        const order = await this.resolveOrder(warehouse.id, orderReference, client);
 
-      for (const line of dto.lines ?? []) {
-        await this.updateLine(warehouse.id, order.id, line);
-      }
+        if (Object.keys(data).length > 0) {
+          await client.outboundOrder.update({
+            where: { id: order.id },
+            data,
+            include: outboundOrderInclude,
+          });
+        }
 
-      const refreshedOrder = await this.resolveOrder(warehouse.id, order.id);
-      await this.writeAudit(actor, warehouse.id, 'outbound_order.updated', refreshedOrder);
+        for (const line of dto.lines ?? []) {
+          await this.updateLine(warehouse.id, order.id, line, client);
+        }
 
-      return toOutboundOrderResponse(refreshedOrder);
+        const refreshedOrder = await this.resolveOrder(warehouse.id, order.id, client);
+        await this.writeAudit(actor, warehouse.id, 'outbound_order.updated', refreshedOrder, client);
+
+        return toOutboundOrderResponse(refreshedOrder);
+      }));
     } catch (error: unknown) {
       if (hasPrismaCode(error, 'P2002')) {
         throw new ConflictException('Outbound order number or line number already exists');
@@ -261,8 +265,9 @@ export class OutboundService {
   private async resolveLine(
     orderId: string,
     lineReference: string,
+    client: OutboundPrismaClient,
   ): Promise<OutboundOrderLineWithParcel> {
-    const line = await this.getClient().outboundOrderLine.findFirst({
+    const line = await client.outboundOrderLine.findFirst({
       where: lineReferenceWhere(orderId, lineReference),
       include: { parcel: true },
     });
@@ -300,13 +305,14 @@ export class OutboundService {
     warehouseId: string,
     orderId: string,
     dto: UpdateOutboundOrderLineDto,
+    client: OutboundPrismaClient,
   ): Promise<void> {
     if (!dto.lineReference) {
       throw new ConflictException('lineReference is required when updating outbound lines');
     }
 
-    const line = await this.resolveLine(orderId, dto.lineReference);
-    const parcelId = await this.resolveUpdateParcelId(warehouseId, dto);
+    const line = await this.resolveLine(orderId, dto.lineReference, client);
+    const parcelId = await this.resolveUpdateParcelId(warehouseId, dto, client);
     const data: Record<string, unknown> = {
       ...(dto.sku === undefined ? {} : { sku: dto.sku.trim() }),
       ...(dto.description === undefined
@@ -319,7 +325,7 @@ export class OutboundService {
     };
 
     if (Object.keys(data).length > 0) {
-      await this.getClient().outboundOrderLine.update({
+      await client.outboundOrderLine.update({
         where: { id: line.id },
         data,
         include: { parcel: true },
@@ -330,6 +336,7 @@ export class OutboundService {
   private async resolveUpdateParcelId(
     warehouseId: string,
     dto: UpdateOutboundOrderLineDto,
+    client: OutboundPrismaClient,
   ): Promise<string | null | undefined> {
     if (dto.parcelReference === undefined) {
       return undefined;
@@ -339,7 +346,7 @@ export class OutboundService {
       return null;
     }
 
-    return (await this.resolveParcel(warehouseId, dto.parcelReference)).id;
+    return (await this.resolveParcel(warehouseId, dto.parcelReference, client)).id;
   }
 
   private async writeAudit(
