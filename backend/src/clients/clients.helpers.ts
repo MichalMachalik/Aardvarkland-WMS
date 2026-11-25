@@ -54,7 +54,7 @@ export function normalizeBillingEventInput(
   warehouseId: string,
   currency: string,
   input: BillingEventInput,
-): Required<Omit<BillingEventInput, 'metadata'>> & { metadata: Record<string, unknown> | null } {
+): Required<BillingEventInput> & { reference: string } {
   const eventType = normalizeBillingEventType(input.eventType);
   const quantity = Math.max(0, Math.trunc(input.quantity ?? 1));
   const unitPriceMinor = Math.max(0, Math.trunc(input.unitPriceMinor ?? 0));
@@ -84,7 +84,7 @@ export function buildBillingEventsFromCounters(input: {
   currency: string;
   occurredAt?: string | Date | null;
   counters: BillingCounterInput[];
-}): Array<Required<Omit<BillingEventInput, 'metadata'>> & { metadata: Record<string, unknown> | null }> {
+}): Array<ReturnType<typeof normalizeBillingEventInput>> {
   const occurredAt = input.occurredAt ? new Date(input.occurredAt) : new Date();
   return input.counters
     .filter((counter) => Math.trunc(counter.quantity) > 0)

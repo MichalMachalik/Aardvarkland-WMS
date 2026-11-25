@@ -2,7 +2,9 @@ import { ConflictException, Injectable, NotFoundException } from '@nestjs/common
 
 import { AuthenticatedUser } from '../access-control/types';
 import { makePageEnvelope, normalizeOffsetPagination, PageEnvelope } from '../common';
-import { PrismaService, withTransactionRetry } from '../database';
+import {
+  lockPostgresAdvisoryTransaction, lockPostgresRowById, lockPostgresRowsById, PrismaService, withTransactionRetry,
+} from '../database';
 import { AttachClientWarehouseDto } from './dto/attach-client-warehouse.dto';
 import { ListBillingCreditNotesQueryDto } from './dto/list-billing-credit-notes-query.dto';
 import { FinalizeBillingCreditNoteDto } from './dto/finalize-billing-credit-note.dto';
@@ -380,53 +382,26 @@ export class ClientsService {
     const warehouse = await this.resolveWarehouse(warehouseReference);
     const client = await this.resolveClient(clientReference);
     const normalized = normalizeBillingEventInput(client.code, warehouse.id, client.billingCurrency, dto);
-    const event = await this.client.billingEvent.upsert({
-      where: { clientId_reference: { clientId: client.id, reference: normalized.reference } },
-      update: {
-        eventType: normalized.eventType,
-        status: dto.status ?? BillingEventStatus.PENDING,
-        resourceType: normalized.resourceType,
-        resourceId: normalized.resourceId,
-        description: normalized.description,
-        quantity: normalized.quantity,
-        unitPriceMinor: normalized.unitPriceMinor,
-        amountMinor: normalized.amountMinor,
-        currency: normalized.currency,
-        occurredAt: normalized.occurredAt,
-        metadata: normalized.metadata,
-      },
-      create: {
-        clientId: client.id,
-        warehouseId: warehouse.id,
-        eventType: normalized.eventType,
-        status: dto.status ?? BillingEventStatus.PENDING,
-        reference: normalized.reference,
-        resourceType: normalized.resourceType,
-        resourceId: normalized.resourceId,
-        description: normalized.description,
-        quantity: normalized.quantity,
-        unitPriceMinor: normalized.unitPriceMinor,
-        amountMinor: normalized.amountMinor,
-        currency: normalized.currency,
-        occurredAt: normalized.occurredAt,
-        metadata: normalized.metadata,
-      },
+    const { reference, ...eventData } = normalized;
+    const data = { ...eventData, status: dto.status ?? BillingEventStatus.PENDING };
+    return this.transaction(async (tx) => {
+      const existing = await this.findBillingEventForWrite(tx, warehouse.id, client.id, reference);
+      if (existing && this.billingEventHasInvoice(existing)) {
+        throw new ConflictException('Billing events assigned to an invoice cannot be changed separately.');
+      }
+      const event = await tx.billingEvent.upsert({
+        where: { clientId_reference: { clientId: client.id, reference } },
+        update: data,
+        create: { ...data, clientId: client.id, warehouseId: warehouse.id, reference },
+      });
+      await this.writeAudit(actor.id, warehouse.id, 'billing.event_upserted', 'billing_event', event.id, {
+        clientCode: client.code, eventType: event.eventType, reference: event.reference, amountMinor: event.amountMinor,
+      }, tx);
+      await this.writeOutbox('BILLING_EVENT_UPSERTED', 'billing_event', event.id, {
+        warehouseId: warehouse.id, clientId: client.id, reference: event.reference, eventType: event.eventType, amountMinor: event.amountMinor,
+      }, tx);
+      return toBillingEventResponse(event);
     });
-
-    await this.writeAudit(actor.id, warehouse.id, 'billing.event_upserted', 'billing_event', event.id, {
-      clientCode: client.code,
-      eventType: event.eventType,
-      reference: event.reference,
-      amountMinor: event.amountMinor,
-    });
-    await this.writeOutbox('BILLING_EVENT_UPSERTED', 'billing_event', event.id, {
-      warehouseId: warehouse.id,
-      clientId: client.id,
-      reference: event.reference,
-      eventType: event.eventType,
-      amountMinor: event.amountMinor,
-    });
-    return toBillingEventResponse(event);
   }
 
   async generateBillingEvents(
@@ -474,6 +449,11 @@ export class ClientsService {
     const events = await this.transaction(async (tx) => {
       const created: BillingEventRecord[] = [];
       for (const normalized of normalizedEvents) {
+        const existing = await this.findBillingEventForWrite(tx, warehouse.id, client.id, normalized.reference);
+        if (existing && this.billingEventHasInvoice(existing)) {
+          created.push(existing);
+          continue;
+        }
         const event = await tx.billingEvent.upsert({
           where: { clientId_reference: { clientId: client.id, reference: normalized.reference } },
           update: {
@@ -545,30 +525,34 @@ export class ClientsService {
     actor: AuthenticatedUser,
   ): Promise<BillingEventResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
-    const event = await this.client.billingEvent.findFirst({
-      where: { warehouseId: warehouse.id, OR: [{ id: eventReference }, { reference: eventReference }] },
+    return this.transaction(async (tx) => {
+      const candidate = await tx.billingEvent.findFirst({
+        where: isUuid(eventReference)
+          ? { warehouseId: warehouse.id, OR: [{ id: eventReference }, { reference: eventReference }] }
+          : { warehouseId: warehouse.id, reference: eventReference },
+      });
+      if (!candidate) throw new NotFoundException('Billing event was not found.');
+      const event = await this.lockBillingEvent(tx, candidate.id);
+      if (event.status === BillingEventStatus.VOIDED) return toBillingEventResponse(event);
+      if (this.billingEventHasInvoice(event)) {
+        throw new ConflictException('Billing events assigned to an invoice cannot be voided separately.');
+      }
+      const updated = await tx.billingEvent.update({
+        where: { id: event.id },
+        data: {
+          status: BillingEventStatus.VOIDED,
+          voidedAt: new Date(),
+          metadata: { ...toRecord(event.metadata), voidReason: dto.reason ?? null, voidMetadata: dto.metadata ?? null },
+        },
+      });
+      await this.writeAudit(actor.id, warehouse.id, 'billing.event_voided', 'billing_event', event.id, {
+        reason: dto.reason ?? null, reference: event.reference,
+      }, tx);
+      await this.writeOutbox('BILLING_EVENT_VOIDED', 'billing_event', event.id, {
+        warehouseId: warehouse.id, clientId: event.clientId, reference: event.reference,
+      }, tx);
+      return toBillingEventResponse(updated);
     });
-    if (!event) throw new NotFoundException('Billing event was not found.');
-    if (event.status === BillingEventStatus.INVOICED) throw new ConflictException('Invoiced billing events cannot be voided.');
-
-    const updated = await this.client.billingEvent.update({
-      where: { id: event.id },
-      data: {
-        status: BillingEventStatus.VOIDED,
-        voidedAt: new Date(),
-        metadata: { ...toRecord(event.metadata), voidReason: dto.reason ?? null, voidMetadata: dto.metadata ?? null },
-      },
-    });
-    await this.writeAudit(actor.id, warehouse.id, 'billing.event_voided', 'billing_event', event.id, {
-      reason: dto.reason ?? null,
-      reference: event.reference,
-    });
-    await this.writeOutbox('BILLING_EVENT_VOIDED', 'billing_event', event.id, {
-      warehouseId: warehouse.id,
-      clientId: event.clientId,
-      reference: event.reference,
-    });
-    return toBillingEventResponse(updated);
   }
 
   async listResourceLinks(
@@ -702,6 +686,11 @@ export class ClientsService {
     const events = await this.transaction(async (tx) => {
       const created: BillingEventRecord[] = [];
       for (const draft of drafts) {
+        const existing = await this.findBillingEventForWrite(tx, warehouse.id, client.id, draft.reference);
+        if (existing && this.billingEventHasInvoice(existing)) {
+          created.push(existing);
+          continue;
+        }
         const event = await tx.billingEvent.upsert({
           where: { clientId_reference: { clientId: client.id, reference: draft.reference } },
           update: {
@@ -797,23 +786,26 @@ export class ClientsService {
     const client = await this.resolveClient(clientReference);
     const period = normalizeBillingPeriod({ periodStart: dto.periodStart, periodEnd: dto.periodEnd });
     const eventStatuses = invoiceEventStatusFilter(dto.eventStatuses);
-    const events = await this.client.billingEvent.findMany({
-      where: {
-        warehouseId: warehouse.id,
-        clientId: client.id,
-        status: { in: eventStatuses },
-        occurredAt: { gte: period.periodStart, lt: period.periodEnd },
-        invoiceLine: null,
-      },
-      orderBy: [{ occurredAt: 'asc' }, { reference: 'asc' }],
-    });
-    if (events.length === 0) throw new ConflictException('No billable events were found for this invoice period.');
-
-    const lines = buildInvoiceLines(events.map((event) => ({ ...event, vatRateBps: dto.vatRateBps ?? null })));
-    const summary = summarizeInvoiceLines(lines);
+    const eligibleEvents = {
+      warehouseId: warehouse.id,
+      clientId: client.id,
+      status: { in: eventStatuses },
+      occurredAt: { gte: period.periodStart, lt: period.periodEnd },
+      invoiceLine: null,
+    };
     const requestedInvoiceNumber = dto.invoiceNumber?.trim().toUpperCase() || null;
     const now = new Date();
     const invoice = await this.transaction(async (tx) => {
+      const candidates = await tx.billingEvent.findMany({ where: eligibleEvents, select: { id: true } });
+      const eventIds = candidates.map(event => event.id);
+      await lockPostgresRowsById(tx, 'billing_events', eventIds);
+      const events = await tx.billingEvent.findMany({
+        where: { ...eligibleEvents, id: { in: eventIds } },
+        orderBy: [{ occurredAt: 'asc' }, { reference: 'asc' }],
+      });
+      if (!events.length) throw new ConflictException('No billable events were found for this invoice period.');
+      const lines = buildInvoiceLines(events.map(event => ({ ...event, vatRateBps: dto.vatRateBps ?? null })));
+      const summary = summarizeInvoiceLines(lines);
       const invoiceNumber = requestedInvoiceNumber ?? (await this.allocateInvoiceNumber(tx, warehouse.id, client.id, client.code, period.periodStart));
       const created = await tx.billingInvoice.create({
         data: {
@@ -899,12 +891,11 @@ export class ClientsService {
   ): Promise<BillingInvoiceResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
     const client = await this.resolveClient(clientReference);
-    const invoice = await this.resolveInvoice(warehouse.id, client.id, invoiceReference);
-    if (invoice.status !== BillingInvoiceStatus.DRAFT) throw new ConflictException('Only draft invoices can be finalized.');
-    const voidPlan = buildInvoiceVoidReinvoicePlan(invoice.lines ?? []);
-    const eventIds = voidPlan.billingEventIds;
-    const now = new Date();
     const updated = await this.transaction(async (tx) => {
+      const invoice = await this.lockInvoice(tx, warehouse.id, client.id, invoiceReference);
+      if (invoice.status !== BillingInvoiceStatus.DRAFT) throw new ConflictException('Only draft invoices can be finalized.');
+      const eventIds = buildInvoiceVoidReinvoicePlan(invoice.lines ?? []).billingEventIds;
+      const now = new Date();
       const result = await tx.billingInvoice.update({
         where: { id: invoice.id },
         data: { status: BillingInvoiceStatus.FINALIZED, finalizedAt: now, metadata: mergeMetadata(invoice.metadata, dto.metadata ?? {}) },
@@ -929,12 +920,11 @@ export class ClientsService {
   ): Promise<BillingInvoiceResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
     const client = await this.resolveClient(clientReference);
-    const invoice = await this.resolveInvoice(warehouse.id, client.id, invoiceReference);
-    if (invoice.status === BillingInvoiceStatus.VOIDED) return toBillingInvoiceResponse(invoice);
-    const voidPlan = buildInvoiceVoidReinvoicePlan(invoice.lines ?? []);
-    const eventIds = voidPlan.billingEventIds;
-    const now = new Date();
     const updated = await this.transaction(async (tx) => {
+      const invoice = await this.lockInvoice(tx, warehouse.id, client.id, invoiceReference);
+      if (invoice.status === BillingInvoiceStatus.VOIDED) return invoice;
+      const eventIds = buildInvoiceVoidReinvoicePlan(invoice.lines ?? []).billingEventIds;
+      const now = new Date();
       if (eventIds.length) {
         await tx.billingEvent.updateMany({
           where: { id: { in: eventIds }, status: BillingEventStatus.INVOICED },
@@ -1297,8 +1287,9 @@ export class ClientsService {
     warehouseId: string,
     clientId: string,
     reference: string,
+    client: ClientsTransactionClient = this.client,
   ): Promise<BillingInvoiceRecord & { lines?: BillingInvoiceLineRecord[]; _count?: { lines: number } }> {
-    const invoice = await this.client.billingInvoice.findFirst({
+    const invoice = await client.billingInvoice.findFirst({
       where: isUuid(reference)
         ? { warehouseId, clientId, OR: [{ id: reference }, { invoiceNumber: reference.trim().toUpperCase() }] }
         : { warehouseId, clientId, invoiceNumber: reference.trim().toUpperCase() },
@@ -1306,6 +1297,41 @@ export class ClientsService {
     });
     if (!invoice) throw new NotFoundException('Billing invoice was not found.');
     return invoice;
+  }
+
+  private async lockInvoice(tx: ClientsTransactionClient, warehouseId: string, clientId: string, reference: string) {
+    const candidate = await this.resolveInvoice(warehouseId, clientId, reference, tx);
+    await lockPostgresRowById(tx, 'billing_invoices', candidate.id);
+    return this.resolveInvoice(warehouseId, clientId, candidate.id, tx);
+  }
+
+  private async lockBillingEvent(tx: ClientsTransactionClient, id: string): Promise<BillingEventRecord> {
+    await lockPostgresRowById(tx, 'billing_events', id);
+    const event = await tx.billingEvent.findFirst({
+      where: { id },
+      include: { invoiceLine: { select: { id: true } } },
+    });
+    if (!event) throw new NotFoundException('Billing event was not found.');
+    return event;
+  }
+
+  private async findBillingEventForWrite(
+    tx: ClientsTransactionClient,
+    warehouseId: string,
+    clientId: string,
+    reference: string,
+  ): Promise<BillingEventRecord | null> {
+    await lockPostgresAdvisoryTransaction(tx, 'idempotency_key', `billing-event:${clientId}:${reference}`);
+    const candidate = await tx.billingEvent.findFirst({ where: { clientId, reference } });
+    if (!candidate) return null;
+    if (candidate.warehouseId !== warehouseId) {
+      throw new ConflictException('This billing event reference is already used in another warehouse.');
+    }
+    return this.lockBillingEvent(tx, candidate.id);
+  }
+
+  private billingEventHasInvoice(event: BillingEventRecord): boolean {
+    return Boolean(event.invoiceLine) || event.status === BillingEventStatus.INVOICED;
   }
 
   private async resolveCreditNote(
@@ -1380,12 +1406,13 @@ export class ClientsService {
     resourceType: string,
     resourceId: string | null,
     metadata: Record<string, unknown>,
+    client: ClientsTransactionClient = this.client,
   ): Promise<void> {
-    await this.client.auditLog.create({ data: { actorUserId, warehouseId, action, resourceType, resourceId, metadata } });
+    await client.auditLog.create({ data: { actorUserId, warehouseId, action, resourceType, resourceId, metadata } });
   }
 
-  private async writeOutbox(type: string, aggregateType: string, aggregateId: string, payload: Record<string, unknown>): Promise<void> {
-    await this.client.outboxEvent.create({ data: { type, aggregateType, aggregateId, payload, status: 'PENDING', availableAt: new Date() } });
+  private async writeOutbox(type: string, aggregateType: string, aggregateId: string, payload: Record<string, unknown>, client: ClientsTransactionClient = this.client): Promise<void> {
+    await client.outboxEvent.create({ data: { type, aggregateType, aggregateId, payload, status: 'PENDING', availableAt: new Date() } });
   }
 
   private transaction<T>(fn: (client: ClientsTransactionClient) => Promise<T>): Promise<T> {
@@ -1666,7 +1693,7 @@ interface ClientResourceLinkRecord { id: string; clientId: string; warehouseId: 
 interface ClientRateCardRecord { id: string; clientId: string; warehouseId: string; name: string; currency: string; validFrom: Date; validTo: Date | null; isActive: boolean; metadata: unknown; createdAt: Date; updatedAt: Date }
 interface ClientRateRecord { id: string; rateCardId: string; eventType: string; unit: string; unitPriceMinor: number; minChargeMinor: number | null; vatRateBps: number | null; metadata: unknown }
 interface UserClientAccessRecord { id: string; userId: string; clientId: string; warehouseId: string | null; isActive: boolean; metadata: unknown }
-interface BillingEventRecord { id: string; clientId: string; warehouseId: string; eventType: string; status: string; reference: string; resourceType: string | null; resourceId: string | null; description: string | null; quantity: number; unitPriceMinor: number; amountMinor: number; currency: string; occurredAt: Date; invoicedAt: Date | null; voidedAt: Date | null; metadata: unknown }
+interface BillingEventRecord { id: string; clientId: string; warehouseId: string; eventType: string; status: string; reference: string; resourceType: string | null; resourceId: string | null; description: string | null; quantity: number; unitPriceMinor: number; amountMinor: number; currency: string; occurredAt: Date; invoicedAt: Date | null; voidedAt: Date | null; metadata: unknown; invoiceLine?: { id: string } | null }
 
 interface StockQuantBillingRecord { id: string; warehouseId: string; skuId: string; quantity: number; createdAt: Date; sku?: { code: string } | null; location?: { code: string } | null }
 interface BillingInvoiceRecord { id: string; clientId: string; warehouseId: string; invoiceNumber: string; status: string; periodStart: Date; periodEnd: Date; currency: string; subtotalMinor?: number; taxTotalMinor?: number; totalAmountMinor: number; finalizedAt: Date | null; voidedAt: Date | null; metadata: unknown; createdAt: Date; updatedAt: Date }

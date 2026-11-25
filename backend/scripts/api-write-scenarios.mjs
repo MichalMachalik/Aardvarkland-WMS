@@ -290,6 +290,81 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
 
   });
 
+  await scenario('billing invoices protect their events and finalize once across concurrent requests', async () => {
+    const client = await asAdmin('POST', '/api/clients', {
+      code: `BILL-${suffix}`, name: 'Billing test client', billingCurrency: 'EUR',
+    });
+    const path = `/clients/${client.code}`;
+    await own('POST', `${path}/attach`, {});
+    const eventBody = {
+      eventType: 'PICK', status: 'BILLABLE', reference: `TEST-FEE-${suffix}`,
+      quantity: 2, unitPriceMinor: 1200, occurredAt: '2026-10-10T12:00:00.000Z',
+    };
+    const event = await own('POST', `${path}/billing-events`, eventBody);
+    assert.equal(event.amountMinor, 2400);
+    const period = { periodStart: '2026-10-01T00:00:00.000Z', periodEnd: '2026-11-01T00:00:00.000Z', vatRateBps: 2100 };
+    const invoice = await own('POST', `${path}/billing-invoices`, period);
+    assert.equal(invoice.status, 'DRAFT');
+    assert.equal(invoice.subtotalMinor, 2400);
+    assert.equal(invoice.taxTotalMinor, 504);
+    assert.equal(invoice.totalAmountMinor, 2904);
+    assert.equal(invoice.lines[0].billingEventId, event.id);
+    const invoicePath = `${path}/billing-invoices/${invoice.id}`;
+    const ledger = () => prisma.billingEvent.findUniqueOrThrow({ where: { id: event.id } });
+    await own('POST', `/billing-events/${event.id}/void`, { reason: 'Invoice event cannot be voided separately' }, 409);
+    await own('POST', `${path}/billing-events`, { ...eventBody, quantity: 3 }, 409);
+    assert.equal((await ledger()).status, 'BILLABLE');
+    assert.equal((await ledger()).amountMinor, 2400);
+
+    const finalizations = await Promise.all([
+      own('POST', `${invoicePath}/finalize`, {}, [201, 409]),
+      own('POST', `${invoicePath}/finalize`, {}, [201, 409]),
+    ]);
+    assert.equal(finalizations.filter(item => item.status === 'FINALIZED').length, 1);
+    assert.equal((await ledger()).status, 'INVOICED');
+    assert.equal(await prisma.outboxEvent.count({
+      where: { aggregateId: invoice.id, type: 'BILLING_INVOICE_FINALIZED' },
+    }), 1);
+    await own('POST', `${path}/billing-invoices`, period, 409);
+
+    await Promise.all([
+      own('POST', `${invoicePath}/void`, { reason: 'Test correction' }),
+      own('POST', `${invoicePath}/void`, { reason: 'Same correction' }),
+    ]);
+    assert.equal(await prisma.outboxEvent.count({
+      where: { aggregateId: invoice.id, type: 'BILLING_INVOICE_VOIDED' },
+    }), 1);
+    assert.equal((await ledger()).status, 'BILLABLE');
+    assert.equal((await ledger()).invoicedAt, null);
+    const replacements = await Promise.all([
+      own('POST', `${path}/billing-invoices`, period, [201, 409]),
+      own('POST', `${path}/billing-invoices`, period, [201, 409]),
+    ]);
+    const drafts = replacements.filter(item => item.status === 'DRAFT');
+    assert.equal(drafts.length, 1);
+    const [replacement] = drafts;
+    assert.notEqual(replacement.id, invoice.id);
+    assert.equal(replacement.lines[0].billingEventId, event.id);
+    assert.equal(replacement.totalAmountMinor, 2904);
+
+    const unbilled = await own('POST', `${path}/billing-events`, { ...eventBody, reference: `PENDING-${suffix}`, status: 'PENDING' });
+    const voided = await own('POST', `/billing-events/${unbilled.reference}/void`, { reason: 'Unbilled fixture' });
+    assert.equal(voided.status, 'VOIDED');
+
+    const counters = [{ eventType: 'PACK', quantity: 2, unitPriceMinor: 350, referenceSuffix: `COUNT-${suffix}` }];
+    const generate = `${path}/billing-events/generate`;
+    const generatedBody = { counters, occurredAt: '2026-09-04T10:00:00.000Z' };
+    const generated = await own('POST', generate, generatedBody);
+    assert.equal(generated.events[0].amountMinor, 700);
+    await own('POST', `${path}/billing-invoices`, {
+      periodStart: '2026-09-01T00:00:00.000Z', periodEnd: '2026-10-01T00:00:00.000Z', eventStatuses: ['PENDING'],
+    });
+    const repeat = await own('POST', generate, { ...generatedBody, counters: [{ ...counters[0], quantity: 6 }] });
+    assert.equal(repeat.events[0].id, generated.events[0].id);
+    assert.equal(repeat.events[0].amountMinor, 700);
+    assert.equal((await prisma.billingEvent.findUniqueOrThrow({ where: { id: generated.events[0].id } })).quantity, 2);
+  });
+
   await scenario('parcels, tracking, operational exceptions and notifications can be updated', async () => {
     const parcelBody = { trackingNumber: `PARCEL-${suffix}`, currentLocationReference: 'A-01-01' };
     const parcel = await own('POST', '/parcels', parcelBody);
