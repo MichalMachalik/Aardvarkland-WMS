@@ -9,6 +9,7 @@ import { ResourceFreshness } from '../../components/ui/ResourceFreshness';
 import { useApiResource } from '../../core/api/useApiResource';
 import { getControlTower } from '../../core/api/wms';
 import { useWorkspace, type Language } from '../../core/workspace/workspace';
+import { asArray as array, asRecord as record, nonBlankText as nullableString, textOr as stringValue } from '../../core/api/response-values';
 
 interface StatusCount {
   key: string;
@@ -510,22 +511,6 @@ function formatMinutes(value: number, text: typeof czech): string {
 
 function localeFor(language?: Language): string {
   return languageLocale(language ?? 'cs');
-}
-
-function record(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
-}
-
-function array(value: unknown): unknown[] {
-  return Array.isArray(value) ? value : [];
-}
-
-function stringValue(value: unknown, fallback: string): string {
-  return typeof value === 'string' && value.trim() ? value : fallback;
-}
-
-function nullableString(value: unknown): string | null {
-  return typeof value === 'string' && value.trim() ? value : null;
 }
 
 function numberValue(value: unknown): number {

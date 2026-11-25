@@ -7,6 +7,7 @@ import { useApiResource } from '../../core/api/useApiResource';
 import { getOpsIntegrationCommandCenter } from '../../core/api/wms';
 import { useWorkspace, type Language } from '../../core/workspace/workspace';
 import { BaseComConnectorCard } from '../integrations/BaseComConnectorCard';
+import { asArray as array, asRecord as record, nonBlankText as nullableString, textOr as stringValue } from '../../core/api/response-values';
 
 interface IntegrationConnector {
   code: string;
@@ -156,22 +157,6 @@ function healthLabel(value: string, language: Language) {
 function stateLabel(value: string, language: Language) {
   const labels = pickLanguage(language, { cs: czechState, en: englishState, ua: ukrainianState });
   return labels[value] ?? value;
-}
-
-function record(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
-}
-
-function array(value: unknown): unknown[] {
-  return Array.isArray(value) ? value : [];
-}
-
-function stringValue(value: unknown, fallback: string): string {
-  return typeof value === 'string' && value.trim() ? value : fallback;
-}
-
-function nullableString(value: unknown): string | null {
-  return typeof value === 'string' && value.trim() ? value : null;
 }
 
 function numberValue(value: unknown): number {

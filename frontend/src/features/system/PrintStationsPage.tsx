@@ -22,6 +22,7 @@ import {
   upsertPrinter,
 } from '../../core/api/wms';
 import { useWorkspace, type Language } from '../../core/workspace/workspace';
+import { asArray as array, asRecord as record, finiteNumber as numberValue, nonBlankText as nullableString, textOr as stringValue } from '../../core/api/response-values';
 
 interface PrinterRow {
   id: string;
@@ -642,26 +643,6 @@ function mapJob(value: unknown): JobRow {
     errorMessage: nullableString(row['errorMessage']),
     createdAt: stringValue(row['createdAt'], ''),
   };
-}
-
-function record(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
-}
-
-function array(value: unknown): unknown[] {
-  return Array.isArray(value) ? value : [];
-}
-
-function stringValue(value: unknown, fallback: string): string {
-  return typeof value === 'string' && value.trim() ? value : fallback;
-}
-
-function nullableString(value: unknown): string | null {
-  return typeof value === 'string' && value.trim() ? value : null;
-}
-
-function numberValue(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
 function readPrinterCodes(row: Record<string, unknown>): string[] {

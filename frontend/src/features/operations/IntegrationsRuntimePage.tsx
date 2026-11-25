@@ -15,6 +15,7 @@ import {
   testOpsPrintLabel,
 } from '../../core/api/wms';
 import { useWorkspace } from '../../core/workspace/workspace';
+import { asArray as array } from '../../core/api/response-values';
 
 type RuntimeIntegrationState = 'READY' | 'WAITING' | 'RETRYING' | 'DEAD_LETTER' | 'APPLIED' | string;
 type ConnectorHealth = 'CONNECTED' | 'DEGRADED' | 'MISSING_CREDENTIALS' | string;
@@ -320,10 +321,6 @@ function checklistLabel(value: string) {
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
-}
-
-function array(value: unknown): unknown[] {
-  return Array.isArray(value) ? value : [];
 }
 
 function text(value: unknown, fallback: string) {

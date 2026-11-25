@@ -21,6 +21,7 @@ import {
 } from '../../core/scanning/rfOfflineQueue';
 import { cx } from '../../core/utils/format';
 import { useWorkspace, type Language } from '../../core/workspace/workspace';
+import { asRecord as record, finiteNumber as numberValue, nonBlankText as nullableString } from '../../core/api/response-values';
 
 type ExpectedType = 'LOCATION' | 'SKU' | 'HANDLING_UNIT' | 'QUANTITY' | 'NONE';
 interface RfPlannedStep {
@@ -240,18 +241,6 @@ function mapScanners(payload: unknown): ScannerRow[] {
       lastActivityAt: nullableString(row['lastActivityAt'] ?? row['lastSeenAt']),
     };
   }).filter((scanner) => scanner.code);
-}
-
-function record(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
-}
-
-function numberValue(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) ? value : null;
-}
-
-function nullableString(value: unknown): string | null {
-  return typeof value === 'string' && value.trim() ? value : null;
 }
 
 function formatPercent(value: number | null, fallback: string): string {

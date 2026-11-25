@@ -109,12 +109,16 @@ test('print stations only offer retry after failure and return the job to the qu
   const fixture = randomUUID().slice(0, 8).toUpperCase();
   const printerCode = `UI-PRINTER-${fixture}`;
   const agentCode = `UI-AGENT-${fixture}`;
+  const scannerCode = `UI-SCANNER-${fixture}`;
   const agent = { agentCode, token: randomUUID() };
   await liveApi(page, api + '/printers', {
     token, data: { code: printerCode, name: 'Browser fixture printer', protocol: 'WINDOWS_RAW', windowsPrinterName: 'Test-only printer' },
   });
   await liveApi(page, api + '/print-agents', {
     token, data: { code: agentCode, name: 'Browser fixture agent', token: agent.token, printerCodes: [printerCode] },
+  });
+  await liveApi(page, api + '/scanners', {
+    token, data: { code: scannerCode, name: 'Browser fixture scanner', batteryLevel: 0 },
   });
   const job = await liveApi(page, api + '/print-jobs', {
     token, data: { printerCode, agentCode, maxAttempts: 1, renderedZpl: '^XA^FO40,40^FDFixture^FS^XZ' },
@@ -124,6 +128,8 @@ test('print stations only offer retry after failure and return the job to the qu
 
   await login(page, roles.system);
   await desktopNav(page).getByRole('button', { name: 'Tiskárny', exact: true }).click();
+  const scanner = page.getByRole('row').filter({ has: page.getByRole('cell', { name: scannerCode, exact: true }) });
+  await expect(scanner.getByRole('cell', { name: '0% / Nenastaveno', exact: true })).toBeVisible();
   const code = page.getByTestId('print-label-code');
   await code.fill(`LABEL-${fixture}`);
   const previews = page.locator('.barcode-preview-grid');

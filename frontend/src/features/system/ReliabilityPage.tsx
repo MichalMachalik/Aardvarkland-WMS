@@ -25,6 +25,7 @@ import {
 } from '../../core/api/wms';
 import type { Severity } from '../../core/types/wms';
 import { useWorkspace, type Language } from '../../core/workspace/workspace';
+import { asArray as array, asRecord as record, nonBlankText as nullableString, textOr as stringValue } from '../../core/api/response-values';
 
 interface AlertRow {
   key: string;
@@ -901,18 +902,6 @@ function formatBytes(value: number): string {
   return `${(value / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function record(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
-}
-
-function array(value: unknown): unknown[] {
-  return Array.isArray(value) ? value : [];
-}
-
-function stringValue(value: unknown, fallback: string): string {
-  return typeof value === 'string' && value.trim() ? value : fallback;
-}
-
 function numberValue(value: unknown): number {
   const parsed = typeof value === 'number' ? value : Number(value);
   return Number.isFinite(parsed) ? parsed : 0;
@@ -921,10 +910,6 @@ function numberValue(value: unknown): number {
 function nullableNumber(value: unknown): number | null {
   const parsed = numberValue(value);
   return value === undefined || value === null ? null : parsed;
-}
-
-function nullableString(value: unknown): string | null {
-  return typeof value === 'string' && value.trim() ? value : null;
 }
 
 function stringNumberRecord(value: unknown): Record<string, number> {

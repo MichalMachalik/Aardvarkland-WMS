@@ -9,6 +9,7 @@ import { useApiMutation } from '../../core/api/useApiMutation';
 import { useApiResource } from '../../core/api/useApiResource';
 import { createUser, listAuditLogs, listUsers } from '../../core/api/wms';
 import { useWorkspace, type Language, type RoleId } from '../../core/workspace/workspace';
+import { asArray as array, asRecord as record, nonBlankText as nullableString, textOr as stringValue } from '../../core/api/response-values';
 
 interface UserRow {
   id: string;
@@ -240,22 +241,6 @@ function statusLabel(value: string, language: Language) {
   return value === 'ACTIVE'
     ? pickLanguage(language, { cs: 'Aktivní', en: 'Active', ua: 'Активний' })
     : pickLanguage(language, { cs: 'Vypnuto', en: 'Disabled', ua: 'Вимкнено' });
-}
-
-function record(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
-}
-
-function array(value: unknown): unknown[] {
-  return Array.isArray(value) ? value : [];
-}
-
-function stringValue(value: unknown, fallback: string): string {
-  return typeof value === 'string' && value.trim() ? value : fallback;
-}
-
-function nullableString(value: unknown): string | null {
-  return typeof value === 'string' && value.trim() ? value : null;
 }
 
 const czech = {

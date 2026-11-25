@@ -18,6 +18,7 @@ import {
   submitCycleCountTask,
 } from '../../core/api/wms';
 import { useWorkspace, type Language } from '../../core/workspace/workspace';
+import { asRecord as record, finiteNumber as numberValue, nonBlankText as nullableString, textOr as stringValue } from '../../core/api/response-values';
 
 interface CycleCountPlan {
   id: string;
@@ -288,12 +289,6 @@ function mapTasks(payload: unknown): CycleCountTask[] {
   }).filter((task) => task.id);
 }
 
-function record(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
-}
-function stringValue(value: unknown, fallback: string): string { return typeof value === 'string' && value.trim() ? value : fallback; }
-function nullableString(value: unknown): string | null { return typeof value === 'string' && value.trim() ? value : null; }
-function numberValue(value: unknown): number | null { return typeof value === 'number' && Number.isFinite(value) ? value : null; }
 function shortId(value: string) { return value.length > 12 ? `${value.slice(0, 8)}...` : value; }
 function formatDate(value: string) {
   const date = new Date(value);
