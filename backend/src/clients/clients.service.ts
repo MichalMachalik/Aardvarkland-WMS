@@ -1,4 +1,4 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 
 import { AuthenticatedUser } from '../access-control/types';
 import { makePageEnvelope, normalizeOffsetPagination, PageEnvelope } from '../common';
@@ -621,7 +621,7 @@ export class ClientsService {
   ): Promise<GenerateBillingEventsResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
     const client = await this.resolveClient(clientReference);
-    const period = normalizeBillingPeriod({ periodStart: dto.periodStart, periodEnd: dto.periodEnd });
+    const period = readBillingPeriod(dto);
     const stockLinks = await this.client.clientResourceLink.findMany({
       where: { warehouseId: warehouse.id, clientId: client.id, resourceType: 'STOCK_QUANT' },
       orderBy: [{ createdAt: 'asc' }],
@@ -784,7 +784,7 @@ export class ClientsService {
   ): Promise<BillingInvoiceResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
     const client = await this.resolveClient(clientReference);
-    const period = normalizeBillingPeriod({ periodStart: dto.periodStart, periodEnd: dto.periodEnd });
+    const period = readBillingPeriod(dto);
     const eventStatuses = invoiceEventStatusFilter(dto.eventStatuses);
     const eligibleEvents = {
       warehouseId: warehouse.id,
@@ -923,8 +923,17 @@ export class ClientsService {
     const updated = await this.transaction(async (tx) => {
       const invoice = await this.lockInvoice(tx, warehouse.id, client.id, invoiceReference);
       if (invoice.status === BillingInvoiceStatus.VOIDED) return invoice;
+      const finalizedCreditNote = await tx.billingCreditNote.findFirst({
+        where: { invoiceId: invoice.id, status: BillingCreditNoteStatus.FINALIZED },
+        select: { id: true },
+      });
+      if (finalizedCreditNote) throw new ConflictException('An invoice with finalized credit notes cannot be voided.');
       const eventIds = buildInvoiceVoidReinvoicePlan(invoice.lines ?? []).billingEventIds;
       const now = new Date();
+      const voidedCreditDrafts = await tx.billingCreditNote.updateMany({
+        where: { invoiceId: invoice.id, status: BillingCreditNoteStatus.DRAFT },
+        data: { status: BillingCreditNoteStatus.VOIDED, voidedAt: now },
+      });
       if (eventIds.length) {
         await tx.billingEvent.updateMany({
           where: { id: { in: eventIds }, status: BillingEventStatus.INVOICED },
@@ -944,6 +953,7 @@ export class ClientsService {
             voidReason: dto.reason ?? null,
             voidMetadata: dto.metadata ?? null,
             releasedBillingEventIds: eventIds,
+            voidedCreditNoteDrafts: voidedCreditDrafts.count,
           }),
         },
         include: { lines: { orderBy: { lineNumber: 'asc' } }, _count: { select: { lines: true } } },
@@ -1057,24 +1067,24 @@ export class ClientsService {
   ): Promise<BillingCreditNoteResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
     const client = await this.resolveClient(clientReference);
-    const invoice = await this.resolveInvoice(warehouse.id, client.id, invoiceReference);
-    if (invoice.status !== BillingInvoiceStatus.FINALIZED) {
-      throw new ConflictException('Credit notes can only be created for finalized invoices.');
-    }
-
-    let lines: BillingCreditNoteLineDraft[];
-    try {
-      lines = buildCreditNoteLines(invoice.lines ?? [], dto.invoiceLineNumbers);
-    } catch (error) {
-      throw new ConflictException(error instanceof Error ? error.message : 'Credit note must reference at least one invoice line.');
-    }
-
-    const summary = summarizeCreditNoteLines(lines);
     const requestedCreditNoteNumber = dto.creditNoteNumber?.trim().toUpperCase() || null;
-    const now = new Date();
     const creditNote = await this.transaction(async (tx) => {
-      const sequence = (await tx.billingCreditNote.count({ where: { invoiceId: invoice.id } })) + 1;
-      const creditNoteNumber = requestedCreditNoteNumber ?? makeCreditNoteNumber({ invoiceNumber: invoice.invoiceNumber, sequence });
+      const invoice = await this.lockInvoice(tx, warehouse.id, client.id, invoiceReference);
+      if (invoice.status !== BillingInvoiceStatus.FINALIZED) {
+        throw new ConflictException('Credit notes can only be created for finalized invoices.');
+      }
+      let lines: BillingCreditNoteLineDraft[];
+      try {
+        lines = buildCreditNoteLines(invoice.lines ?? [], dto.invoiceLineNumbers);
+      } catch (error) {
+        throw new ConflictException(error instanceof Error ? error.message : 'Credit note must reference at least one invoice line.');
+      }
+      await this.assertUncreditedInvoiceLines(tx, invoice.id, lines.map(line => line.invoiceLineId), [
+        BillingCreditNoteStatus.DRAFT, BillingCreditNoteStatus.FINALIZED,
+      ]);
+      const summary = summarizeCreditNoteLines(lines);
+      const creditNoteNumber = await this.allocateCreditNoteNumber(tx, invoice, requestedCreditNoteNumber);
+      const now = new Date();
       const created = await tx.billingCreditNote.create({
         data: {
           clientId: client.id,
@@ -1158,16 +1168,22 @@ export class ClientsService {
   ): Promise<BillingCreditNoteResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
     const client = await this.resolveClient(clientReference);
-    const creditNote = await this.resolveCreditNote(warehouse.id, client.id, creditNoteReference);
-    if (creditNote.status !== BillingCreditNoteStatus.DRAFT) {
-      throw new ConflictException('Only draft credit notes can be finalized.');
-    }
-
-    const now = new Date();
     const updated = await this.transaction(async (tx) => {
+      const candidate = await this.resolveCreditNote(warehouse.id, client.id, creditNoteReference, tx);
+      const invoice = await this.lockInvoice(tx, warehouse.id, client.id, candidate.invoiceId);
+      const creditNote = await this.resolveCreditNote(warehouse.id, client.id, candidate.id, tx);
+      if (creditNote.status !== BillingCreditNoteStatus.DRAFT || invoice.status !== BillingInvoiceStatus.FINALIZED) {
+        throw new ConflictException('Only draft credit notes for finalized invoices can be finalized.');
+      }
+      const sourceLines = new Set(invoice.lines?.map(line => line.id));
+      const creditedLines = (creditNote.lines ?? []).map(line => line.invoiceLineId);
+      if (!creditedLines.length || creditedLines.some(id => id === null || !sourceLines.has(id))) {
+        throw new ConflictException('The credit note no longer matches its source invoice lines.');
+      }
+      await this.assertUncreditedInvoiceLines(tx, invoice.id, creditedLines, [BillingCreditNoteStatus.FINALIZED]);
       const result = await tx.billingCreditNote.update({
         where: { id: creditNote.id },
-        data: { status: BillingCreditNoteStatus.FINALIZED, finalizedAt: now, metadata: mergeMetadata(creditNote.metadata, dto.metadata ?? {}) },
+        data: { status: BillingCreditNoteStatus.FINALIZED, finalizedAt: new Date(), metadata: mergeMetadata(creditNote.metadata, dto.metadata ?? {}) },
         include: { lines: { orderBy: { lineNumber: 'asc' } }, _count: { select: { lines: true } } },
       });
       await tx.auditLog.create({ data: { actorUserId: actor.id, warehouseId: warehouse.id, action: 'billing.credit_note_finalized', resourceType: 'billing_credit_note', resourceId: creditNote.id, metadata: { creditNoteNumber: creditNote.creditNoteNumber, invoiceId: creditNote.invoiceId } } });
@@ -1338,8 +1354,9 @@ export class ClientsService {
     warehouseId: string,
     clientId: string,
     reference: string,
+    client: ClientsTransactionClient = this.client,
   ): Promise<BillingCreditNoteRecord & { lines?: BillingCreditNoteLineRecord[]; _count?: { lines: number } }> {
-    const creditNote = await this.client.billingCreditNote.findFirst({
+    const creditNote = await client.billingCreditNote.findFirst({
       where: isUuid(reference)
         ? { warehouseId, clientId, OR: [{ id: reference }, { creditNoteNumber: reference.trim().toUpperCase() }] }
         : { warehouseId, clientId, creditNoteNumber: reference.trim().toUpperCase() },
@@ -1347,6 +1364,42 @@ export class ClientsService {
     });
     if (!creditNote) throw new NotFoundException('Billing credit note was not found.');
     return creditNote;
+  }
+
+  private async assertUncreditedInvoiceLines(
+    tx: ClientsTransactionClient,
+    invoiceId: string,
+    invoiceLineIds: Array<string | null>,
+    statuses: BillingCreditNoteStatus[],
+  ): Promise<void> {
+    const existing = await tx.billingCreditNote.findFirst({
+      where: {
+        invoiceId,
+        status: { in: statuses },
+        lines: { some: { invoiceLineId: { in: invoiceLineIds.filter(id => id !== null) } } },
+      },
+      select: { id: true },
+    });
+    if (existing) throw new ConflictException('One or more invoice lines are already on a credit note.');
+  }
+
+  private async allocateCreditNoteNumber(
+    tx: ClientsTransactionClient,
+    invoice: BillingInvoiceRecord,
+    requested: string | null,
+  ): Promise<string> {
+    await lockPostgresAdvisoryTransaction(tx, 'idempotency_key', `billing-credit-number:${invoice.clientId}`);
+    let sequence = (await tx.billingCreditNote.count({ where: { invoiceId: invoice.id } })) + 1;
+    let number = requested ?? makeCreditNoteNumber({ invoiceNumber: invoice.invoiceNumber, sequence });
+    while (await tx.billingCreditNote.findFirst({
+      where: { clientId: invoice.clientId, creditNoteNumber: number },
+      select: { id: true },
+    })) {
+      if (requested) throw new ConflictException('Credit note number is already in use.');
+      sequence += 1;
+      number = makeCreditNoteNumber({ invoiceNumber: invoice.invoiceNumber, sequence });
+    }
+    return number;
   }
 
   private async resolveActiveClientRate(
@@ -1421,6 +1474,15 @@ export class ClientsService {
 
   private get client(): ClientsPrismaClient {
     return this.prisma as unknown as ClientsPrismaClient;
+  }
+}
+
+function readBillingPeriod(input: { periodStart: string; periodEnd: string }) {
+  try {
+    return normalizeBillingPeriod(input);
+  } catch (error) {
+    if (!(error instanceof Error)) throw error;
+    throw new BadRequestException(error.message);
   }
 }
 
@@ -1680,7 +1742,7 @@ interface ClientsTransactionClient {
   invoiceNumberSequence: { findFirst(args: Record<string, unknown>): Promise<InvoiceNumberSequenceRecord | null>; create(args: Record<string, unknown>): Promise<InvoiceNumberSequenceRecord>; update(args: Record<string, unknown>): Promise<InvoiceNumberSequenceRecord> };
   billingInvoice: { count(args: Record<string, unknown>): Promise<number>; create(args: Record<string, unknown>): Promise<BillingInvoiceRecord & { lines?: BillingInvoiceLineRecord[]; _count?: { lines: number } }>; findFirst(args: Record<string, unknown>): Promise<(BillingInvoiceRecord & { lines?: BillingInvoiceLineRecord[]; _count?: { lines: number } }) | null>; findMany(args: Record<string, unknown>): Promise<Array<BillingInvoiceRecord & { _count?: { lines: number } }>>; update(args: Record<string, unknown>): Promise<BillingInvoiceRecord & { lines?: BillingInvoiceLineRecord[]; _count?: { lines: number } }> };
   billingInvoiceLine: { updateMany(args: Record<string, unknown>): Promise<unknown> };
-  billingCreditNote: { count(args: Record<string, unknown>): Promise<number>; create(args: Record<string, unknown>): Promise<BillingCreditNoteRecord & { lines?: BillingCreditNoteLineRecord[]; _count?: { lines: number } }>; findFirst(args: Record<string, unknown>): Promise<(BillingCreditNoteRecord & { lines?: BillingCreditNoteLineRecord[]; _count?: { lines: number } }) | null>; findMany(args: Record<string, unknown>): Promise<Array<BillingCreditNoteRecord & { _count?: { lines: number } }>>; update(args: Record<string, unknown>): Promise<BillingCreditNoteRecord & { lines?: BillingCreditNoteLineRecord[]; _count?: { lines: number } }> };
+  billingCreditNote: { count(args: Record<string, unknown>): Promise<number>; create(args: Record<string, unknown>): Promise<BillingCreditNoteRecord & { lines?: BillingCreditNoteLineRecord[]; _count?: { lines: number } }>; findFirst(args: Record<string, unknown>): Promise<(BillingCreditNoteRecord & { lines?: BillingCreditNoteLineRecord[]; _count?: { lines: number } }) | null>; findMany(args: Record<string, unknown>): Promise<Array<BillingCreditNoteRecord & { _count?: { lines: number } }>>; update(args: Record<string, unknown>): Promise<BillingCreditNoteRecord & { lines?: BillingCreditNoteLineRecord[]; _count?: { lines: number } }>; updateMany(args: Record<string, unknown>): Promise<{ count: number }> };
   auditLog: { create(args: Record<string, unknown>): Promise<unknown> };
   outboxEvent: { create(args: Record<string, unknown>): Promise<unknown> };
 }

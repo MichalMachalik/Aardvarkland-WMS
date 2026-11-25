@@ -33,7 +33,6 @@ export class CreateBillingCreditNoteDto {
 
   @ApiPropertyOptional({ example: false, description: 'Create and finalize the credit note in one transaction.' })
   @IsOptional()
-  @Type(() => Boolean)
   @IsBoolean()
   finalize?: boolean;
 

@@ -999,6 +999,89 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.equal((await prisma.billingEvent.findUniqueOrThrow({ where: { id: generated.events[0].id } })).quantity, 2);
   });
 
+  await scenario('billing credits include only valid invoice lines and finalize each line once', async () => {
+    const client = await asAdmin('POST', '/api/clients', {
+      code: `CREDIT-${suffix}`, name: 'Credit note fixture client', billingCurrency: 'EUR',
+    });
+    const path = `/clients/${client.code}`;
+    await own('POST', path + '/attach', {});
+    const makeInvoice = async (day, prices, invoiceNumber) => {
+      const events = [];
+      for (const [index, unitPriceMinor] of prices.entries()) {
+        events.push(await own('POST', path + '/billing-events', {
+          eventType: 'PICK', status: 'BILLABLE', reference: `CREDIT-${suffix}-${day}-${index}`,
+          quantity: 1, unitPriceMinor, occurredAt: `2026-10-${day}T12:0${index}:00.000Z`,
+        }));
+      }
+      const invoice = await own('POST', path + '/billing-invoices', {
+        periodStart: `2026-10-${day}T00:00:00.000Z`, periodEnd: `2026-10-${Number(day) + 1}T00:00:00.000Z`,
+        vatRateBps: 2100, invoiceNumber,
+      });
+      return { invoice, events, invoicePath: `${path}/billing-invoices/${invoice.id}` };
+    };
+
+    const { invoice, invoicePath, events } = await makeInvoice('20', [1200, 800], 'TEST-' + 'X'.repeat(115));
+    const credits = invoicePath + '/credit-notes';
+    await own('POST', credits, { invoiceLineNumbers: [1] }, 409);
+    await own('POST', invoicePath + '/finalize', {});
+    await own('POST', credits, { invoiceLineNumbers: [1, 999] }, 409);
+    await own('POST', credits, { invoiceLineNumbers: [] }, 409);
+    await own('POST', credits, { invoiceLineNumbers: [1], finalize: 'false' }, 400);
+    assert.equal(await prisma.billingCreditNote.count({ where: { invoiceId: invoice.id } }), 0);
+
+    const draft = { invoiceLineNumbers: [1], reason: 'Fixture correction' };
+    const candidates = await Promise.all([
+      own('POST', credits, draft, [201, 409]),
+      own('POST', credits, draft, [201, 409]),
+    ]);
+    const drafts = candidates.filter(item => item.status === 'DRAFT');
+    assert.equal(drafts.length, 1);
+    const [credit] = drafts;
+    assert.equal(credit.lines.length, 1);
+    assert.equal(credit.lines[0].invoiceLineId, invoice.lines[0].id);
+    assert.equal(credit.subtotalMinor, 1200);
+    assert.equal(credit.taxTotalMinor, 252);
+    assert.equal(credit.totalAmountMinor, 1452);
+
+    const creditPath = `${path}/billing-credit-notes/${credit.id}`;
+    const results = await Promise.all([
+      own('POST', creditPath + '/finalize', { metadata: { confirmed: true } }, [201, 409]),
+      own('POST', creditPath + '/finalize', { metadata: { confirmed: true } }, [201, 409]),
+    ]);
+    assert.equal(results.filter(item => item.status === 'FINALIZED').length, 1);
+    assert.equal((await own('GET', creditPath)).metadata.confirmed, true);
+    assert.equal(await prisma.outboxEvent.count({ where: { aggregateId: credit.id, type: 'BILLING_CREDIT_NOTE_FINALIZED' } }), 1);
+    assert.equal(await prisma.auditLog.count({ where: { resourceId: credit.id, action: 'billing.credit_note_finalized' } }), 1);
+    await own('POST', credits, { invoiceLineNumbers: [1], finalize: true }, 409);
+    await own('POST', credits, { invoiceLineNumbers: [2], creditNoteNumber: credit.creditNoteNumber }, 409);
+    const remaining = await own('POST', credits, { invoiceLineNumbers: [2], finalize: true });
+    assert.equal(remaining.status, 'FINALIZED');
+    assert.equal(remaining.totalAmountMinor, 968);
+    assert.equal(remaining.lines[0].invoiceLineId, invoice.lines[1].id);
+    assert.notEqual(remaining.creditNoteNumber, credit.creditNoteNumber);
+    assert.equal(await prisma.billingCreditNote.count({ where: { invoiceId: invoice.id } }), 2);
+    await own('POST', invoicePath + '/void', { reason: 'Credit is already posted' }, 409);
+    assert.equal((await own('GET', invoicePath)).status, 'FINALIZED');
+    assert.equal(await prisma.billingEvent.count({ where: { id: { in: events.map(event => event.id) }, status: 'INVOICED' } }), 2);
+
+    const other = await makeInvoice('21', [500]);
+    await own('POST', other.invoicePath + '/finalize', {});
+    const savedDraft = await own('POST', other.invoicePath + '/credit-notes', { finalize: false });
+    const savedDraftPath = `${path}/billing-credit-notes/${savedDraft.id}`;
+    const transitions = await Promise.all([
+      own('POST', other.invoicePath + '/void', { reason: 'Concurrent invoice cancellation' }, [201, 409]),
+      own('POST', savedDraftPath + '/finalize', {}, [201, 409]),
+    ]);
+    const voided = transitions[0].status === 'VOIDED';
+    assert.equal(transitions[1].status === 'FINALIZED', !voided);
+    assert.equal((await own('GET', savedDraftPath)).status, voided ? 'VOIDED' : 'FINALIZED');
+    const event = await prisma.billingEvent.findUniqueOrThrow({ where: { id: other.events[0].id } });
+    assert.equal(event.status, voided ? 'BILLABLE' : 'INVOICED');
+    await own('POST', path + '/billing-invoices', {
+      periodStart: '2026-10-22T00:00:00.000Z', periodEnd: '2026-10-22T23:59:00.000Z',
+    }, 400);
+  });
+
   await scenario('parcels, tracking, operational exceptions and notifications can be updated', async () => {
     const parcelBody = { trackingNumber: `PARCEL-${suffix}`, currentLocationReference: 'A-01-01' };
     const parcel = await own('POST', '/parcels', parcelBody);

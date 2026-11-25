@@ -262,19 +262,23 @@ export function makeCreditNoteNumber(input: {
       .replace(/[^A-Z0-9_-]+/g, '-')
       .replace(/^-+|-+$/g, '') || 'INVOICE';
   const sequence = Math.max(1, Math.trunc(input.sequence ?? 1));
-  return `CN-${invoiceNumber}-${String(sequence).padStart(3, '0')}`.slice(0, 120);
+  const suffix = String(sequence).padStart(3, '0');
+  return `CN-${invoiceNumber.slice(0, 116 - suffix.length)}-${suffix}`;
 }
 
 export function buildCreditNoteLines(
   invoiceLines: BillingCreditNoteSourceLine[],
   selectedLineNumbers?: number[] | null,
 ): BillingCreditNoteLineDraft[] {
-  const selected = normalizeLineNumberSelection(selectedLineNumbers);
+  const selected = selectedLineNumbers == null ? null : new Set(selectedLineNumbers);
   const eligibleLines = invoiceLines
     .slice()
     .filter((line) => selected === null || selected.has(line.lineNumber))
     .sort((a, b) => a.lineNumber - b.lineNumber);
 
+  if (selected && selected.size !== eligibleLines.length) {
+    throw new Error('One or more selected lines do not belong to this invoice.');
+  }
   if (eligibleLines.length === 0) {
     throw new Error('Credit note must reference at least one invoice line.');
   }
@@ -530,16 +534,6 @@ export function buildInvoiceVoidReinvoicePlan(lines: Array<{ billingEventId?: st
     ),
   );
   return { billingEventIds, shouldDetachLines: billingEventIds.length > 0 };
-}
-
-function normalizeLineNumberSelection(value: number[] | null | undefined): Set<number> | null {
-  if (!value?.length) return null;
-  const normalized = new Set<number>();
-  for (const lineNumber of value) {
-    const normalizedLineNumber = Math.trunc(lineNumber);
-    if (normalizedLineNumber > 0) normalized.add(normalizedLineNumber);
-  }
-  return normalized.size > 0 ? normalized : null;
 }
 
 function normalizeVatRateBps(value: number | null | undefined): number | null {
