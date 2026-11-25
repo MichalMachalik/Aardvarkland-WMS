@@ -86,9 +86,7 @@ export class DecisionSupportService {
 
     const exceptionRecords = records
       .map(toRecord)
-      .filter((record): record is DynamicRecord => record !== null)
-      .filter((record) => matchesFocus(record, focus))
-      .slice(0, limit);
+      .filter((record): record is DynamicRecord => record !== null);
 
     return {
       generatedAt: new Date(),
@@ -108,34 +106,19 @@ export class DecisionSupportService {
     focus: ExceptionTriageFocus,
   ): Promise<unknown[] | null> {
     const delegate = getRuntimeDelegate(this.prisma, 'wmsException');
-    const statusFiltered = await safeRuntimeFindMany(delegate, {
+    return safeRuntimeFindMany(delegate, {
       where: {
         warehouseId,
         ...(focus === ExceptionTriageFocus.All
           ? {}
           : { status: { in: Array.from(OPEN_EXCEPTION_STATUSES) } }),
+        ...(focus === ExceptionTriageFocus.HighRisk
+          ? { severity: { in: Array.from(HIGH_RISK_SEVERITIES) } }
+          : {}),
       },
-      orderBy: [{ severity: 'desc' }, { createdAt: 'asc' }],
+      orderBy: [{ severity: 'desc' }, { createdAt: 'asc' }, { id: 'asc' }],
       take: limit,
     });
-
-    if (statusFiltered !== null) {
-      return statusFiltered;
-    }
-
-    const orderedFallback = await safeRuntimeFindMany(delegate, {
-      where: { warehouseId },
-      orderBy: { createdAt: 'asc' },
-      take: limit,
-    });
-
-    return (
-      orderedFallback ??
-      (await safeRuntimeFindMany(delegate, {
-        where: { warehouseId },
-        take: limit,
-      }))
-    );
   }
 }
 
@@ -303,22 +286,6 @@ function chooseTriageRule(
     confidence: 0.58,
     signals: ['fallback_rule'],
   };
-}
-
-function matchesFocus(record: DynamicRecord, focus: ExceptionTriageFocus): boolean {
-  if (focus === ExceptionTriageFocus.All) {
-    return true;
-  }
-
-  const severity = normalizeUpper(readFirstString(record, ['severity', 'priority']));
-
-  if (focus === ExceptionTriageFocus.HighRisk) {
-    return severity === undefined || HIGH_RISK_SEVERITIES.has(severity);
-  }
-
-  const status = normalizeUpper(readFirstString(record, ['status']));
-
-  return status === undefined || OPEN_EXCEPTION_STATUSES.has(status);
 }
 
 function buildDescriptor(record: DynamicRecord): string {

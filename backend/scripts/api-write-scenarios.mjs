@@ -23,6 +23,105 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     return { product, sku };
   }
 
+  await scenario('operational summaries respect the requested window and recommendation option', async () => {
+    const path = '/decision-support/ops-summary';
+    await asWorker('POST', warehouse + path, {}, 403);
+    await own('POST', path, { lookbackDays: 0 }, 400);
+    await own('POST', path, { lookbackDays: 91 }, 400);
+    const summary = await own('POST', path, { lookbackDays: 2, includeRecommendations: false });
+    const warehouseRow = await prisma.warehouse.findUniqueOrThrow({ where: { code: 'MAIN' } });
+    assert.equal(summary.warehouse.id, warehouseRow.id);
+    assert.match(summary.summary, /last 2 days/);
+    assert.equal(summary.metrics.parcelsTotal, await prisma.parcel.count({ where: { warehouseId: warehouseRow.id } }));
+    assert.equal(summary.engine.externalCalls, false);
+    assert.deepEqual(summary.recommendedActions, []);
+    assert.ok((await own('POST', path, {})).recommendedActions.length > 0);
+  });
+
+  await scenario('exception triage filters warehouse and focus before applying its limit', async () => {
+    const main = await prisma.warehouse.create({ data: { code: `TRIAGE-${suffix}`, name: 'Triage fixture warehouse' } });
+    const other = await prisma.warehouse.create({
+      data: { code: `TRIAGE-OTHER-${suffix}`, name: 'Other triage fixture warehouse' },
+    });
+    const path = `/api/warehouses/${main.code}/decision-support/exception-triage`;
+    await asAdmin('POST', path, {}, 403);
+    const email = `triage-${suffix.toLowerCase()}@example.invalid`;
+    const password = `Fixture-${randomUUID()}-42!`;
+    const operator = await asAdmin('POST', '/api/users', {
+      email, password, displayName: 'Triage fixture operator', roleCode: 'WAREHOUSE_WORKER', warehouseCode: 'MAIN',
+    });
+    const role = await prisma.role.findUniqueOrThrow({ where: { code: 'WMS_ADMIN' } });
+    await prisma.userRole.create({ data: { userId: operator.id, roleId: role.id, warehouseId: main.id } });
+    const asOperator = bind((await login(email, password)).accessToken);
+    const triage = (body, expected = 201) => asOperator('POST', path, body, expected);
+    await triage({ focus: 'UNKNOWN' }, 400);
+    await triage({ limit: 51 }, 400);
+    const actor = await prisma.user.findUniqueOrThrow({ where: { email: 'admin@example.com' } });
+    const exception = (warehouseId, severity, status, title) => prisma.wmsException.create({
+      data: { warehouseId, createdByUserId: actor.id, severity, status, code: `TEST-${suffix}`, title, createdAt: new Date(0) },
+    });
+    const high = await exception(main.id, 'CRITICAL', 'OPEN', 'Fixture critical exception');
+    const low = await exception(main.id, 'LOW', 'OPEN', 'Fixture label issue');
+    const resolved = await exception(main.id, 'CRITICAL', 'RESOLVED', 'Fixture resolved issue');
+    const unrelated = await exception(other.id, 'CRITICAL', 'OPEN', 'Fixture in another warehouse');
+    const first = await triage({ focus: 'HIGH_RISK', limit: 1 });
+    assert.deepEqual(first.source, { available: true, scanned: 1 });
+    assert.equal(first.recommendations[0].exceptionId, high.id);
+    assert.equal(first.recommendations[0].category, 'HIGH_RISK');
+    assert.equal(first.recommendations[0].priority, 'critical');
+    const open = await triage({ focus: 'OPEN', limit: 50 });
+    const openIds = open.recommendations.map(item => item.exceptionId);
+    assert.ok(openIds.includes(high.id) && openIds.includes(low.id));
+    assert.ok(!openIds.includes(resolved.id) && !openIds.includes(unrelated.id));
+    assert.equal(open.recommendations.find(item => item.exceptionId === low.id).category, 'LABELING');
+    const all = await triage({ focus: 'ALL', limit: 50 });
+    assert.ok(all.recommendations.some(item => item.exceptionId === resolved.id));
+    assert.equal((await prisma.wmsException.findUniqueOrThrow({ where: { id: high.id } })).status, 'OPEN');
+  });
+
+  await scenario('workflow validation requires a consistent transition and reports missing reasons', async () => {
+    const evaluate = body => asAdmin('POST', '/api/workflows/validate-transition', {
+      entity: 'outbound-order', currentStatus: 'allocated', ...body,
+    });
+    const selection = { action: 'release-picking', targetStatus: 'picking' };
+    const valid = await evaluate({ ...selection, actorPermissions: ['fulfillment.manage'] });
+    assert.equal(valid.allowed, true);
+    assert.equal(valid.targetStatus, 'PICKING');
+    const noReason = await evaluate({ action: 'cancel', actorPermissions: ['outbound.manage'] });
+    assert.deepEqual(noReason.issues.map(issue => issue.code), ['REASON_REQUIRED']);
+    const invalid = [
+      [selection, 'PERMISSION_REQUIRED'],
+      [{ action: 'release-picking', targetStatus: 'cancelled' }, 'INVALID_TARGET_STATUS'],
+      [{}, 'UNKNOWN_ACTION'],
+    ];
+    for (const [body, code] of invalid) {
+      const result = await evaluate({ ...body, actorPermissions: [] });
+      assert.equal(result.allowed, false, code);
+      assert.ok(result.issues.some(issue => issue.code === code), code);
+    }
+  });
+
+  await scenario('browser telemetry retains diagnostics without storing request query values', async () => {
+    const path = '/api/observability/frontend-events';
+    const input = {
+      type: 'api_failure', severity: 'error', route: '/inventory?search=example',
+      source: '/api/warehouses/MAIN/inventory?search=example', message: 'Fixture request failed',
+      statusCode: 503, browserOnline: false, metadata: { component: 'Inventory' },
+    };
+    await request('POST', path, { body: { ...input, statusCode: 600 }, expected: 400 });
+    const { data } = await request('POST', path, { body: input, expected: 201 });
+    assert.equal(data.accepted, true);
+    const runtime = await asAdmin('GET', '/api/observability/runtime');
+    const stored = runtime.frontend.recentEvents.find(event => event.id === data.eventId);
+    assert.equal(stored.receivedAt, data.receivedAt);
+    assert.equal(stored.route, '/inventory');
+    assert.equal(stored.source, '/api/warehouses/MAIN/inventory');
+    assert.equal(stored.statusCode, 503);
+    assert.equal(stored.browserOnline, false);
+    assert.equal(stored.message, input.message);
+    assert.equal(Object.hasOwn(stored, 'metadata'), false);
+  });
+
   await scenario('SKU creation and product alias updates preserve explicit nullable fields and reject blank names', async () => {
     const product = await asAdmin('POST', '/api/products', { code: `SKU-ALIAS-${suffix}`, name: 'Fixture product' });
     const body = {

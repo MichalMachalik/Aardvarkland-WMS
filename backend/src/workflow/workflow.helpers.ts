@@ -176,6 +176,15 @@ export function evaluateWorkflowTransition(
     ]);
   }
 
+  if (!action && !targetStatus) {
+    return baseEvaluation(entity, currentStatus, action, targetStatus, allowedTransitions, [
+      {
+        code: 'UNKNOWN_ACTION',
+        message: 'Provide action or targetStatus to validate a specific transition.',
+      },
+    ]);
+  }
+
   const transition = allowedTransitions.find((candidate) => {
     if (action && candidate.action !== action) {
       return false;
@@ -189,24 +198,20 @@ export function evaluateWorkflowTransition(
   }) ?? null;
 
   if (!transition) {
-    if (action && !allowedTransitions.some((candidate) => candidate.action === action)) {
+    const knownAction = allowedTransitions.some((candidate) => candidate.action === action);
+    if (action && !knownAction) {
       issues.push({
         code: 'UNKNOWN_ACTION',
         message: `Action ${action} is not valid from ${entity}.${currentStatus}.`,
       });
     }
 
-    if (targetStatus && !allowedTransitions.some((candidate) => candidate.to === targetStatus)) {
+    if (targetStatus && (knownAction || !allowedTransitions.some((candidate) => candidate.to === targetStatus))) {
       issues.push({
         code: 'INVALID_TARGET_STATUS',
-        message: `Target status ${targetStatus} is not valid from ${entity}.${currentStatus}.`,
-      });
-    }
-
-    if (!action && !targetStatus) {
-      issues.push({
-        code: 'UNKNOWN_ACTION',
-        message: 'Provide action or targetStatus to validate a specific transition.',
+        message: knownAction
+          ? `Action ${action} cannot transition from ${entity}.${currentStatus} to ${targetStatus}.`
+          : `Target status ${targetStatus} is not valid from ${entity}.${currentStatus}.`,
       });
     }
 
@@ -220,7 +225,13 @@ export function evaluateWorkflowTransition(
     });
   }
 
-  if (transition.permission && actorPermissions.size > 0 && !actorPermissions.has(transition.permission)) {
+  if (
+    transition.permission &&
+    input.actorPermissions !== undefined &&
+    input.actorPermissions !== null &&
+    !actorPermissions.has('*') &&
+    !actorPermissions.has(transition.permission)
+  ) {
     issues.push({
       code: 'PERMISSION_REQUIRED',
       message: `Transition ${transition.action} requires permission ${transition.permission}.`,
