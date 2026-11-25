@@ -3,6 +3,7 @@ const DATABASE_VERSION = 1;
 const STORE_NAME = 'offline-scans';
 const LEGACY_STORAGE_KEY = 'wms-rf-offline-queue-v2';
 const FALLBACK_STORAGE_KEY = 'wms-rf-offline-queue-v3';
+const QUEUE_LOCK = 'wms-rf-offline-queue';
 
 export interface StoredRfOfflineScan {
   idempotencyKey: string;
@@ -18,18 +19,25 @@ export interface StoredRfOfflineScan {
 }
 
 // Persist each user-acknowledged scan before indicating success in the scanner UI.
-// A serialized per-warehouse queue prevents concurrent writes from clobbering each other.
 const warehouseOperations = new Map<string, Promise<void>>();
 
 function serializeWarehouse<T>(warehouseId: string, work: () => Promise<T>): Promise<T> {
+  // The queue and its legacy keys are shared by every tab on the same origin.
+  if (typeof navigator !== 'undefined' && navigator.locks) {
+    return navigator.locks.request(QUEUE_LOCK, work);
+  }
   const previous = warehouseOperations.get(warehouseId) ?? Promise.resolve();
   const operation = previous.then(work, work);
   warehouseOperations.set(warehouseId, operation.then(() => undefined, () => undefined));
   return operation;
 }
 
-export async function loadRfOfflineQueue(warehouseId: string): Promise<StoredRfOfflineScan[]> {
+export function loadRfOfflineQueue(warehouseId: string): Promise<StoredRfOfflineScan[]> {
   const normalizedWarehouse = normalizeWarehouse(warehouseId);
+  return serializeWarehouse(normalizedWarehouse, () => readRfOfflineQueue(normalizedWarehouse));
+}
+
+async function readRfOfflineQueue(normalizedWarehouse: string): Promise<StoredRfOfflineScan[]> {
   // Read the fallback first. IndexedDB might recover after the fallback received
   // newer unacknowledged scans; never erase those scans merely because IDB opens.
   const fallback = loadFallbackQueue(normalizedWarehouse);
@@ -70,7 +78,7 @@ export function appendRfOfflineScan(
 ): Promise<StoredRfOfflineScan[]> {
   const normalizedWarehouse = normalizeWarehouse(warehouseId);
   return serializeWarehouse(normalizedWarehouse, async () => {
-    const stored = await loadRfOfflineQueue(normalizedWarehouse);
+    const stored = await readRfOfflineQueue(normalizedWarehouse);
     const next = mergeScans(stored, [{ ...scan, warehouseId: normalizedWarehouse }]);
     await persistWarehouseQueue(normalizedWarehouse, next);
     return next;
@@ -84,7 +92,7 @@ export function applyRfOfflineResults(
 ): Promise<StoredRfOfflineScan[]> {
   const normalizedWarehouse = normalizeWarehouse(warehouseId);
   return serializeWarehouse(normalizedWarehouse, async () => {
-    const stored = await loadRfOfflineQueue(normalizedWarehouse);
+    const stored = await readRfOfflineQueue(normalizedWarehouse);
     const confirmed = new Set(confirmedIdempotencyKeys);
     const failed = new Set(failedIdempotencyKeys);
     const next = stored.filter(scan => !confirmed.has(scan.idempotencyKey))
