@@ -19,7 +19,6 @@ export class RequeueDeadLetterOutboxEventDto {
 
   @ApiPropertyOptional({ example: true, description: 'Reset delivery attempts to zero before replaying the event.' })
   @IsOptional()
-  @Type(() => Boolean)
   @IsBoolean()
   resetAttempts?: boolean;
 }

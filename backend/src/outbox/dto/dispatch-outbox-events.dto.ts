@@ -34,7 +34,6 @@ export class DispatchOutboxEventsDto {
 
   @ApiPropertyOptional({ example: false })
   @IsOptional()
-  @Type(() => Boolean)
   @IsBoolean()
   dryRun?: boolean;
 }

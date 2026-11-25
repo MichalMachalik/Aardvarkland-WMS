@@ -138,8 +138,8 @@ export class IntegrationDispatchService {
 
     return endpoints.filter((endpoint) => {
       const config = toIntegrationEndpointConfig(endpoint.config);
-      if (endpointAcceptsEvent(config, eventType)) {
-        return true;
+      if (config.eventTypes !== undefined || config.routes !== undefined) {
+        return endpointAcceptsEvent(config, eventType);
       }
 
       const endpointType = endpoint.type.trim().toUpperCase();

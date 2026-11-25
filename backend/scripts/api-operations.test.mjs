@@ -16,13 +16,15 @@ test('OpenAPI operations on a disposable PostgreSQL database', { timeout: 180000
   const database = new URL(process.env.WMS_TEST_DATABASE_URL);
   assert.ok(loopback.has(database.hostname), 'Use a local PostgreSQL instance');
   assert.match(database.pathname, /test|regression/i, 'Use a database dedicated to tests');
+  const connectionOptions = database.searchParams.get('options');
+  database.searchParams.set('options', [connectionOptions, '-c timezone=Europe/Prague'].filter(Boolean).join(' '));
   Object.assign(process.env, {
     DATABASE_URL: database.href,
     DATABASE_DIRECT_URL: database.href,
     NODE_ENV: 'test',
     CARRIER_ADAPTER_MODE: 'mock',
     BASE_COM_API_TOKEN: '',
-    EXTERNAL_HTTP_ALLOWED_HOSTS: '',
+    EXTERNAL_HTTP_ALLOWED_HOSTS: '127.0.0.1',
     OPERATIONAL_ALERT_DELIVERY_ENABLED: 'false',
     RATE_LIMIT_BACKEND: 'memory',
     RATE_LIMIT_MAX: '5000',

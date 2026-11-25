@@ -1,6 +1,6 @@
-import { ConflictException, Injectable, NotFoundException, Optional } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException, Optional } from '@nestjs/common';
 
-import { PrismaService } from '../database';
+import { lockPostgresAdvisoryTransaction, lockPostgresRowById, PrismaService, withTransactionRetry } from '../database';
 import { IntegrationDispatchService } from '../integrations';
 import {
   canMarkOutboxSent,
@@ -55,24 +55,18 @@ export class OutboxService {
   }
 
   async markSent(eventId: string, sentAt = new Date()): Promise<OutboxEventResponse> {
-    const existing = await this.client.outboxEvent.findFirst({
-      where: { id: eventId },
-    });
-
-    if (!existing) {
-      throw new NotFoundException('Outbox event was not found');
-    }
-
-    if (!canMarkOutboxSent(existing)) {
-      return toOutboxEventResponse(existing);
-    }
-
-    const record = await this.client.outboxEvent.update({
-      where: { id: existing.id },
-      data: { sentAt, status: 'SENT' },
-    });
-
-    return toOutboxEventResponse(record);
+    if (!isEventId(eventId)) throw new NotFoundException('Outbox event was not found');
+    return withTransactionRetry(() => this.client.$transaction(async tx => {
+      await lockPostgresRowById(tx, 'outbox_events', eventId);
+      const existing = await tx.outboxEvent.findFirst({ where: { id: eventId } });
+      if (!existing) throw new NotFoundException('Outbox event was not found');
+      if (!canMarkOutboxSent(existing)) return toOutboxEventResponse(existing);
+      const record = await tx.outboxEvent.update({
+        where: { id: existing.id },
+        data: { sentAt, status: 'SENT' },
+      });
+      return toOutboxEventResponse(record);
+    }));
   }
 
   async dispatchPending(input: DispatchOutboxEventsInput = {}): Promise<OutboxDispatchResponse> {
@@ -103,57 +97,60 @@ export class OutboxService {
         continue;
       }
 
+      // A batch may wait behind slow sends. Refresh each claim before its delivery.
+      const lease = event.availableAt;
+      if (!lease) {
+        skipped++;
+        continue;
+      }
+      const leaseUntil = new Date(Math.max(Date.now() + DEFAULT_PROCESSING_TIMEOUT_SECONDS * 1000, +lease + 1));
+      const claim = { id: event.id, status: 'PROCESSING' as const };
+      const renewed = await this.client.outboxEvent.updateMany({
+        where: { ...claim, availableAt: lease },
+        data: { availableAt: leaseUntil },
+      });
+      if (!renewed.count) {
+        skipped++;
+        continue;
+      }
+
+      let deliveryError: string | null = null;
       try {
         await this.deliverEvent(event);
-        const sentAt = new Date();
-        const marked = await this.client.outboxEvent.update({
-          where: { id: event.id },
-          data: {
-            status: 'SENT',
-            sentAt,
-            lastError: null,
-            attempts: { increment: 1 },
-          },
-        });
-        dispatched += 1;
-        events.push({
-          id: marked.id,
-          eventType: marked.type,
-          status: OutboxDeliveryStatus.SENT,
-          attempts: marked.attempts ?? null,
-          nextAvailableAt: null,
-        });
       } catch (error: unknown) {
-        const decision = getNextRetryDecision({
-          attempts: event.attempts ?? 0,
-          maxAttempts,
-          retryDelaySeconds,
-        });
-        const persistedStatus: OutboxEventUpdateInput['status'] = decision.status;
-        const updated = await this.client.outboxEvent.update({
-          where: { id: event.id },
-          data: {
-            status: persistedStatus,
-            attempts: { increment: 1 },
-            availableAt: decision.availableAt ?? new Date(),
-            lastError: normalizeError(error),
-          },
-        });
-
-        if (decision.exhausted) {
-          failed += 1;
-        } else {
-          retried += 1;
-        }
-
-        events.push({
-          id: updated.id,
-          eventType: updated.type,
-          status: decision.status,
-          attempts: updated.attempts ?? decision.attempts,
-          nextAvailableAt: decision.availableAt,
-        });
+        deliveryError = normalizeError(error);
       }
+
+      const decision = deliveryError === null ? null : getNextRetryDecision({
+        attempts: event.attempts ?? 0,
+        maxAttempts,
+        retryDelaySeconds,
+      });
+      const status = decision?.status ?? OutboxDeliveryStatus.SENT;
+      const settled = await this.client.outboxEvent.updateMany({
+        where: { ...claim, availableAt: leaseUntil },
+        data: {
+          status,
+          attempts: { increment: 1 },
+          lastError: deliveryError,
+          ...(decision ? { availableAt: decision.availableAt ?? new Date() } : { sentAt: new Date() }),
+        },
+      });
+      if (!settled.count) {
+        skipped++;
+        continue;
+      }
+
+      if (!decision) dispatched++;
+      else if (decision.exhausted) failed++;
+      else retried++;
+      events.push({
+        id: event.id,
+        eventType: event.type,
+        status,
+        attempts: (event.attempts ?? 0) + 1,
+        nextAvailableAt: decision?.availableAt ?? null,
+      });
     }
 
     return {
@@ -202,90 +199,81 @@ export class OutboxService {
     eventId: string,
     input: RequeueDeadLetterOutboxEventInput,
   ): Promise<OutboxEventResponse> {
-    const existing = await this.client.outboxEvent.findFirst({ where: { id: eventId } });
+    if (!isEventId(eventId)) throw new NotFoundException('Outbox event was not found');
+    const reason = input.reason.trim();
+    if (reason.length < 3) throw new BadRequestException('Requeue reason must contain at least three characters');
+    const updated = await withTransactionRetry(() => this.client.$transaction(async tx => {
+      await lockPostgresRowById(tx, 'outbox_events', eventId);
+      const existing = await tx.outboxEvent.findFirst({ where: { id: eventId } });
 
-    if (!existing) {
-      throw new NotFoundException('Outbox event was not found');
-    }
+      if (!existing) throw new NotFoundException('Outbox event was not found');
+      if (getOutboxDeliveryStatus(existing) !== OutboxDeliveryStatus.DEAD_LETTER) {
+        throw new ConflictException('Only dead-letter outbox events can be requeued');
+      }
 
-    if (getOutboxDeliveryStatus(existing) !== OutboxDeliveryStatus.DEAD_LETTER) {
-      throw new ConflictException('Only dead-letter outbox events can be requeued');
-    }
+      const availableInSeconds = Math.max(0, input.availableInSeconds ?? 0);
+      const now = new Date();
+      const availableAt = new Date(+now + availableInSeconds * 1000);
+      const payloadEnvelope = toRecordOrNull(existing.payload);
+      const existingHeaders = toRecordOrNull(payloadEnvelope?.['headers']);
+      const payload = payloadEnvelope && 'payload' in payloadEnvelope ? payloadEnvelope['payload'] : existing.payload ?? {};
+      const requeueHistory = Array.isArray(existingHeaders?.['requeueHistory']) ? existingHeaders['requeueHistory'] : [];
 
-    const availableInSeconds = Math.max(0, input.availableInSeconds ?? 0);
-    const availableAt = new Date(Date.now() + availableInSeconds * 1000);
-    const payloadEnvelope = toRecordOrNull(existing.payload);
-    const existingHeaders = toRecordOrNull(payloadEnvelope?.['headers']);
-    const payload = payloadEnvelope && 'payload' in payloadEnvelope ? payloadEnvelope['payload'] : existing.payload ?? {};
-    const requeueHistory = Array.isArray(existingHeaders?.['requeueHistory'])
-      ? existingHeaders['requeueHistory'] as unknown[]
-      : [];
-
-    const updated = await this.client.outboxEvent.update({
-      where: { id: existing.id },
-      data: {
-        status: 'PENDING',
-        availableAt,
-        sentAt: null,
-        lastError: null,
-        attempts: input.resetAttempts === false ? existing.attempts ?? 0 : 0,
-        payload: withHeaders(payload, {
-          ...(existingHeaders ?? {}),
-          requeueHistory: [
-            ...requeueHistory.slice(-9),
-            {
-              reason: input.reason.trim(),
-              requeuedAt: new Date().toISOString(),
-              previousAttempts: existing.attempts ?? 0,
-              availableAt: availableAt.toISOString(),
-            },
-          ],
-        }),
-      },
-    });
+      return tx.outboxEvent.update({
+        where: { id: existing.id },
+        data: {
+          status: 'PENDING',
+          availableAt,
+          sentAt: null,
+          lastError: null,
+          attempts: input.resetAttempts === false ? existing.attempts ?? 0 : 0,
+          payload: withHeaders(payload, {
+            ...(existingHeaders ?? {}),
+            requeueHistory: [
+              ...requeueHistory.slice(-9),
+              { reason, requeuedAt: now.toISOString(), previousAttempts: existing.attempts ?? 0, availableAt: availableAt.toISOString() },
+            ],
+          }),
+        },
+      });
+    }));
 
     return toOutboxEventResponse(updated);
   }
 
   async receiveInboxEvent(input: ReceiveInboxEventInput): Promise<InboxEventResponse> {
     const normalized = normalizeInboxEventInput(input);
-    const existing = await this.client.inboxEvent.findFirst({
-      where: {
+    return withTransactionRetry(() => this.client.$transaction(async tx => {
+      const identity = {
         sourceSystem: normalized.sourceSystem,
         externalEventId: normalized.externalEventId,
-      },
-    });
+      };
+      await lockPostgresAdvisoryTransaction(tx, 'idempotency_key', `inbox-event:${JSON.stringify(Object.values(identity))}`);
+      const existing = await tx.inboxEvent.findFirst({ where: identity });
 
-    if (existing) {
-      if (!sameJsonValue(existing.payload ?? {}, normalized.payload ?? {})) {
-        throw new ConflictException(
-          'Inbox event externalEventId was already received with a different payload',
-        );
+      if (existing) {
+        if (existing.type !== normalized.eventType || !sameJsonValue(existing.payload ?? {}, normalized.payload ?? {})) {
+          throw new ConflictException('Inbox event externalEventId was already received with a different type or payload');
+        }
+        if (!matchesInboxHeaders(existing, normalized.headers ?? null)) {
+          throw new ConflictException('Inbox event externalEventId was already received with different headers');
+        }
+        return toInboxEventResponse(existing, true);
       }
 
-      if (!sameJsonValue(existing.headers ?? null, normalized.headers ?? null)) {
-        throw new ConflictException(
-          'Inbox event externalEventId was already received with different headers',
-        );
-      }
-
-      return toInboxEventResponse(existing, true);
-    }
-
-    const record = await this.client.inboxEvent.create({
-      data: {
-        sourceSystem: normalized.sourceSystem,
-        externalEventId: normalized.externalEventId,
-        type: normalized.eventType,
-        status: InboxEventStatus.RECEIVED,
-        payload: normalized.payload ?? {},
-        headers: normalized.headers ?? null,
-        resourceType: normalized.resourceType,
-        resourceId: normalized.resourceId,
-      },
-    });
-
-    return toInboxEventResponse(record, false);
+      const record = await tx.inboxEvent.create({
+        data: {
+          ...identity,
+          type: normalized.eventType,
+          status: InboxEventStatus.RECEIVED,
+          payload: normalized.payload ?? {},
+          headers: normalized.headers ?? null,
+          resourceType: normalized.resourceType,
+          resourceId: normalized.resourceId,
+        },
+      });
+      return toInboxEventResponse(record, false);
+    }));
   }
 
   async listInboxEvents(input: ListInboxEventsInput = {}): Promise<InboxEventResponse[]> {
@@ -307,64 +295,58 @@ export class OutboxService {
     eventId: string,
     input: MarkInboxEventProcessedInput = {},
   ): Promise<InboxEventResponse> {
-    const existing = await this.client.inboxEvent.findFirst({ where: { id: eventId } });
-
-    if (!existing) {
-      throw new NotFoundException('Inbox event was not found');
-    }
-
-    if (existing.status === InboxEventStatus.PROCESSED) {
-      return toInboxEventResponse(existing, false);
-    }
-
-    if (existing.status === InboxEventStatus.FAILED) {
-      throw new ConflictException(
-        'Failed inbox events must be retried before they can be processed',
-      );
-    }
-
-    const processedAt = new Date();
-    const updated = await this.client.inboxEvent.update({
-      where: { id: existing.id },
-      data: {
-        status: InboxEventStatus.PROCESSED,
-        processedAt,
-        resourceType: normalizeOptional(input.resourceType) ?? existing.resourceType ?? null,
-        resourceId: normalizeOptional(input.resourceId) ?? existing.resourceId ?? null,
-        lastError: null,
-        attempts: { increment: 1 },
-        headers: mergeJsonRecord(existing.headers, { processedMetadata: input.metadata ?? null }),
-      },
-    });
-
-    return toInboxEventResponse(updated, false);
+    return withTransactionRetry(() => this.client.$transaction(async tx => {
+      const existing = await this.lockInboxEvent(tx, eventId);
+      if (existing.status === InboxEventStatus.PROCESSED) return toInboxEventResponse(existing, false);
+      if (existing.status === InboxEventStatus.FAILED) {
+        throw new ConflictException('Failed inbox events must be retried before they can be processed');
+      }
+      const updated = await tx.inboxEvent.update({
+        where: { id: existing.id },
+        data: {
+          status: InboxEventStatus.PROCESSED,
+          processedAt: new Date(),
+          resourceType: normalizeOptional(input.resourceType) ?? existing.resourceType ?? null,
+          resourceId: normalizeOptional(input.resourceId) ?? existing.resourceId ?? null,
+          lastError: null,
+          attempts: { increment: 1 },
+          processingMetadata: mergeJsonRecord(existing.processingMetadata, { processedMetadata: input.metadata ?? null }),
+        },
+      });
+      return toInboxEventResponse(updated, false);
+    }));
   }
 
   async markInboxFailed(
     eventId: string,
     input: MarkInboxEventFailedInput,
   ): Promise<InboxEventResponse> {
-    const existing = await this.client.inboxEvent.findFirst({ where: { id: eventId } });
+    const message = normalizeRequired(input.errorMessage, 'errorMessage');
+    return withTransactionRetry(() => this.client.$transaction(async tx => {
+      const existing = await this.lockInboxEvent(tx, eventId);
+      if (existing.status === InboxEventStatus.FAILED) return toInboxEventResponse(existing, false);
+      if (existing.status === InboxEventStatus.PROCESSED) {
+        throw new ConflictException('Processed inbox events cannot be marked failed');
+      }
+      const updated = await tx.inboxEvent.update({
+        where: { id: existing.id },
+        data: {
+          status: InboxEventStatus.FAILED,
+          lastError: message,
+          attempts: { increment: 1 },
+          processingMetadata: mergeJsonRecord(existing.processingMetadata, { failedMetadata: input.metadata ?? null }),
+        },
+      });
+      return toInboxEventResponse(updated, false);
+    }));
+  }
 
-    if (!existing) {
-      throw new NotFoundException('Inbox event was not found');
-    }
-
-    if (existing.status === InboxEventStatus.PROCESSED) {
-      throw new ConflictException('Processed inbox events cannot be marked failed');
-    }
-
-    const updated = await this.client.inboxEvent.update({
-      where: { id: existing.id },
-      data: compactRecord({
-        status: InboxEventStatus.FAILED,
-        lastError: input.errorMessage.trim(),
-        attempts: { increment: 1 },
-        headers: mergeJsonRecord(existing.headers, { failedMetadata: input.metadata ?? null }),
-      }),
-    });
-
-    return toInboxEventResponse(updated, false);
+  private async lockInboxEvent(tx: OutboxTransactionClient, eventId: string): Promise<InboxEventRecord> {
+    if (!isEventId(eventId)) throw new NotFoundException('Inbox event was not found');
+    await lockPostgresRowById(tx, 'inbox_events', eventId);
+    const event = await tx.inboxEvent.findFirst({ where: { id: eventId } });
+    if (!event) throw new NotFoundException('Inbox event was not found');
+    return event;
   }
 
   private async claimPendingEvents(
@@ -389,7 +371,7 @@ export class OutboxService {
             SELECT id
             FROM outbox_events
             WHERE status IN ('PENDING', 'PROCESSING')
-              AND available_at <= NOW()
+              AND available_at <= (statement_timestamp() AT TIME ZONE 'UTC')
               ${typeFilter}
             ORDER BY created_at ASC, id ASC
             FOR UPDATE SKIP LOCKED
@@ -397,8 +379,8 @@ export class OutboxService {
           )
           UPDATE outbox_events AS event
           SET status = 'PROCESSING',
-              available_at = NOW() + INTERVAL '5 minutes',
-              updated_at = NOW()
+              available_at = (statement_timestamp() AT TIME ZONE 'UTC') + INTERVAL '5 minutes',
+              updated_at = statement_timestamp() AT TIME ZONE 'UTC'
           FROM claimed
           WHERE event.id = claimed.id
           RETURNING
@@ -434,7 +416,7 @@ export class OutboxService {
           updated_at AS "updatedAt"
         FROM outbox_events
         WHERE status IN ('PENDING', 'PROCESSING')
-          AND available_at <= NOW()
+          AND available_at <= (statement_timestamp() AT TIME ZONE 'UTC')
           ${typeFilter}
         ORDER BY created_at ASC, id ASC
         FOR UPDATE SKIP LOCKED
@@ -524,7 +506,9 @@ function toInboxEventResponse(record: InboxEventRecord, duplicate: boolean): Inb
     eventType: record.type,
     status: normalizeInboxStatus(record.status),
     payload: record.payload ?? {},
-    headers: toRecordOrNull(record.headers),
+    headers: record.processingMetadata
+      ? mergeJsonRecord(record.headers, toRecordOrNull(record.processingMetadata) ?? {})
+      : toRecordOrNull(record.headers),
     resourceType: record.resourceType ?? null,
     resourceId: record.resourceId ?? null,
     attempts: record.attempts ?? 0,
@@ -584,7 +568,7 @@ function normalizeRequired(value: string, fieldName: string): string {
   const normalized = value.trim();
 
   if (normalized.length === 0) {
-    throw new Error(`${fieldName} is required`);
+    throw new BadRequestException(`${fieldName} is required`);
   }
 
   return normalized;
@@ -614,6 +598,24 @@ function compactRecord(record: Record<string, unknown>): Record<string, unknown>
 
 function sameJsonValue(left: unknown, right: unknown): boolean {
   return stableStringify(left) === stableStringify(right);
+}
+
+function isEventId(value: string): boolean {
+  return /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function matchesInboxHeaders(existing: InboxEventRecord, supplied: Record<string, unknown> | null): boolean {
+  if (sameJsonValue(existing.headers ?? null, supplied)) return true;
+  if (existing.processingMetadata || !existing.attempts) return false;
+  const headers = toRecordOrNull(existing.headers);
+  const key = existing.status === InboxEventStatus.PROCESSED ? 'processedMetadata'
+    : existing.status === InboxEventStatus.FAILED ? 'failedMetadata' : null;
+  if (!headers || !key || (headers[key] !== null && !toRecordOrNull(headers[key]))) return false;
+
+  // Older rows combined the sender headers with the worker result.
+  const original = { ...headers };
+  delete original[key];
+  return sameJsonValue(original, supplied) || (supplied === null && Object.keys(original).length === 0);
 }
 
 function stableStringify(value: unknown): string {
@@ -663,6 +665,7 @@ interface OutboxEventDelegate {
     skip: number;
   }): Promise<OutboxEventRecord[]>;
   update(args: { where: { id: string }; data: OutboxEventUpdateInput }): Promise<OutboxEventRecord>;
+  updateMany(args: { where: OutboxEventWhereInput; data: OutboxEventUpdateInput }): Promise<{ count: number }>;
 }
 
 interface InboxEventDelegate {
@@ -713,14 +716,14 @@ interface InboxEventUpdateInput {
   resourceId?: string | null;
   lastError?: string | null;
   attempts?: { increment: number };
-  headers?: Record<string, unknown>;
+  processingMetadata?: Record<string, unknown>;
 }
 
 interface OutboxEventWhereInput {
   id?: string;
   type?: string;
   status?: 'PENDING' | 'PROCESSING' | 'SENT' | 'FAILED' | 'DEAD_LETTER';
-  availableAt?: { lte: Date };
+  availableAt?: Date | { lte: Date };
 }
 
 interface InboxEventWhereInput {
@@ -754,6 +757,7 @@ interface InboxEventRecord {
   status: string;
   payload?: unknown;
   headers?: unknown;
+  processingMetadata?: unknown;
   resourceType?: string | null;
   resourceId?: string | null;
   attempts?: number | null;

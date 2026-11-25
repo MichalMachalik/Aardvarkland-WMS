@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { createServer } from 'node:http';
 
 const warehouse = '/api/warehouses/MAIN';
 
@@ -1336,6 +1337,184 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     const another = await asAdmin('POST', '/api/inbox/events', { ...eventBody, externalEventId: `FAILED-${suffix}` });
     const failed = await asAdmin('POST', `/api/outbox/events/inbox/${another.id}/failed`, { errorMessage: 'Test failure' });
     assert.equal(failed.status, 'FAILED');
+  });
+
+  await scenario('inbox redelivery preserves the original message and terminal decisions are recorded once', async () => {
+    const inbox = '/api/inbox/events';
+    const alias = '/api/outbox/events/inbox';
+    const body = {
+      sourceSystem: `QUEUE-${suffix}`,
+      externalEventId: `QUEUE-RECEIVED-${suffix}`,
+      eventType: 'TEST_INCOMING',
+      payload: { sku: 'FIXTURE', quantity: 1 },
+      headers: { correlationId: suffix, processedMetadata: 'Sender header' },
+    };
+    const received = await asAdmin('POST', inbox, body);
+    const processedPath = `${alias}/${received.id}/processed`;
+    const processed = await asAdmin('POST', processedPath, { resourceType: 'SKU', resourceId: 'FIXTURE', metadata: { mapped: true } });
+    assert.equal(processed.status, 'PROCESSED');
+    assert.deepEqual(processed.headers, { correlationId: suffix, processedMetadata: { mapped: true } });
+    const replay = await asAdmin('POST', alias, body);
+    assert.equal(replay.id, received.id);
+    assert.equal(replay.duplicate, true);
+    assert.equal(replay.attempts, 1);
+    assert.equal(replay.resourceId, 'FIXTURE');
+    const persisted = await prisma.inboxEvent.findUniqueOrThrow({ where: { id: received.id } });
+    assert.deepEqual(persisted.headers, body.headers);
+    await asAdmin('POST', inbox, { ...body, headers: { ...body.headers, correlationId: 'changed' } }, 409);
+    await asAdmin('POST', inbox, { ...body, eventType: 'INCOMING_WRONG_TYPE' }, 409);
+    await asAdmin('POST', inbox, { ...body, sourceSystem: '   ' }, 400);
+    const reread = await asAdmin('POST', processedPath, { resourceId: 'NOT-THE-ORIGINAL' });
+    assert.equal(reread.resourceId, 'FIXTURE');
+    assert.equal(reread.attempts, 1);
+
+    const second = { ...body, externalEventId: `QUEUE-RACE-${suffix}`, headers: { correlationId: suffix } };
+    const receipts = await Promise.all([asAdmin('POST', inbox, second), asAdmin('POST', alias, second)]);
+    assert.equal(receipts[0].id, receipts[1].id);
+    assert.deepEqual(receipts.map(entry => entry.duplicate).sort(), [false, true]);
+    const id = receipts[0].id;
+    const competing = await Promise.all([
+      asAdmin('POST', `${alias}/${id}/processed`, {}, [201, 409]),
+      asAdmin('POST', `${inbox}/${id}/failed`, { errorMessage: 'Fixture failure' }, [201, 409]),
+    ]);
+    assert.equal(competing.filter(item => ['FAILED', 'PROCESSED'].includes(item.status)).length, 1);
+    assert.equal((await prisma.inboxEvent.findUniqueOrThrow({ where: { id } })).attempts, 1);
+
+    const failedBody = { ...body, externalEventId: `QUEUE-FAILED-${suffix}`, headers: undefined };
+    const failed = await asAdmin('POST', inbox, failedBody);
+    const failedPath = `${inbox}/${failed.id}/failed`;
+    await asAdmin('POST', failedPath, { errorMessage: '  ' }, 400);
+    await asAdmin('POST', failedPath, { errorMessage: 'Original failure', metadata: { parser: 'fixture' } });
+    const failedReplay = await asAdmin('POST', failedPath, { errorMessage: 'Duplicate failure' });
+    assert.equal(failedReplay.lastError, 'Original failure');
+    assert.equal(failedReplay.attempts, 1);
+    assert.equal((await asAdmin('POST', alias, failedBody)).duplicate, true);
+    await asAdmin('POST', `${alias}/${failed.id}/processed`, {}, 409);
+
+    const legacy = await prisma.inboxEvent.create({
+      data: {
+        sourceSystem: body.sourceSystem, externalEventId: `QUEUE-LEGACY-${suffix}`, type: body.eventType,
+        status: 'PROCESSED', attempts: 1, processedAt: new Date(), payload: body.payload,
+        headers: { correlationId: suffix, processedMetadata: { legacy: true } },
+      },
+    });
+    const legacyReplay = await asAdmin('POST', inbox, {
+      ...body, externalEventId: legacy.externalEventId, headers: { correlationId: suffix },
+    });
+    assert.equal(legacyReplay.id, legacy.id);
+    assert.equal(legacyReplay.duplicate, true);
+    assert.deepEqual(legacyReplay.headers.processedMetadata, { legacy: true });
+  });
+
+  await scenario('outbox workers respect endpoint filters and resume a dead-letter event once', async () => {
+    const [{ timezone }] = await prisma.$queryRaw`SELECT current_setting('TimeZone') AS timezone`;
+    assert.equal(timezone, 'Europe/Prague');
+    const eventType = `OUTBOX-FIXTURE-${suffix}`;
+    const received = [];
+    let rejectDelivery = true;
+    let onDelivery;
+    const receiver = createServer(async (req, res) => {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      received.push({ route: req.url, payload });
+      await onDelivery?.(payload);
+      res.writeHead(rejectDelivery ? 503 : 200);
+      res.end('fixture');
+    });
+    await new Promise(resolve => receiver.listen(0, '127.0.0.1', resolve));
+    const baseUrl = `http://127.0.0.1:${receiver.address().port}`;
+    const endpointIds = [];
+    try {
+      for (const [name, types, path] of [
+        ['Matching fixture', [eventType], '/business-events'],
+        ['Unrelated fixture', ['ANOTHER-FIXTURE-EVENT'], '/unrelated'],
+      ]) {
+        const endpoint = await prisma.integrationEndpoint.create({
+          data: {
+            code: `${name.startsWith('Matching') ? 'MATCH' : 'OTHER'}-${suffix}`, name, type: 'ERP',
+            status: 'ACTIVE', baseUrl, config: { eventTypes: types, path },
+          },
+        });
+        endpointIds.push(endpoint.id);
+      }
+      const event = await prisma.outboxEvent.create({
+        data: { type: eventType, aggregateType: 'fixture', aggregateId: suffix, payload: { test: true } },
+      });
+      const outbox = '/api/outbox/events';
+      const dispatch = outbox + '/dispatch';
+      const worker = '/api/jobs/queue-worker/run-once';
+      const dispatchBody = { eventType, take: 2, maxAttempts: 2, retryDelaySeconds: 60 };
+      const readEvent = () => prisma.outboxEvent.findUniqueOrThrow({ where: { id: event.id } });
+      const preview = await asAdmin('POST', dispatch, { ...dispatchBody, dryRun: true });
+      assert.equal(preview.skipped, 1);
+      assert.equal((await readEvent()).attempts, 0);
+      assert.deepEqual(received, []);
+      const first = await asAdmin('POST', dispatch, dispatchBody);
+      assert.equal(first.claimed, 1);
+      assert.equal(first.retried, 1);
+      assert.equal((await readEvent()).status, 'PENDING');
+      assert.equal((await asAdmin('POST', worker, dispatchBody)).claimed, 0);
+      assert.deepEqual(received.map(call => call.route), ['/business-events']);
+      await asAdmin('POST', dispatch, { ...dispatchBody, dryRun: 'false' }, 400);
+
+      await prisma.outboxEvent.update({ where: { id: event.id }, data: { availableAt: new Date(0) } });
+      const second = await asAdmin('POST', dispatch, dispatchBody);
+      assert.equal(second.failed, 1);
+      const letters = await asAdmin('GET', outbox + '/dead-letter?' + new URLSearchParams({ eventType }));
+      assert.equal(letters[0].id, event.id);
+      assert.equal(letters[0].attempts, 2);
+      const requeuePath = `${outbox}/dead-letter/${event.id}/requeue`;
+      await asAdmin('POST', requeuePath, { reason: '   ' }, 400);
+      await asAdmin('POST', requeuePath, { reason: 'Fixture recovered', resetAttempts: 'false' }, 400);
+      const requeued = await Promise.all([
+        asAdmin('POST', requeuePath, { reason: 'Fixture recovered', resetAttempts: false }, [201, 409]),
+        asAdmin('POST', requeuePath, { reason: 'Competing action', resetAttempts: false }, [201, 409]),
+      ]);
+      const ready = requeued.filter(entry => entry.deliveryStatus === 'PENDING');
+      assert.equal(ready.length, 1);
+      assert.equal(ready[0].headers.requeueHistory.length, 1);
+      assert.equal(ready[0].attempts, 2);
+      rejectDelivery = false;
+      const results = await Promise.all([
+        asAdmin('POST', worker, dispatchBody),
+        asAdmin('POST', dispatch, dispatchBody),
+      ]);
+      assert.equal(results.reduce((count, result) => count + result.claimed, 0), 1);
+      assert.equal(results.reduce((count, result) => count + result.dispatched, 0), 1);
+      const saved = await readEvent();
+      assert.equal(saved.status, 'SENT');
+      assert.equal(saved.attempts, 3);
+      assert.equal(saved.lastError, null);
+      assert.deepEqual(received.map(call => [call.route, call.payload.id, call.payload.attempt]), [
+        ['/business-events', event.id, 0], ['/business-events', event.id, 1], ['/business-events', event.id, 2],
+      ]);
+      await asAdmin('POST', requeuePath, { reason: 'Already sent' }, 409);
+
+      const newClaim = new Date(Date.now() + 600_000);
+      const reclaimed = await prisma.outboxEvent.create({
+        data: { type: eventType, aggregateType: 'fixture', aggregateId: suffix, payload: { test: true } },
+      });
+      onDelivery = async payload => {
+        if (payload.id === reclaimed.id) {
+          await prisma.outboxEvent.update({
+            where: { id: reclaimed.id }, data: { availableAt: newClaim },
+          });
+        }
+      };
+      const stale = await asAdmin('POST', dispatch, dispatchBody);
+      assert.equal(stale.claimed, 1);
+      assert.equal(stale.skipped, 1);
+      assert.equal(stale.dispatched, 0);
+      const activeClaim = await prisma.outboxEvent.findUniqueOrThrow({ where: { id: reclaimed.id } });
+      assert.equal(activeClaim.status, 'PROCESSING');
+      assert.equal(activeClaim.availableAt.toISOString(), newClaim.toISOString());
+      assert.equal(activeClaim.attempts, 0);
+    } finally {
+      await prisma.integrationEndpoint.updateMany({ where: { id: { in: endpointIds } }, data: { status: 'INACTIVE' } });
+      receiver.closeAllConnections();
+      await new Promise(resolve => receiver.close(resolve));
+    }
   });
 
   await scenario('quality checks handle a missing stock reference and quarantine and release real stock', async () => {

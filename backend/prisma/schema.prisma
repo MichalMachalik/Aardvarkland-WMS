@@ -1606,7 +1606,7 @@ model OutboxEvent {
   status        OutboxEventStatus @default(PENDING)
   attempts      Int               @default(0)
   lastError     String?           @map("last_error")
-  availableAt   DateTime          @default(now()) @map("available_at")
+  availableAt   DateTime          @default(dbgenerated("(CURRENT_TIMESTAMP AT TIME ZONE 'UTC'::text)")) @map("available_at")
   sentAt        DateTime?         @map("sent_at")
   createdAt     DateTime          @default(now()) @map("created_at")
   updatedAt     DateTime          @default(now()) @updatedAt @map("updated_at")
@@ -1624,6 +1624,7 @@ model InboxEvent {
   status          InboxEventStatus @default(RECEIVED)
   payload         Json
   headers         Json?
+  processingMetadata Json?        @map("processing_metadata")
   resourceType    String?          @map("resource_type")
   resourceId      String?          @map("resource_id")
   attempts        Int              @default(0)
