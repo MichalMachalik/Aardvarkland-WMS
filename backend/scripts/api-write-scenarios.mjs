@@ -141,6 +141,81 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.equal(saved.quantity, 3);
   });
 
+  await scenario('manual reservations validate the order SKU and release each stock hold once', async () => {
+    const { sku } = await createSku('RESERVATION');
+    const { sku: otherSku } = await createSku('RESERVATION-OTHER');
+    const locationReference = 'A-01-01';
+    const receive = (skuReference, quantity, status) =>
+      own('POST', '/inventory/quants/receive', { skuReference, locationReference, quantity, status });
+    const { quant } = await receive(sku.code, 7);
+    const { quant: other } = await receive(otherSku.code, 5);
+    const { quant: damaged } = await receive(sku.code, 3, 'DAMAGED');
+    const order = await own('POST', '/outbound-orders', {
+      orderNumber: `MANUAL-RES-${suffix}`,
+      lines: [{ lineNumber: '1', sku: sku.code.toLowerCase(), orderedQuantity: 6 }],
+    });
+    const lineId = order.lines[0].id;
+    const path = '/reservations';
+    const create = { stockQuantReference: quant.id, outboundOrderLineId: lineId, quantity: 2 };
+    await own('POST', path, { ...create, stockQuantReference: other.id }, 409);
+    await own('POST', path, { ...create, stockQuantReference: damaged.id }, 409);
+    await own('POST', path, { ...create, quantity: 7 }, 409);
+    assert.equal(await prisma.reservation.count({ where: { outboundOrderLineId: lineId } }), 0);
+    assert.equal(await prisma.stockQuant.count({ where: { id: { in: [other.id, damaged.id] }, reservedQuantity: 0 } }), 2);
+
+    const released = await own('POST', path, create);
+    assert.equal(released.status, 'ACTIVE');
+    assert.equal(released.sku, sku.code);
+    assert.equal(released.outboundOrderId, order.id);
+    assert.equal(released.outboundOrderLineId, lineId);
+    const releasedPath = `${path}/${released.id}`;
+    const task = await prisma.warehouseTask.findFirstOrThrow({ where: { reservationId: released.id } });
+    assert.equal(task.status, 'OPEN');
+    await own('POST', `/tasks/${task.id}/assign`, {});
+    const stock = () => prisma.stockQuant.findUniqueOrThrow({ where: { id: quant.id } });
+    assert.equal((await stock()).reservedQuantity, 2);
+    const releaseBody = { reason: 'Test release of assigned work' };
+    const releases = await Promise.all([
+      own('POST', releasedPath + '/release', releaseBody, [201, 409]),
+      own('POST', releasedPath + '/release', releaseBody, [201, 409]),
+    ]);
+    assert.equal(releases.filter(entry => entry.status === 'RELEASED').length, 1);
+    assert.equal((await own('GET', releasedPath)).status, 'RELEASED');
+    assert.equal((await stock()).reservedQuantity, 0);
+    assert.equal((await own('GET', `/tasks/${task.id}`)).status, 'CANCELLED');
+    await own('POST', `/tasks/${task.id}/start`, {}, 409);
+    const entries = await own('GET', `${path}?sku=${encodeURIComponent(sku.code.toLowerCase())}&status=RELEASED`);
+    assert.deepEqual(entries.map(entry => entry.id), [released.id]);
+    assert.deepEqual(await own('GET', `${path}?sku=${otherSku.code}&status=RELEASED`), []);
+
+    const cancel = await own('POST', path, { stockQuantReference: quant.id, quantity: 4 });
+    const cancelPath = `${path}/${cancel.id}`;
+    assert.equal((await stock()).reservedQuantity, 4);
+    assert.equal((await own('POST', cancelPath + '/cancel', { reason: 'Test cancellation' })).status, 'CANCELLED');
+    await own('POST', cancelPath + '/release', undefined, 409);
+    assert.equal((await stock()).reservedQuantity, 0);
+    for (const [record, quantity, action] of [[released, 2, 'released'], [cancel, 4, 'cancelled']]) {
+      const movements = await prisma.stockMovement.findMany({ where: { reservationId: record.id } });
+      assert.deepEqual(movements.map(movement => [movement.type, movement.quantity]).sort(),
+        [['CANCEL_RESERVATION', quantity], ['RESERVE', quantity]]);
+      assert.equal(await prisma.auditLog.count({ where: { resourceId: record.id, action: `reservation.${action}` } }), 1);
+    }
+
+    const racing = await own('POST', path, create);
+    const racingTask = await prisma.warehouseTask.findFirstOrThrow({ where: { reservationId: racing.id } });
+    const outcomes = await Promise.all([
+      own('POST', `${path}/${racing.id}/cancel`, {}, [201, 409]),
+      own('POST', `/tasks/${racingTask.id}/start`, {}, [201, 409]),
+    ]);
+    const cancelled = outcomes[0].status === 'CANCELLED';
+    assert.equal(outcomes[1].status === 'IN_PROGRESS', !cancelled);
+    assert.equal((await stock()).reservedQuantity, cancelled ? 0 : 2);
+    if (!cancelled) {
+      await own('POST', `${path}/${racing.id}/release`, {}, 409);
+      assert.equal((await stock()).reservedQuantity, 2);
+    }
+  });
+
   await scenario('warehouse tasks claim available work and apply terminal transitions once', async () => {
     const zone = `TASK-${suffix}`;
     const location = await own('POST', '/locations', {

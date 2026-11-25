@@ -44,7 +44,7 @@ export function toReservationResponse(value: RuntimeRecord): ReservationResponse
       readNullableString(value, 'orderLineId') ??
       null,
     skuId: readNullableString(value, 'skuId') ?? null,
-    sku: readNullableString(value, 'sku') ?? null,
+    sku: readString(toRecord(value['sku']), 'code') ?? readNullableString(value, 'sku') ?? null,
     quantity: readNumber(value, 'quantity') ?? 0,
     status: readString(value, 'status') ?? ReservationStatus.ACTIVE,
     createdByUserId: readNullableString(value, 'createdByUserId') ?? null,

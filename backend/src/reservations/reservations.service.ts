@@ -30,6 +30,8 @@ import {
 } from './reservation-mappers';
 import { ReservationResponse, ReservationStatus } from './reservations.types';
 
+const skuInclude = { sku: { select: { code: true } } };
+
 @Injectable()
 export class ReservationsService {
   constructor(private readonly prisma: PrismaService, private readonly ownerScope: OwnerScopeService) {}
@@ -55,7 +57,7 @@ export class ReservationsService {
       andConditions.push({ id: { in: ownedReservationIds } });
       where['AND'] = andConditions;
     }
-    const args: RuntimeRecord = { where };
+    const args: RuntimeRecord = { where, include: skuInclude };
 
     if (reservationFields.has('createdAt')) {
       args['orderBy'] = { createdAt: 'desc' };
@@ -169,8 +171,14 @@ export class ReservationsService {
         throw new ConflictException('Outbound order cannot be reserved in its current status');
       }
     }
+    const stockQuant = await this.resolveStockQuant(client, warehouseId, dto.stockQuantReference);
     if (orderContext.outboundOrderLineId) {
       const line = await this.resolveOutboundOrderLine(client, warehouseId, orderContext.outboundOrderLineId);
+      const orderedSku = readString(line, 'sku');
+      const stockSku = readString(toRecord(stockQuant['sku']), 'code');
+      if (!orderedSku || !stockSku || normalizeSku(orderedSku) !== stockSku) {
+        throw new ConflictException('Stock SKU must match the outbound order line');
+      }
       const reservationFields = getModelFields(client, 'Reservation');
       const lineField = firstField(reservationFields, ['outboundOrderLineId', 'orderLineId']);
       const existing = lineField ? await getDelegate<RuntimeRecord>(client, 'reservation', 'Reservation').findMany({
@@ -180,7 +188,6 @@ export class ReservationsService {
       const remaining = (readNumber(line, 'orderedQuantity') ?? 0) - (readNumber(line, 'pickedQuantity') ?? 0) - reserved;
       if (dto.quantity > remaining) throw new ConflictException('Reservation exceeds remaining outbound line quantity');
     }
-    const stockQuant = await this.resolveStockQuant(client, warehouseId, dto.stockQuantReference);
     const stockQuantFields = getModelFields(client, 'StockQuant');
     const quantityReservedField = firstField(stockQuantFields, QUANTITY_RESERVED_FIELDS);
     const available = availableQuantity(stockQuant, quantityReservedField);
@@ -290,12 +297,12 @@ export class ReservationsService {
 
     const stockQuant = await this.resolveStockQuant(client, warehouseId, stockQuantId);
 
-    await this.releaseReservedStockQuant(client, stockQuant, quantity);
     const tasksCancelled = await this.cancelOpenReservationTasks(
       client,
       warehouseId,
       reservationId,
     );
+    await this.releaseReservedStockQuant(client, stockQuant, quantity);
     const updatedReservation = await this.updateReservationStatus(client, {
       reservation,
       targetStatus,
@@ -358,7 +365,7 @@ export class ReservationsService {
         modelReferenceWhere(reservationFields, reservationReference, ['reservationNumber', 'code']),
       ],
     };
-    const resolved = await reservation.findFirst({ where });
+    const resolved = await reservation.findFirst({ where, include: skuInclude });
 
     if (!resolved) {
       throw new NotFoundException('Reservation was not found');
@@ -380,7 +387,7 @@ export class ReservationsService {
         modelReferenceWhere(stockQuantFields, stockQuantReference, ['code', 'lotNumber']),
       ],
     };
-    const resolved = await stockQuant.findFirst({ where });
+    const resolved = await stockQuant.findFirst({ where, include: skuInclude });
 
     if (!resolved) {
       throw new NotFoundException('Stock quant was not found');
@@ -470,7 +477,7 @@ export class ReservationsService {
     return {
       ...(fields.has('warehouseId') ? { warehouseId } : {}),
       ...(query.status && fields.has('status') ? { status: query.status } : {}),
-      ...(query.sku && fields.has('sku') ? { sku: normalizeSku(query.sku) } : {}),
+      ...(query.sku ? { sku: { code: normalizeSku(query.sku) } } : {}),
       ...(query.outboundOrderId && fields.has('outboundOrderId')
         ? { outboundOrderId: query.outboundOrderId }
         : {}),
@@ -505,6 +512,9 @@ export class ReservationsService {
     }
 
     const lockedStockQuant = await this.lockAndReloadStockQuant(client, warehouseId, stockQuantId);
+    if (readString(lockedStockQuant, 'status') !== 'AVAILABLE') {
+      throw new ConflictException('Only available stock can be reserved');
+    }
     await assertNoBlockingStockFreeze(client, {
       warehouseId,
       stockQuantId,
@@ -612,29 +622,26 @@ export class ReservationsService {
     }
 
     const hasCompletedAt = fields.has('completedAt');
-    const inProgressTask = await warehouseTask.findFirst({
-      where: {
-        warehouseId,
-        reservationId,
-        status: 'IN_PROGRESS',
-      },
-    });
-
-    if (inProgressTask) {
-      throw new ConflictException('Reservation has an in-progress task and cannot be released');
-    }
-
     const result = await warehouseTask.updateMany({
       where: {
         warehouseId,
         reservationId,
-        status: 'OPEN',
+        status: { in: ['OPEN', 'ASSIGNED', 'BLOCKED', 'FAILED'] },
       },
       data: {
         status: 'CANCELLED',
         ...(hasCompletedAt ? { completedAt: new Date() } : {}),
+        ...(fields.has('version') ? { version: { increment: 1 } } : {}),
       },
     });
+
+    // If a task started while the update waited for its row, roll back the release.
+    const inProgressTask = await warehouseTask.findFirst({
+      where: { warehouseId, reservationId, status: 'IN_PROGRESS' },
+    });
+    if (inProgressTask) {
+      throw new ConflictException('Reservation has an in-progress task and cannot be released');
+    }
 
     return result.count;
   }
@@ -758,7 +765,7 @@ export class ReservationsService {
       metadata: params.metadata,
     });
 
-    const created = await reservation.create({ data });
+    const created = await reservation.create({ data, include: skuInclude });
 
     return toRecord(created);
   }
@@ -783,6 +790,7 @@ export class ReservationsService {
     const updated = await reservation.update({
       where: { id: reservationId },
       data,
+      include: skuInclude,
     });
 
     return toRecord(updated);
