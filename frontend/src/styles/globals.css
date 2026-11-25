@@ -743,7 +743,7 @@ code { max-width: 100%; overflow-wrap: anywhere; white-space: normal; }
 .align-right { text-align: right !important; }
 .align-center { text-align: center !important; }
 
-.app-status-strip, .data-source-banner, .inline-banner {
+.data-source-banner, .inline-banner {
   display: flex;
   align-items: center;
   gap: 9px;
@@ -757,7 +757,6 @@ code { max-width: 100%; overflow-wrap: anywhere; white-space: normal; }
   flex-wrap: wrap;
 }
 .data-source-banner { margin-bottom: 0; }
-.app-status-strip__api { flex: 1 1 260px; }
 .inline-banner--warning { color: #8a5a05; background: #fff9e8; border-color: #f0d99b; }
 .inline-banner--critical { color: #aa321b; background: #fff0eb; border-color: #f2cbbf; }
 .pwa-status-banner {
@@ -825,7 +824,7 @@ code { max-width: 100%; overflow-wrap: anywhere; white-space: normal; }
 .mini-table--shipments .mini-table__head, .mini-table--shipments .mini-table__row { grid-template-columns: 1fr 0.5fr 0.9fr 1fr; }
 .mini-table--tasks .mini-table__head, .mini-table--tasks .mini-table__row { grid-template-columns: 0.8fr 0.9fr 0.8fr 1.1fr; }
 
-.task-progress-list, .activity-feed, .action-list-minimal, .activity-list, .event-list, .compact-list, .timeline, .exception-grid, .scan-log, .endpoint-list, .settings-stack, .package-list, .mini-insights, .stepper, .task-kanban, .action-panel, .wave-planner, .live-stream, .nba-stack, .offline-queue, .drawer-stack, .operation-timeline, .operational-control-list, .gate-list {
+.task-progress-list, .activity-feed, .action-list-minimal, .activity-list, .event-list, .compact-list, .timeline, .exception-grid, .scan-log, .endpoint-list, .settings-stack, .package-list, .mini-insights, .stepper, .task-kanban, .action-panel, .wave-planner, .offline-queue, .drawer-stack, .operational-control-list, .gate-list {
   display: grid;
   gap: 10px;
 }
@@ -840,7 +839,7 @@ code { max-width: 100%; overflow-wrap: anywhere; white-space: normal; }
 .task-progress-list article:last-child { border-bottom: 0; }
 .task-progress-list strong { display: block; font-size: 11px; }
 .task-progress-list span, .task-progress-list small { color: var(--text-muted); font-size: 10px; }
-.activity-feed article, .action-list-minimal article, .activity-list article, .event, .timeline article, .exception-grid article, .scan-log article, .compact-list article, .wave-planner article, .package-list article, .offline-queue > article, .operation-timeline article, .operational-control-list article, .gate-list article {
+.activity-feed article, .action-list-minimal article, .activity-list article, .event, .timeline article, .exception-grid article, .scan-log article, .compact-list article, .wave-planner article, .package-list article, .offline-queue > article, .operational-control-list article, .gate-list article {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
   gap: 10px;
@@ -851,13 +850,13 @@ code { max-width: 100%; overflow-wrap: anywhere; white-space: normal; }
   background: var(--surface);
 }
 .action-list-minimal article { grid-template-columns: auto minmax(0, 1fr); }
-.activity-feed p, .action-list-minimal p, .activity-list p, .event p, .timeline p, .exception-grid p, .scan-log p, .compact-list p, .operation-timeline p, .operational-control-list small, .gate-list p {
+.activity-feed p, .action-list-minimal p, .activity-list p, .event p, .timeline p, .exception-grid p, .scan-log p, .compact-list p, .operational-control-list small, .gate-list p {
   margin: 3px 0 0;
   color: var(--text-muted);
   font-size: 11px;
   line-height: 1.45;
 }
-.activity-feed strong, .action-list-minimal strong, .activity-list strong, .event strong, .timeline strong, .exception-grid strong, .scan-log strong, .compact-list strong, .operation-timeline strong, .operational-control-list strong, .gate-list strong { font-size: 11px; font-weight: 600; }
+.activity-feed strong, .action-list-minimal strong, .activity-list strong, .event strong, .timeline strong, .exception-grid strong, .scan-log strong, .compact-list strong, .operational-control-list strong, .gate-list strong { font-size: 11px; font-weight: 600; }
 .activity-feed small, .action-list-minimal small, .activity-list small, .event small { color: var(--text-soft); font-size: 10px; }
 .feed-dot, .activity-dot {
   width: 7px;
@@ -876,14 +875,14 @@ code { max-width: 100%; overflow-wrap: anywhere; white-space: normal; }
 }
 .metric-stack--inline { grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: 0; }
 .metric-stack--compact { grid-template-columns: 1fr; }
-.metric-stack article, .settings-stack article, .role-matrix article, .detail-grid article, .rules-grid article, .system-status-card, .system-status-readiness, .health-card, .dock-card, .flow-step, .station-grid article, .carrier-grid article, .design-system-grid article, .ergonomics-grid article, .warehouse-zone, .worker-load, .live-event, .pipeline-step, .portal-grid article, .portal-stat-grid article {
+.metric-stack article, .settings-stack article, .role-matrix article, .detail-grid article, .rules-grid article, .system-status-card, .system-status-readiness, .health-card, .dock-card, .flow-step, .station-grid article, .carrier-grid article, .design-system-grid article, .ergonomics-grid article, .pipeline-step, .portal-grid article, .portal-stat-grid article {
   min-width: 0;
   padding: 12px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--surface);
 }
-.metric-stack span, .settings-stack span, .role-matrix p, .detail-grid span, .rules-grid p, .dock-card small, .health-card span, .station-grid span, .station-grid small, .carrier-grid span, .carrier-grid small, .ergonomics-grid p, .warehouse-zone span, .worker-load span, .wave-detail p, .form-hint { color: var(--text-muted); }
+.metric-stack span, .settings-stack span, .role-matrix p, .detail-grid span, .rules-grid p, .dock-card small, .health-card span, .station-grid span, .station-grid small, .carrier-grid span, .carrier-grid small, .ergonomics-grid p, .wave-detail p, .form-hint { color: var(--text-muted); }
 .metric-stack span { display: block; min-width: 0; overflow-wrap: anywhere; }
 .metric-stack strong { display: block; overflow-wrap: anywhere; font-size: 18px; font-weight: 500; }
 
@@ -924,12 +923,12 @@ code { max-width: 100%; overflow-wrap: anywhere; white-space: normal; }
 .flow-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
 .dock-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; }
 .health-grid, .system-status-grid, .system-status-grid--enterprise, .station-grid, .carrier-grid, .design-system-grid, .ergonomics-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
-.rules-grid, .detail-grid, .role-matrix, .simulation-grid, .worker-load-grid, .warehouse-map, .tower-map { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.rules-grid, .detail-grid, .role-matrix, .simulation-grid, .tower-map { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .pipeline, .pipeline--pro { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
 .pipeline section, .pipeline-step { min-height: 126px; }
 .wave-planner__bar { height: 5px; overflow: hidden; border-radius: 999px; background: #e6eae7; }
 .wave-planner__bar span { display: block; height: 100%; background: var(--primary); }
-.warehouse-zone__head, .live-event__top, .nba-card__top, .dock-card > div, .carrier-grid article > div, .station-grid article, .health-card, .settings-stack article, .system-status-card, .system-status-readiness, .gate-list article, .operational-control-list article { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.dock-card > div, .carrier-grid article > div, .station-grid article, .health-card, .settings-stack article, .system-status-card, .system-status-readiness, .gate-list article, .operational-control-list article { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .system-status-card strong { display: block; margin-top: 4px; font-size: 22px; font-weight: 500; letter-spacing: 0; }
 .system-status-readiness .progress { flex: 1; min-width: 120px; }
 .system-status-panel--compact { margin-top: 4px; }
@@ -1733,7 +1732,7 @@ code { max-width: 100%; overflow-wrap: anywhere; white-space: normal; }
 @media (max-width: 980px) {
   .topbar { align-items: center; flex-direction: row; }
   .topbar__actions { width: auto; justify-content: flex-end; overflow-x: visible; padding-bottom: 0; }
-  .metric-grid, .metric-stack--inline, .flow-grid, .dock-grid, .health-grid, .system-status-grid, .system-status-grid--enterprise, .station-grid, .carrier-grid, .design-system-grid, .ergonomics-grid, .rules-grid, .tower-map, .pipeline, .pipeline--pro, .worker-load-grid, .warehouse-map, .portal-grid, .flow-stepper, .role-matrix, .detail-grid, .simulation-grid, .event-list--grid, .activity-list--two-col { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .metric-grid, .metric-stack--inline, .flow-grid, .dock-grid, .health-grid, .system-status-grid, .system-status-grid--enterprise, .station-grid, .carrier-grid, .design-system-grid, .ergonomics-grid, .rules-grid, .tower-map, .pipeline, .pipeline--pro, .portal-grid, .flow-stepper, .role-matrix, .detail-grid, .simulation-grid, .event-list--grid, .activity-list--two-col { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .span-3, .span-4, .span-5, .span-6, .span-7, .span-8, .span-9 { grid-column: span 12; }
   .client-panel-grid, .client-kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .client-portal-shell, .packing-workbench, .packing-workbench--os, .packing-desk, .packing-desk--pro { grid-template-columns: 1fr; }
@@ -1754,7 +1753,7 @@ code { max-width: 100%; overflow-wrap: anywhere; white-space: normal; }
   .client-download-row { grid-template-columns: 30px minmax(0, 1fr); }
   .client-download-row__actions { grid-column: 2; justify-content: flex-start; flex-wrap: wrap; min-width: 0; }
   .topbar h1 { font-size: 21px; }
-  .metric-grid, .metric-stack--inline, .flow-grid, .dock-grid, .health-grid, .system-status-grid, .system-status-grid--enterprise, .station-grid, .carrier-grid, .design-system-grid, .ergonomics-grid, .rules-grid, .tower-map, .pipeline, .pipeline--pro, .worker-load-grid, .warehouse-map, .portal-grid, .client-kpi-grid, .client-panel-grid, .flow-stepper, .role-matrix, .detail-grid, .simulation-grid, .event-list--grid, .activity-list--two-col, .rf-fast-actions, .rf-fast-actions--scanner { grid-template-columns: 1fr; }
+  .metric-grid, .metric-stack--inline, .flow-grid, .dock-grid, .health-grid, .system-status-grid, .system-status-grid--enterprise, .station-grid, .carrier-grid, .design-system-grid, .ergonomics-grid, .rules-grid, .tower-map, .pipeline, .pipeline--pro, .portal-grid, .client-kpi-grid, .client-panel-grid, .flow-stepper, .role-matrix, .detail-grid, .simulation-grid, .event-list--grid, .activity-list--two-col, .rf-fast-actions, .rf-fast-actions--scanner { grid-template-columns: 1fr; }
   .overview-strip, .page-intro, .wms-page-intro, .hero-card { flex-direction: column; align-items: flex-start; }
   .pwa-status-banner,
   .pwa-status-banner > div:first-child { align-items: stretch; flex-direction: column; }

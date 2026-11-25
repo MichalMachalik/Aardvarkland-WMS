@@ -62,7 +62,6 @@ export const generatedTranslations = {
   "API error": { fr: "Erreur API", de: "API-Fehler", es: "Error de API" },
   "API failure": { fr: "Échec de l'API", de: "API-Fehler", es: "Fallo de API" },
   "App loaded": { fr: "Application chargée", de: "App geladen", es: "Aplicación cargada" },
-  "Application status and active scope": { fr: "État de l'application et étendue active", de: "Anwendungsstatus und aktiver Bereich", es: "Estado de la solicitud y alcance activo" },
   "Appointments": { fr: "Rendez-vous", de: "Termine", es: "Citas" },
   "Approve variance": { fr: "Approuver l'écart", de: "Abweichung genehmigen", es: "Aprobar variación" },
   "Approved": { fr: "Approuvé", de: "Genehmigt", es: "Aprobado" },

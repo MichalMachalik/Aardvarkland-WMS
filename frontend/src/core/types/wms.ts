@@ -56,35 +56,6 @@ export interface WarehouseTask {
   sku: string;
 }
 
-export interface NextBestAction {
-  id: string;
-  title: string;
-  detail: string;
-  severity: Severity;
-  impact: string;
-  cta: string;
-  route: string;
-}
-
-export interface ZoneLoad {
-  id: string;
-  label: string;
-  role: string;
-  backlog: number;
-  workers: number;
-  utilization: number;
-  risk: Severity;
-}
-
-export interface LiveEvent {
-  id: string;
-  title: string;
-  detail: string;
-  actor: string;
-  severity: Severity;
-  time: string;
-}
-
 export interface WavePlan {
   id: string;
   status: 'Draft' | 'Ready' | 'Running' | 'Completed' | 'At risk';
@@ -95,13 +66,4 @@ export interface WavePlan {
   progress: number;
   risk: Severity;
   recommendation: string;
-}
-
-export interface WorkerLoad {
-  id: string;
-  name: string;
-  role: 'Picker' | 'Packer' | 'Receiver' | 'Supervisor';
-  zone: string;
-  utilization: number;
-  activeTask: string;
 }
