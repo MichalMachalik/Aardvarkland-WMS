@@ -1,6 +1,6 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
-import { IsInt, IsObject, IsOptional, IsString, Max, MaxLength, Min } from 'class-validator';
+import { ArrayMaxSize, IsArray, IsInt, IsObject, IsOptional, IsString, Max, MaxLength, Min } from 'class-validator';
 
 export class ConfirmWarehouseTaskDto {
   @ApiPropertyOptional({ example: 'A-01-01' })
@@ -28,6 +28,17 @@ export class ConfirmWarehouseTaskDto {
   @Min(0)
   @Max(2_147_483_647)
   quantity?: number;
+
+  @ApiPropertyOptional({
+    type: [String],
+    description: 'Serial codes for a MOVE task that transfers only part of a stock quant.',
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(1000)
+  @IsString({ each: true })
+  @MaxLength(180, { each: true })
+  serialNumbers?: string[];
 
   @ApiPropertyOptional({ example: 'HU-100001' })
   @IsOptional()

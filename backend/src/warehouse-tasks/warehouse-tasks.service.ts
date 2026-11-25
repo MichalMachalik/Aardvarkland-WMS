@@ -339,6 +339,9 @@ export class WarehouseTasksService {
       if (task.type === WarehouseTaskType.REPLENISH) {
         throw new ConflictException('Use replenishment confirmation to complete this task and move stock');
       }
+      if (body.serialNumbers?.length && task.type !== WarehouseTaskType.MOVE) {
+        throw new ConflictException('Serial numbers are supported for movement confirmation');
+      }
       if (task.type === WarehouseTaskType.COUNT) {
         await this.assertStandaloneCount(db, warehouse.id, task);
         if (typeof body.quantity !== 'number') {
@@ -367,7 +370,7 @@ export class WarehouseTasksService {
           throw new ConflictException('Confirmed movement must match the planned SKU and locations');
         }
         quantity = await this.inventory.moveStockForTask(
-          db as unknown as Prisma.TransactionClient, warehouse.id, task.id, body.quantity, actor,
+          db as unknown as Prisma.TransactionClient, warehouse.id, task.id, body.quantity, actor, body.serialNumbers,
         );
       }
       const data: MutationObject = {

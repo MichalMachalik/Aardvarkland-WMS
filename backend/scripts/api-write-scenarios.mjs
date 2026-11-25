@@ -440,6 +440,75 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.equal(events[1].toLocationId, target.id);
   });
 
+  await scenario('serialized stock moves the selected labels and records each transfer once', async () => {
+    const { sku } = await createSku('SERIAL-TRANSFER');
+    const target = await own('POST', '/locations', {
+      code: `SERIAL-MOVE-${suffix}`, name: 'Serialized stock destination', type: 'STORAGE', parentReference: 'A-01',
+    });
+    const { quant: source } = await own('POST', '/inventory/quants/receive', {
+      skuReference: sku.id, locationReference: 'A-01-01', quantity: 3, batch: 'SERIAL-MOVE',
+    });
+    const serials = [];
+    for (let index = 1; index <= 3; index++) {
+      serials.push(await own('POST', '/traceability/serial-numbers', {
+        skuReference: sku.id, serialNumber: `MOVE-SN-${index}-${suffix}`, stockQuantId: source.id,
+      }));
+    }
+    const move = '/inventory/quants/move';
+    const body = { quantReference: source.id, toLocationReference: target.id, quantity: 1 };
+    await own('POST', move, body, 409);
+    await own('POST', move, { ...body, serialNumbers: [`UNKNOWN-${suffix}`] }, 409);
+    const part = { ...body, serialNumbers: [serials[0].serialNumber], idempotencyKey: randomUUID() };
+    const [first, replay] = await Promise.all([
+      own('POST', move, part, 201, part.idempotencyKey),
+      own('POST', move, part, 201, part.idempotencyKey),
+    ]);
+    assert.equal(replay.movement.id, first.movement.id);
+    assert.equal((await own('GET', `/inventory/quants/${first.quant.id}`)).quantity, 1);
+
+    const start = async label => {
+      const order = await own('POST', '/warehouse-orders', {
+        orderType: 'MOVE', orderNumber: `${label}-${suffix}`,
+        fromLocationReference: 'A-01-01', toLocationReference: target.id,
+        lines: [{ lineNumber: '1', skuReference: sku.id, requestedQuantity: 1, serialRequired: true }],
+      });
+      const path = `/warehouse-orders/${order.id}`;
+      const released = await own('POST', path + '/release');
+      return { taskId: released.taskLinks[0].warehouseTaskId, path };
+    };
+    const desktop = await start('DESKTOP-SERIAL');
+    const desktopPath = `/tasks/${desktop.taskId}`;
+    await own('POST', desktopPath + '/start', {});
+    await own('POST', desktopPath + '/confirm', {}, 409);
+    await own('POST', desktopPath + '/confirm', { serialNumbers: [serials[0].serialNumber] }, 409);
+    await own('POST', desktopPath + '/confirm', { serialNumbers: [serials[1].serialNumber] });
+    assert.equal((await own('POST', desktop.path + '/complete', {})).status, 'COMPLETED');
+
+    const rf = await start('RF-SERIAL');
+    const work = (path, data) => asWorker('POST', warehouse + path, data);
+    const { sessionId } = await work(`/rf/tasks/${rf.taskId}/start`, {});
+    const scan = value => work(`/rf/sessions/${sessionId}/scan`, { scannedValue: value });
+    for (const value of ['A-01-01', sku.code, '1']) await scan(value);
+    assert.equal((await scan(target.code)).status, 'COMPLETED');
+    assert.equal((await own('POST', rf.path + '/complete', {})).status, 'COMPLETED');
+
+    assert.equal((await own('GET', `/inventory/quants/${source.id}`)).quantity, 0);
+    assert.equal((await own('GET', `/inventory/quants/${first.quant.id}`)).quantity, 3);
+    const movementIds = [];
+    for (const serial of serials) {
+      const path = `/traceability/serial-numbers/${serial.id}`;
+      const saved = await own('GET', path);
+      assert.equal(saved.stockQuantId, first.quant.id);
+      assert.equal(saved.lastSeenLocationId, target.id);
+      const events = await own('GET', path + '/events');
+      assert.deepEqual(events.map(event => event.eventType), ['MOVED', 'CREATED']);
+      assert.equal(events[0].referenceType, 'STOCK_MOVEMENT');
+      movementIds.push(events[0].referenceId);
+    }
+    assert.equal(movementIds[0], first.movement.id);
+    assert.equal(new Set(movementIds).size, 3);
+  });
+
   await scenario('putaway moves the planned stock exactly once and rejects mismatched confirmations', async () => {
     const { sku } = await createSku('PUTAWAY');
     const { sku: otherSku } = await createSku('PUTAWAY-OTHER');

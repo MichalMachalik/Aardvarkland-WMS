@@ -27,6 +27,7 @@ export function InventoryPage() {
   const [selectedId, setSelectedId] = useState(sourceRows[0]?.id ?? '');
   const [quantity, setQuantity] = useState('1');
   const [targetLocation, setTargetLocation] = useState('');
+  const [serialEntry, setSerialEntry] = useState({ quantId: '', value: '' });
   const canMove = can('inventory.move');
   const canAdjust = can('inventory.adjust');
 
@@ -55,14 +56,23 @@ export function InventoryPage() {
   const parsedQuantity = Number(quantity);
   const validQuantity = Number.isSafeInteger(parsedQuantity) && parsedQuantity >= 1 && parsedQuantity <= 2147483647;
   const normalizedTargetLocation = targetLocation.trim();
+  const serialEntryValue = selected?.id === serialEntry.quantId ? serialEntry.value : '';
+  const serialNumbers = serialEntryValue.split(/\r?\n/).map(value => value.trim()).filter(Boolean);
+  const invalidSerials = serialNumbers.length > 0 && (
+    serialNumbers.length !== parsedQuantity || serialNumbers.length > 1000 ||
+    new Set(serialNumbers).size !== serialNumbers.length || serialNumbers.some(value => value.length > 180)
+  );
   const targetIsCurrentLocation = Boolean(selected && normalizedTargetLocation && normalizedTargetLocation.toLowerCase() === selected.location.toLowerCase());
   const tooManyToMove = Boolean(selected && validQuantity && parsedQuantity > selected.available);
-  const moveHint = targetIsCurrentLocation ? text.sameLocationHint : normalizedTargetLocation && tooManyToMove ? text.overAvailableHint : '';
+  const moveHint = targetIsCurrentLocation ? text.sameLocationHint
+    : normalizedTargetLocation && tooManyToMove ? text.overAvailableHint
+    : invalidSerials ? text.serialCountHint : '';
   const canSubmit = Boolean(selected && validQuantity && mutation.status !== 'running');
 
   const afterMutation = async (label: string, action: () => Promise<unknown>) => {
     const result = await mutation.run(label, action);
     if (result) resource.refresh();
+    return result;
   };
 
   const receive = () => {
@@ -86,9 +96,12 @@ export function InventoryPage() {
       quantity: parsedQuantity,
       status: 'AVAILABLE',
       reason: text.reasons.move,
+      ...(serialNumbers.length ? { serialNumbers } : {}),
       idempotencyKey: createWmsIdempotencyKey('storage-move'),
       metadata: { source: 'storage-ui' },
-    }));
+    })).then(result => {
+      if (result) setSerialEntry(entry => entry.quantId === selected.id ? { quantId: '', value: '' } : entry);
+    });
   };
 
   const adjust = () => {
@@ -144,6 +157,12 @@ export function InventoryPage() {
           {selected && (canMove || canAdjust) && <form className="action-panel" aria-label={text.detailTitle} onSubmit={(event) => event.preventDefault()}>
             <label>{text.fields.quantity}<input data-testid="inventory-quantity" type="number" min="1" max="2147483647" step="1" required value={quantity} onChange={(event) => setQuantity(event.target.value)} /></label>
             {canMove && <label>{text.fields.targetLocation}<input data-testid="inventory-target-location" value={targetLocation} onChange={(event) => setTargetLocation(event.target.value)} placeholder={text.fields.targetPlaceholder} aria-describedby={moveHint ? 'inventory-move-hint' : undefined} /></label>}
+            {canMove && <details>
+              <summary>{text.serialNumbers}</summary>
+              <textarea aria-label={text.serialNumbers} placeholder={text.serialNumberExample} rows={2}
+                aria-describedby={invalidSerials ? 'inventory-move-hint' : undefined}
+                value={serialEntryValue} onChange={event => setSerialEntry({ quantId: selected.id, value: event.target.value })} />
+            </details>}
             {moveHint && <p id="inventory-move-hint" className="form-hint">{moveHint}</p>}
             <div className="button-row">
               {canMove && <Button type="button" tone="primary" data-e2e-action="inventory-move" disabled={!canSubmit || !normalizedTargetLocation || Boolean(moveHint)} onClick={move}>{text.buttons.move}</Button>}
@@ -175,6 +194,9 @@ const czech = {
   fields: { quantity: 'Množství', targetLocation: 'Cílová lokace', targetPlaceholder: 'Např. A-01-01' },
   sameLocationHint: 'Zadejte jinou cílovou lokaci.',
   overAvailableHint: 'Zadejte množství, které je v této lokaci dostupné.',
+  serialNumbers: 'Sériová čísla',
+  serialNumberExample: 'Jedno sériové číslo na řádek',
+  serialCountHint: 'Každá přesouvaná položka musí mít vlastní sériové číslo.',
   buttons: { receive: 'Přijmout zásobu', move: 'Přesunout', adjust: 'Upravit +ks' },
   actions: { receive: 'Přijmout zásobu', move: 'Přesunout zásobu', adjust: 'Upravit zásobu' },
   reasons: { move: 'Přesun zásoby z jednoduchého UI', adjust: 'Ruční korekce z jednoduchého UI' },
@@ -196,6 +218,9 @@ const english = {
   fields: { quantity: 'Quantity', targetLocation: 'Target location', targetPlaceholder: 'For example A-01-01' },
   sameLocationHint: 'Enter a different target location.',
   overAvailableHint: 'Enter a quantity available at this location.',
+  serialNumbers: 'Serial numbers',
+  serialNumberExample: 'One serial number per line',
+  serialCountHint: 'Enter one distinct serial number for each item being moved.',
   buttons: { receive: 'Receive stock', move: 'Move', adjust: 'Adjust +pcs' },
   actions: { receive: 'Receive stock', move: 'Move stock', adjust: 'Adjust stock' },
   reasons: { move: 'Stock movement from the simple UI', adjust: 'Manual correction from the simple UI' },
@@ -217,6 +242,9 @@ const ukrainian = {
   fields: { quantity: 'Кількість', targetLocation: 'Цільова локація', targetPlaceholder: 'Напр. A-01-01' },
   sameLocationHint: 'Введіть іншу цільову локацію.',
   overAvailableHint: 'Введіть кількість, доступну в цій локації.',
+  serialNumbers: 'Серійні номери',
+  serialNumberExample: 'Один серійний номер у рядку',
+  serialCountHint: 'Введіть окремий серійний номер для кожної переміщуваної одиниці.',
   buttons: { receive: 'Прийняти запас', move: 'Перемістити', adjust: 'Корекція +шт' },
   actions: { receive: 'Прийняти запас', move: 'Перемістити запас', adjust: 'Коригувати запас' },
   reasons: { move: 'Переміщення запасу з простого UI', adjust: 'Ручна корекція з простого UI' },

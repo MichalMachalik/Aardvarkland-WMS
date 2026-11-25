@@ -16,7 +16,9 @@ import {
   OwnerScopeService,
 } from '../clients/owner-scope.service';
 import { normalizeOffsetPagination } from '../common';
-import { lockPostgresRowById, PrismaService, withTransactionRetry } from '../database';
+import {
+  lockPostgresAdvisoryTransaction, lockPostgresRowById, lockPostgresRowsById, PrismaService, withTransactionRetry,
+} from '../database';
 import { Prisma, Warehouse, WarehouseLocation } from '../generated/prisma/client';
 import { AdjustStockDto } from './dto/adjust-stock.dto';
 import { BlockStockDto } from './dto/block-stock.dto';
@@ -506,31 +508,29 @@ export class InventoryService {
   ): Promise<StockOperationResponse> {
     const client = this.getClient();
     const warehouse = await this.resolveWarehouse(client, warehouseReference);
+    const request = dto.serialNumbers
+      ? { ...dto, serialNumbers: normalizeMoveSerialNumbers(dto.serialNumbers) }
+      : dto;
     const requestFingerprint = stockRequestFingerprint({
       warehouseId: warehouse.id,
       type: StockMovementType.MOVE,
       actorId: actor.id,
-      dto,
+      dto: request,
     });
-    const existingOperation = await this.findIdempotentOperation(
-      client,
-      warehouse.id,
-      StockMovementType.MOVE,
-      dto.idempotencyKey,
-      requestFingerprint,
-    );
-
-    if (existingOperation) {
-      return existingOperation;
-    }
-
-    const destination = await this.resolveLocation(client, warehouse.id, dto.toLocationReference);
-    const sourceQuant = await this.resolveMoveSourceQuant(client, warehouse.id, dto);
-
-    const result = await this.transaction(client, (tx) =>
-      this.moveStockInTransaction(tx, warehouse.id, sourceQuant.id, destination, dto, actor, { requestFingerprint }),
-    );
-    return this.toOperationResponse(client, result.quant, result.movement);
+    return this.transaction(client, async (tx) => {
+      const key = normalizeOptionalString(request.idempotencyKey);
+      if (key) {
+        await lockPostgresAdvisoryTransaction(tx, 'idempotency_key', `inventory-move:${key}`);
+        const existing = await this.findIdempotentOperation(tx, warehouse.id, StockMovementType.MOVE, key, requestFingerprint);
+        if (existing) return existing;
+      }
+      const destination = await this.resolveLocation(tx, warehouse.id, request.toLocationReference);
+      const sourceQuant = await this.resolveMoveSourceQuant(tx, warehouse.id, request);
+      const result = await this.moveStockInTransaction(
+        tx, warehouse.id, sourceQuant.id, destination, request, actor, { requestFingerprint },
+      );
+      return this.toOperationResponse(tx, result.quant, result.movement);
+    });
   }
 
   async moveStockForTask(
@@ -539,6 +539,7 @@ export class InventoryService {
     taskId: string,
     confirmedQuantity: number | undefined,
     actor: AuthenticatedUser,
+    serialNumbers?: string[],
   ): Promise<number> {
     const permissions = actor.warehouses.find(access => access.warehouseId === warehouseId)?.permissionCodes ?? [];
     if (!permissions.includes('*') && !(permissions.includes('inventory.move') && permissions.includes('task.manage'))) {
@@ -557,6 +558,10 @@ export class InventoryService {
         (task.quantity !== null && task.quantity !== quantity)) {
       throw new ConflictException('Confirmed movement quantity must match the planned amount');
     }
+    const selectedSerials = normalizeMoveSerialNumbers(serialNumbers);
+    if (selectedSerials.length && selectedSerials.length !== quantity) {
+      throw new ConflictException('Supply one serial number for each item being moved');
+    }
     if (shouldEnforceClientAccess(actor) && (!task.ownerClientId || !hasClientAccess({
       user: actor, clientReference: task.ownerClientId, warehouseReference: warehouseId,
     }))) {
@@ -571,31 +576,39 @@ export class InventoryService {
       where: { warehouseId, warehouseTaskId: task.id },
       select: { warehouseOrderLine: { select: { lotId: true, serialRequired: true } } },
     });
-    if (link?.warehouseOrderLine?.serialRequired) {
-      throw new ConflictException('A loose stock movement cannot move individually tracked serial numbers');
-    }
+    const serialRequired = link?.warehouseOrderLine?.serialRequired ?? false;
     const [source] = await tx.$queryRawUnsafe<{ id: string }[]>(
       `SELECT source.id FROM stock_quants AS source
+       CROSS JOIN LATERAL (
+         SELECT count(*) AS attached,
+                count(*) FILTER (WHERE serial_number = ANY($7::text[])) AS selected
+         FROM serial_numbers WHERE stock_quant_id = source.id AND warehouse_id = source.warehouse_id
+       ) AS tracked
        WHERE source.warehouse_id = $1::uuid AND source.sku_id = $2::uuid AND source.location_id = $3::uuid
          AND source.owner_client_id IS NOT DISTINCT FROM $4::uuid
          AND ($5::uuid IS NULL OR source.lot_id = $5::uuid)
          AND source.handling_unit_id IS NULL AND source.status = 'AVAILABLE'
          AND source.quantity - source.reserved_quantity >= $6::int
-         AND NOT EXISTS (SELECT 1 FROM serial_numbers WHERE stock_quant_id = source.id)
+         AND CASE
+           WHEN cardinality($7::text[]) > 0 THEN tracked.selected = $6::int
+           WHEN $8::boolean THEN source.quantity = $6::int AND tracked.attached = $6::int
+           ELSE source.quantity = $6::int OR tracked.attached = 0
+         END
        ORDER BY source.expiry_date ASC NULLS LAST, source.created_at, source.id
        LIMIT 1 FOR UPDATE OF source`,
       warehouseId, task.skuId, task.fromLocationId, task.ownerClientId,
-      link?.warehouseOrderLine?.lotId ?? null, quantity,
+      link?.warehouseOrderLine?.lotId ?? null, quantity, selectedSerials, serialRequired,
     );
-    if (!source) throw new ConflictException('Insufficient eligible unreserved stock for the movement task');
+    if (!source) throw new ConflictException('Insufficient eligible stock for the planned quantity and serial numbers');
     await this.moveStockInTransaction(
       tx as unknown as InventoryTransactionClient, warehouseId, source.id, destination,
       {
         toLocationReference: destination.id, quantity, reference: task.id,
         ownerClientReference: task.ownerClientId ?? undefined,
+        serialNumbers: selectedSerials,
         metadata: { source: 'warehouse_task' },
       },
-      actor, { taskId: task.id },
+      actor, { taskId: task.id, serialRequired },
     );
     return quantity;
   }
@@ -607,12 +620,16 @@ export class InventoryService {
     destination: WarehouseLocation,
     dto: MoveStockDto,
     actor: AuthenticatedUser,
-    options: { requestFingerprint?: string; taskId?: string } = {},
+    options: { requestFingerprint?: string; taskId?: string; serialRequired?: boolean } = {},
   ): Promise<StockOperationInternalResult> {
+    await this.lockQuantForUpdate(tx, sourceQuantId);
     const currentSourceQuant = await this.resolveQuant(tx, warehouseId, sourceQuantId);
     if (currentSourceQuant.locationId === destination.id) {
       throw new ConflictException('Source and destination locations must be different');
     }
+    const serials = await this.selectSerialsForMove(
+      tx, currentSourceQuant, dto.quantity, dto.serialNumbers ?? [], options,
+    );
     await assertNoBlockingStockFreeze(tx, {
       warehouseId,
       locationId: destination.id,
@@ -652,6 +669,9 @@ export class InventoryService {
         withStockAdjustmentReasonMetadata(dto.metadata, dto.reasonCode, dto.reason),
       ),
     });
+    if (serials.length) {
+      await this.recordSerialStockMove(tx, serials, currentSourceQuant, targetQuant, movement, actor);
+    }
 
     const owner = await this.resolveOperationOwner(
       tx,
@@ -680,6 +700,69 @@ export class InventoryService {
     await this.writeMovementAudit(tx, actor, warehouseId, movement);
 
     return { movement, quant: targetQuant };
+  }
+
+  private async selectSerialsForMove(
+    tx: InventoryTransactionClient,
+    source: StockQuantRecord,
+    quantity: number,
+    requested: string[],
+    options: { serialRequired?: boolean; taskId?: string },
+  ): Promise<string[]> {
+    if (requested.length && requested.length !== quantity) {
+      throw new ConflictException('Supply one serial number for each item being moved');
+    }
+    const where = { warehouseId: source.warehouseId, stockQuantId: source.id };
+    const candidates = await tx.serialNumber.findMany({ where, select: { id: true } });
+    if (!candidates.length && !requested.length && !options.serialRequired) return [];
+    await lockPostgresRowsById(tx, 'serial_numbers', candidates.map(serial => serial.id));
+    const attached = await tx.serialNumber.findMany({ where });
+    if (source.handlingUnitId) {
+      throw new ConflictException('Move this serialized stock with its handling unit');
+    }
+    const availableStock = toNumber(source.quantity);
+    if (attached.length > availableStock) throw new ConflictException('Source stock and serial counts are inconsistent');
+    if (!requested.length && quantity !== availableStock) {
+      throw new ConflictException('A partial movement of serialized stock requires the serial numbers being moved');
+    }
+    const selected = requested.length
+      ? attached.filter(serial => requested.includes(serial.serialNumber))
+      : attached;
+    if ((requested.length || options.serialRequired) && selected.length !== quantity) {
+      throw new ConflictException('Supply one serial number from the source stock for each item being moved');
+    }
+    const statuses = options.taskId ? ['AVAILABLE'] : ['AVAILABLE', 'RETURNED', 'BLOCKED', 'DAMAGED'];
+    if (selected.some(serial => !statuses.includes(serial.status) || serial.outboundOrderLineId ||
+        serial.skuId !== source.skuId || serial.lotId !== (source.lotId ?? null) ||
+        serial.ownerClientId !== (source.ownerClientId ?? null) || serial.lastSeenLocationId !== source.locationId)) {
+      throw new ConflictException('Serial numbers must match the source stock and be eligible for movement');
+    }
+    return selected.map(serial => serial.id);
+  }
+
+  private async recordSerialStockMove(
+    tx: InventoryTransactionClient,
+    serialIds: string[],
+    source: StockQuantRecord,
+    target: StockQuantRecord,
+    movement: StockMovementRecord,
+    actor: AuthenticatedUser,
+  ): Promise<void> {
+    const updated = await tx.serialNumber.updateMany({
+      where: { warehouseId: source.warehouseId, stockQuantId: source.id, id: { in: serialIds } },
+      data: { stockQuantId: target.id, lastSeenLocationId: target.locationId },
+    });
+    if (updated.count !== serialIds.length) throw new ConflictException('A serial changed before its stock could be moved');
+    const occurredAt = new Date();
+    await tx.serialNumberEvent.createMany({
+      data: serialIds.map(serialNumberId => ({
+        warehouseId: source.warehouseId, ownerClientId: source.ownerClientId,
+        serialNumberId, eventType: 'MOVED', stockQuantId: target.id,
+        fromLocationId: source.locationId, toLocationId: target.locationId,
+        actorUserId: actor.id, referenceType: 'STOCK_MOVEMENT', referenceId: movement.id,
+        occurredAt, createdAt: occurredAt,
+      })),
+    });
   }
 
   async adjust(
@@ -1040,8 +1123,22 @@ export class InventoryService {
 
     const sku = await this.resolveSku(client, dto.skuReference);
     const location = await this.resolveLocation(client, warehouseId, dto.fromLocationReference);
+    let serialQuantId: string | undefined;
+    if (dto.serialNumbers?.length) {
+      const selected = await client.serialNumber.findMany({
+        where: { warehouseId, serialNumber: { in: dto.serialNumbers } },
+        select: { stockQuantId: true },
+      });
+      const quantIds = new Set(selected.map(serial => serial.stockQuantId));
+      const [selectedId] = quantIds;
+      if (!selectedId || quantIds.size !== 1 || selected.length !== dto.serialNumbers.length) {
+        throw new ConflictException('All selected serial numbers must belong to the same source stock');
+      }
+      serialQuantId = selectedId;
+    }
     const where: StockQuantWhereInput = {
       warehouseId,
+      ...(serialQuantId ? { id: serialQuantId } : {}),
       skuId: sku.id,
       locationId: location.id,
       status: dto.status ?? StockQuantStatus.AVAILABLE,
@@ -1820,6 +1917,14 @@ function withReasonMetadata(
   };
 }
 
+function normalizeMoveSerialNumbers(serialNumbers?: string[]): string[] {
+  const normalized = serialNumbers?.map(value => value.trim()) ?? [];
+  if (normalized.some(value => !value) || new Set(normalized).size !== normalized.length) {
+    throw new ConflictException('Movement serial numbers must be nonempty and unique');
+  }
+  return normalized.sort();
+}
+
 export function stockRequestFingerprint(value: unknown): string {
   const canonical = (input: unknown): unknown => {
     if (input === null || typeof input !== 'object') return input;
@@ -2076,6 +2181,7 @@ interface StockQuantRecord extends Record<string, unknown> {
   locationId: string;
   status: StockQuantStatus;
   ownerClientId?: string | null;
+  handlingUnitId?: string | null;
   lotId?: string | null;
   batch: string | null;
   expiry?: Date | string | null;
@@ -2116,6 +2222,8 @@ interface StockMovementRecord extends Record<string, unknown> {
 
 interface InventoryTransactionClient {
   $queryRawUnsafe?<T = unknown>(query: string, ...values: unknown[]): Promise<T>;
+  serialNumber: Prisma.TransactionClient['serialNumber'];
+  serialNumberEvent: Prisma.TransactionClient['serialNumberEvent'];
   warehouse: {
     findFirst(args: { where: Prisma.WarehouseWhereInput }): Promise<Warehouse | null>;
   };

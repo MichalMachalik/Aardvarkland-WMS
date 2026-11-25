@@ -16541,6 +16541,13 @@
             "type": "number",
             "example": 12
           },
+          "serialNumbers": {
+            "description": "Serial codes for the items being moved. Required for a partial move from a stock quant with serial numbers.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
           "status": {
             "type": "string",
             "enum": [
@@ -17749,6 +17756,13 @@
             "minimum": 0,
             "maximum": 2147483647,
             "description": "Zero is valid for count tasks."
+          },
+          "serialNumbers": {
+            "description": "Serial codes for a MOVE task that transfers only part of a stock quant.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           },
           "handlingUnitReference": {
             "type": "string",

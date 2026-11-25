@@ -185,6 +185,48 @@ test('inventory distinguishes no matches and blocks invalid moves and unauthoriz
   expect((await moved).ok()).toBe(true);
 });
 
+test('inventory moves exactly the serial numbers entered by the operator', async ({ page }) => {
+  test.skip(process.env.WMS_LIVE_UI_WRITE !== 'true', 'Requires a disposable warehouse database.');
+  const { accessToken: admin } = await liveApi(page, '/api/auth/login', {
+    data: { email: roles.system.email, password: roles.system.password },
+  });
+  const own = (path, data) => liveApi(page, '/api/warehouses/MAIN' + path, { token: admin, data });
+  const code = `UI-SERIAL-${randomUUID().slice(0, 8).toUpperCase()}`;
+  const product = await liveApi(page, '/api/products', { token: admin, data: { code, name: 'Serialized test product' } });
+  const sku = await liveApi(page, '/api/products/skus', {
+    token: admin, data: { code, productReference: product.id, name: 'Serialized test SKU' },
+  });
+  const { quant: source } = await own('/inventory/quants/receive', {
+    skuReference: code, locationReference: 'A-01-01', quantity: 2,
+  });
+  const serials = [];
+  for (const label of ['A', 'B']) {
+    serials.push(await own('/traceability/serial-numbers', {
+      skuReference: sku.id, stockQuantId: source.id, serialNumber: `${code}-${label}`,
+    }));
+  }
+  await login(page, roles.worker);
+  await desktopNav(page).getByRole('button', { name: 'Zásoby' }).click();
+  await page.getByTestId('inventory-search').fill(code);
+  await page.locator(`[data-e2e-row="quant"][data-e2e-value^="${source.id} "]`).check();
+  await page.getByTestId('inventory-target-location').fill('PACK-01');
+  await page.getByText('Sériová čísla', { exact: true }).click();
+  const labels = page.getByRole('textbox', { name: 'Sériová čísla' });
+  const move = page.locator('[data-e2e-action="inventory-move"]');
+  await labels.fill(serials.map(item => item.serialNumber).join('\n'));
+  await expect(move).toBeDisabled();
+  await labels.fill(serials[1].serialNumber);
+  await move.click();
+  await expect.poll(() => own(`/inventory/quants/${source.id}`)).toMatchObject({ quantity: 1 });
+  const stayed = await own(`/traceability/serial-numbers/${serials[0].id}`);
+  const transferred = await own(`/traceability/serial-numbers/${serials[1].id}`);
+  expect(stayed.stockQuantId).toBe(source.id);
+  expect(transferred.stockQuantId).not.toBe(source.id);
+  const destination = await own(`/inventory/quants/${transferred.stockQuantId}`);
+  expect(destination.location.code).toBe('PACK-01');
+  expect(destination.quantity).toBe(1);
+});
+
 test('manager inventory includes manual correction and wave details are keyboard accessible', async ({ page }) => {
   await login(page, roles.manager);
   await desktopNav(page).getByRole('button', { name: 'Zásoby' }).click();
