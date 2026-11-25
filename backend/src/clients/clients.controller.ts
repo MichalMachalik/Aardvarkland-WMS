@@ -211,7 +211,7 @@ export class ClientsController {
 
 
   @RequireWarehousePermissions('billing.read')
-  @ApiOkResponse({ description: 'Export a client billing invoice as compact PDF base64.' })
+  @ApiOkResponse({ description: 'Export a complete client billing invoice as PDF base64.' })
   @Get('warehouses/:warehouseId/clients/:clientReference/billing-invoices/:invoiceReference/export.pdf')
   exportBillingInvoicePdf(
     @Param('warehouseId') warehouseId: string,
@@ -269,7 +269,7 @@ export class ClientsController {
 
 
   @RequireWarehousePermissions('billing.read')
-  @ApiOkResponse({ description: 'Export an accounting credit note as compact PDF base64.' })
+  @ApiOkResponse({ description: 'Export a complete accounting credit note as PDF base64.' })
   @Get('warehouses/:warehouseId/clients/:clientReference/billing-credit-notes/:creditNoteReference/export.pdf')
   exportBillingCreditNotePdf(
     @Param('warehouseId') warehouseId: string,

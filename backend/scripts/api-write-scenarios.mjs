@@ -1428,8 +1428,7 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     const contents = Buffer.from(pdf.pdfBase64, 'base64').toString('latin1');
     assert.match(contents, /^%PDF-[0-9.]+/);
     assert.match(contents, /%%EOF\s*$/);
-    const printed = [...contents.matchAll(/^\((.*)\) Tj$/gm)].map(line => line[1]).join('');
-    assert.ok(printed.includes(credit.creditNoteNumber));
+    assert.ok(contents.includes(credit.creditNoteNumber));
     assert.equal(await prisma.outboxEvent.count({ where: { aggregateId: credit.id, type: 'BILLING_CREDIT_NOTE_FINALIZED' } }), 1);
     assert.equal(await prisma.auditLog.count({ where: { resourceId: credit.id, action: 'billing.credit_note_finalized' } }), 1);
     await own('POST', credits, { invoiceLineNumbers: [1], finalize: true }, 409);
@@ -1460,6 +1459,48 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     await own('POST', path + '/billing-invoices', {
       periodStart: '2026-10-22T00:00:00.000Z', periodEnd: '2026-10-22T23:59:00.000Z',
     }, 400);
+  });
+
+  await scenario('long client invoices and credit notes export as multi-page PDFs', async () => {
+    const client = await asAdmin('POST', '/api/clients', {
+      code: `PDF-${suffix}`, name: 'PDF fixture client', billingCurrency: 'CZK',
+    });
+    const path = `/clients/${client.code}`;
+    const attachment = await own('POST', path + '/attach', {});
+    const lineCount = 40;
+    await prisma.billingEvent.createMany({
+      data: Array.from({ length: lineCount }, (_, index) => ({
+        clientId: client.id, warehouseId: attachment.warehouseId, eventType: 'PICK', status: 'BILLABLE',
+        reference: `PDF-${suffix}-${index}`, description: `Příjem a výdej zboží (${index + 1})`,
+        quantity: 1, unitPriceMinor: 100, amountMinor: 100, currency: 'CZK',
+        occurredAt: new Date('2026-10-22T12:00:00.000Z'),
+      })),
+    });
+    const invoice = await own('POST', path + '/billing-invoices', {
+      periodStart: '2026-10-22T00:00:00.000Z', periodEnd: '2026-10-23T00:00:00.000Z',
+      vatRateBps: 2100, finalize: true,
+    });
+    assert.equal(invoice.lines.length, lineCount);
+    assert.equal(invoice.totalAmountMinor, 4840);
+    const invoicePath = `${path}/billing-invoices/${invoice.id}`;
+    const credit = await own('POST', invoicePath + '/credit-notes', { finalize: true });
+    assert.equal(credit.lines.length, lineCount);
+    assert.equal(credit.totalAmountMinor, invoice.totalAmountMinor);
+
+    for (const [documentPath, documentNumber] of [
+      [invoicePath, invoice.invoiceNumber],
+      [`${path}/billing-credit-notes/${credit.id}`, credit.creditNoteNumber],
+    ]) {
+      const exported = await own('GET', documentPath + '/export.pdf');
+      assert.equal(exported.contentType, 'application/pdf');
+      assert.equal(exported.filename, documentNumber + '.pdf');
+      const pdf = Buffer.from(exported.pdfBase64, 'base64').toString('latin1');
+      const pages = [...pdf.matchAll(/\/Type \/Page\b/g)].length;
+      assert.ok(pages > 1, 'The export must paginate a long billing document');
+      assert.ok(pdf.includes(documentNumber));
+      assert.ok(pdf.includes('/ToUnicode'), 'Accented item text needs a Unicode mapping');
+      assert.match(pdf, /%%EOF\s*$/);
+    }
   });
 
   await scenario('client setup validates rate cards, aliases, access and warehouse-safe ownership', async () => {

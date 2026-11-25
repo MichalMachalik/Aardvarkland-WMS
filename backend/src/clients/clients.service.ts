@@ -1015,7 +1015,7 @@ export class ClientsService {
     const warehouse = await this.resolveWarehouse(warehouseReference);
     const client = await this.resolveClient(clientReference);
     const invoice = await this.resolveInvoice(warehouse.id, client.id, invoiceReference);
-    const pdfBase64 = buildBillingPdfBase64({
+    const pdfBase64 = await buildBillingPdfBase64({
       documentType: 'INVOICE',
       documentNumber: invoice.invoiceNumber,
       clientCode: client.code,
@@ -1246,7 +1246,7 @@ export class ClientsService {
     const creditNote = await this.resolveCreditNote(warehouse.id, client.id, creditNoteReference);
     const invoice = await this.client.billingInvoice.findFirst({ where: { id: creditNote.invoiceId } });
     if (!invoice) throw new NotFoundException('Source billing invoice was not found.');
-    const pdfBase64 = buildBillingPdfBase64({
+    const pdfBase64 = await buildBillingPdfBase64({
       documentType: 'CREDIT_NOTE',
       documentNumber: creditNote.creditNoteNumber,
       sourceDocumentNumber: invoice.invoiceNumber,

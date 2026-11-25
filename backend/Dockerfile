@@ -23,6 +23,7 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/prisma ./prisma
+COPY assets ./assets
 COPY prisma.config.ts ./
 USER node
 EXPOSE 4001

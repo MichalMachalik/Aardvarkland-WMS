@@ -1,3 +1,8 @@
+import { join } from 'node:path';
+import { buffer } from 'node:stream/consumers';
+// eslint-disable-next-line @typescript-eslint/no-require-imports -- PDFKit's CommonJS entry exports the constructor directly.
+import PDFDocument = require('pdfkit');
+
 export interface BillingPdfLineInput {
   lineNumber: number;
   eventType: string;
@@ -25,117 +30,92 @@ export interface BillingInvoicePdfInput {
   lines: BillingPdfLineInput[];
 }
 
-export function buildBillingPdfBase64(input: BillingInvoicePdfInput): string {
-  return buildPdfBuffer({
-    title: `${input.documentType} ${input.documentNumber}`,
-    lines: buildBillingPdfLines(input),
-  }).toString('base64');
-}
+// Geist Regular from the v1.9.2 release. The license is bundled with the font.
+const fontPath = join(__dirname, '../../assets/fonts/Geist-Regular.ttf');
+const left = 46;
+const bottom = 62;
+const itemFontSize = 10;
+const muted = '#465564';
+const ink = '#14202b';
 
-function buildBillingPdfLines(input: BillingInvoicePdfInput): string[] {
-  const lines = [
-    `${input.documentType.replace('_', ' ')} ${input.documentNumber}`,
-    `Status: ${input.status}`,
-    `Client: ${input.clientCode}`,
-    `Warehouse: ${input.warehouseCode}`,
-    `Currency: ${input.currency}`,
-  ];
+export async function buildBillingPdfBase64(input: BillingInvoicePdfInput): Promise<string> {
+  const title = input.documentType.replace('_', ' ');
+  const doc = new PDFDocument({
+    size: 'A4',
+    margins: { top: 43, left, right: left, bottom },
+    autoFirstPage: false,
+    bufferPages: true,
+    font: fontPath,
+    info: { Title: `${title} ${input.documentNumber}` },
+  });
 
-  if (input.sourceDocumentNumber) {
-    lines.push(`Source invoice: ${input.sourceDocumentNumber}`);
-  }
+  doc.on('pageAdded', () => {
+    doc.fillColor(ink).fontSize(20).text(title);
+    doc.fontSize(12).text(input.documentNumber);
+    doc.moveDown(0.8);
+  });
+  doc.addPage();
+  doc.fillColor(muted).fontSize(10);
+  doc.text(`Status: ${input.status}`);
+  doc.text(`Client: ${input.clientCode}`);
+  doc.text(`Warehouse: ${input.warehouseCode}`);
+  doc.text(`Currency: ${input.currency}`);
+  if (input.sourceDocumentNumber) doc.text(`Source invoice: ${input.sourceDocumentNumber}`);
   if (input.periodStart && input.periodEnd) {
-    lines.push(`Period: ${toIsoDate(input.periodStart)} - ${toIsoDate(input.periodEnd)}`);
+    doc.text(`Period: ${toIsoDate(input.periodStart)} - ${toIsoDate(input.periodEnd)}`);
+  }
+  doc.moveDown();
+  drawTotals(doc, input);
+  doc.moveDown();
+
+  for (const line of input.lines) {
+    const details = `${line.lineNumber}.  ${line.eventType}  |  Qty ${line.quantity}  |  Net ${formatMinor(line.netAmountMinor, line.currency)}  |  Tax ${formatMinor(line.taxAmountMinor, line.currency)}  |  Total ${formatMinor(line.grossAmountMinor, line.currency)}`;
+    const description = line.description.normalize('NFC');
+    const textOptions = { width: doc.page.width - left * 2 };
+    doc.fontSize(itemFontSize);
+    const itemHeight = doc.heightOfString(details, textOptions) + doc.heightOfString(description, textOptions) + 12;
+    if (doc.y + itemHeight > doc.page.height - bottom) doc.addPage();
+
+    doc.strokeColor('#dce2e7').lineWidth(0.5);
+    doc.moveTo(left, doc.y).lineTo(doc.page.width - left, doc.y).stroke();
+    doc.y += 5;
+    doc.fillColor(ink).fontSize(itemFontSize).text(details, textOptions);
+    doc.fillColor(muted).text(description, textOptions);
+    doc.y += 7;
   }
 
-  lines.push(
-    `Subtotal: ${formatMinor(input.subtotalMinor, input.currency)}`,
-    `Tax: ${formatMinor(input.taxTotalMinor, input.currency)}`,
-    `Total: ${formatMinor(input.totalAmountMinor, input.currency)}`,
-    '',
-    'Lines:',
-  );
-
-  for (const line of input.lines.slice(0, 32)) {
-    lines.push(
-      `${line.lineNumber}. ${line.eventType} qty=${line.quantity} net=${formatMinor(line.netAmountMinor, line.currency)} tax=${formatMinor(line.taxAmountMinor, line.currency)} gross=${formatMinor(line.grossAmountMinor, line.currency)}`,
-    );
-    lines.push(`   ${line.description}`);
+  const pages = doc.bufferedPageRange();
+  for (let page = pages.start; page < pages.start + pages.count; page++) {
+    doc.switchToPage(page);
+    doc.fillColor(muted).fontSize(9);
+    const footer = `Page ${page - pages.start + 1} of ${pages.count}`;
+    const x = doc.page.width - left - doc.widthOfString(footer);
+    doc.text(footer, x, doc.page.height - 37, { lineBreak: false });
   }
 
-  if (input.lines.length > 32) {
-    lines.push(`... ${input.lines.length - 32} more lines omitted in compact PDF export`);
-  }
-
-  return lines.flatMap(wrapPdfLine);
+  const contents = buffer(doc);
+  doc.end();
+  return (await contents).toString('base64');
 }
 
-function buildPdfBuffer(input: { title: string; lines: string[] }): Buffer {
-  const content = buildPageContent(input.lines);
-  const objects = [
-    '<< /Type /Catalog /Pages 2 0 R >>',
-    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
-    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>',
-    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
-    `<< /Length ${Buffer.byteLength(content, 'latin1')} >>\nstream\n${content}\nendstream`,
-  ];
+function drawTotals(doc: PDFKit.PDFDocument, input: BillingInvoicePdfInput): void {
+  const values = [
+    ['Subtotal', input.subtotalMinor],
+    ['Tax', input.taxTotalMinor],
+    ['Total', input.totalAmountMinor],
+  ] as const;
+  const gap = 12;
+  const width = (doc.page.width - left * 2 - 2 * gap) / values.length;
+  const top = doc.y;
 
-  const chunks: string[] = ['%PDF-1.4\n'];
-  const offsets = [0];
-  for (const [index, object] of objects.entries()) {
-    offsets.push(Buffer.byteLength(chunks.join(''), 'latin1'));
-    chunks.push(`${index + 1} 0 obj\n${object}\nendobj\n`);
+  for (const [column, [label, amount]] of values.entries()) {
+    const x = left + column * (width + gap);
+    doc.rect(x, top, width, 48).fill('#f1f4f6');
+    doc.fillColor(muted).fontSize(9).text(label, x + 10, top + 7, { width: width - 20 });
+    doc.fillColor(ink).fontSize(13).text(formatMinor(amount, input.currency), x + 10, top + 21, { width: width - 20 });
   }
-  const xrefOffset = Buffer.byteLength(chunks.join(''), 'latin1');
-  chunks.push(`xref\n0 ${objects.length + 1}\n`);
-  chunks.push('0000000000 65535 f \n');
-  for (const offset of offsets.slice(1)) {
-    chunks.push(`${String(offset).padStart(10, '0')} 00000 n \n`);
-  }
-  chunks.push(
-    `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`,
-  );
-
-  return Buffer.from(chunks.join(''), 'latin1');
-}
-
-function buildPageContent(lines: string[]): string {
-  const escapedTitle = pdfEscape(lines[0] ?? 'WMS document');
-  const content = ['BT', '/F1 16 Tf', '50 800 Td', `(${escapedTitle}) Tj`, '/F1 9 Tf', '0 -22 Td'];
-
-  for (const line of lines.slice(1, 70)) {
-    content.push(`(${pdfEscape(toPdfSafeText(line))}) Tj`, '0 -12 Td');
-  }
-
-  content.push('ET');
-  return content.join('\n');
-}
-
-function wrapPdfLine(value: string): string[] {
-  const text = toPdfSafeText(value);
-  const width = 92;
-  if (text.length <= width) {
-    return [text];
-  }
-
-  const wrapped: string[] = [];
-  let cursor = text;
-  while (cursor.length > width) {
-    let cut = cursor.lastIndexOf(' ', width);
-    if (cut <= 0) cut = width;
-    wrapped.push(cursor.slice(0, cut));
-    cursor = cursor.slice(cut).trimStart();
-  }
-  if (cursor) wrapped.push(cursor);
-  return wrapped;
-}
-
-function pdfEscape(value: string): string {
-  return value.replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)');
-}
-
-function toPdfSafeText(value: string): string {
-  return value.normalize('NFKD').replace(/[^\x20-\x7E]/g, '?');
+  doc.x = left;
+  doc.y = top + 48;
 }
 
 function toIsoDate(value: Date | string): string {
