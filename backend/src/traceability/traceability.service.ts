@@ -1,10 +1,10 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 
-import { AuthenticatedUser } from '../access-control';
+import { AuthenticatedUser, hasClientAccess, shouldEnforceClientAccess } from '../access-control';
 import { normalizeOffsetPagination } from '../common';
-import { PrismaService } from '../database';
-import { Prisma, Sku, Warehouse, WarehouseLocation } from '../generated/prisma/client';
+import { lockPostgresRowById, PrismaService, withTransactionRetry } from '../database';
+import { Prisma, Sku, StockQuant, Warehouse, WarehouseLocation } from '../generated/prisma/client';
 import { CreateLotDto } from './dto/create-lot.dto';
 import { CreateSerialNumberEventDto } from './dto/create-serial-number-event.dto';
 import { CreateSerialNumberDto } from './dto/create-serial-number.dto';
@@ -82,6 +82,8 @@ interface SerialNumberEventRow {
   occurred_at: Date | string;
   created_at: Date | string;
 }
+
+type LinkedStock = Pick<StockQuant, 'id' | 'skuId' | 'lotId' | 'ownerClientId' | 'locationId'>;
 
 interface RecallSerialRow extends SerialNumberRow {
   sku_code: string | null;
@@ -177,9 +179,16 @@ export class TraceabilityService {
   ): Promise<SkuLotResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
     const sku = await this.resolveSku(dto.skuReference);
+    const lotCode = normalizeCode(dto.lotCode);
+    if (!lotCode) throw new BadRequestException('Lot code cannot be empty');
+    const manufacturedAt = calendarDate(dto.manufacturedAt);
+    const expiryDate = calendarDate(dto.expiryDate);
+    assertLotDateOrder(manufacturedAt, expiryDate);
 
-    try {
-      const rows = await this.prisma.$queryRawUnsafe<SkuLotRow[]>(
+    return this.transaction(async (tx) => {
+      const ownerClientId = await this.resolveOwnerClient(tx, dto.ownerClientId);
+      assertTraceabilityOwner(actor, warehouse.id, ownerClientId);
+      const [lot] = await tx.$queryRawUnsafe<SkuLotRow[]>(
         `
           INSERT INTO sku_lots
             (warehouse_id, owner_client_id, sku_id, lot_code, batch, supplier_lot, quality_status, status,
@@ -188,32 +197,28 @@ export class TraceabilityService {
           VALUES
             ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7::"LotQualityStatus", $8::"LotStatus",
              $9::date, $10::date, NOW(), $11, $12, $13, $14::jsonb, NOW(), NOW())
+          ON CONFLICT (warehouse_id, sku_id, lot_code) DO NOTHING
           RETURNING ${LOT_COLUMNS}
         `,
         warehouse.id,
-        dto.ownerClientId ?? null,
+        ownerClientId,
         sku.id,
-        normalizeCode(dto.lotCode),
+        lotCode,
         normalizeNullableString(dto.batch),
         normalizeNullableString(dto.supplierLot),
         dto.qualityStatus ?? LotQualityStatus.RELEASED,
         dto.status ?? LotStatus.ACTIVE,
-        dto.manufacturedAt ?? null,
-        dto.expiryDate ?? null,
+        manufacturedAt ?? null,
+        expiryDate ?? null,
         dto.status === LotStatus.RELEASED ? new Date() : null,
         dto.status === LotStatus.QUARANTINED ? new Date() : null,
         null,
         JSON.stringify(dto.metadata ?? {}),
       );
-      const lot = assertSingle(rows, 'Lot was not created');
-      await this.writeAudit(actor, warehouse.id, 'sku_lot.created', 'sku_lot', lot.id, lot);
+      if (!lot) throw new ConflictException('Lot already exists for this SKU and warehouse');
+      await this.writeAudit(tx, actor, warehouse.id, 'sku_lot.created', 'sku_lot', lot.id, lot);
       return toLotResponse(lot);
-    } catch (error: unknown) {
-      if (hasPrismaCode(error, 'P2002') || isUniqueViolation(error)) {
-        throw new ConflictException('Lot already exists for this SKU and warehouse');
-      }
-      throw error;
-    }
+    });
   }
 
   async updateLot(
@@ -223,30 +228,42 @@ export class TraceabilityService {
     actor: AuthenticatedUser,
   ): Promise<SkuLotResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
-    const existing = await this.resolveLot(warehouse.id, lotReference);
-    const patch: Record<string, unknown> = {
-      batch: normalizeNullableString(dto.batch),
-      supplier_lot: normalizeNullableString(dto.supplierLot),
-      quality_status: dto.qualityStatus,
-      status: dto.status,
-      manufactured_at: dto.manufacturedAt,
-      expiry_date: dto.expiryDate,
-      quarantine_reason: normalizeNullableString(dto.quarantineReason),
-      metadata: dto.metadata === undefined ? undefined : JSON.stringify(dto.metadata),
-      released_at: dto.status === LotStatus.RELEASED ? new Date() : undefined,
-      quarantined_at: dto.status === LotStatus.QUARANTINED ? new Date() : undefined,
-    };
-
-    const lot = await this.updateRow<SkuLotRow>({
-      table: 'sku_lots',
-      id: existing.id,
-      enumColumns: { quality_status: 'LotQualityStatus', status: 'LotStatus' },
-      jsonColumns: new Set(['metadata']),
-      patch,
-      select: LOT_SELECT,
+    return this.transaction(async (tx) => {
+      const candidate = await this.resolveLot(warehouse.id, lotReference, tx);
+      await lockPostgresRowById(tx, 'sku_lots', candidate.id);
+      const existing = await this.resolveLot(warehouse.id, candidate.id, tx);
+      assertTraceabilityOwner(actor, warehouse.id, existing.owner_client_id);
+      const manufacturedAt = calendarDate(dto.manufacturedAt);
+      const expiryDate = calendarDate(dto.expiryDate);
+      if (manufacturedAt !== undefined || expiryDate !== undefined) {
+        assertLotDateOrder(
+          manufacturedAt === undefined ? calendarDate(existing.manufactured_at) : manufacturedAt,
+          expiryDate === undefined ? calendarDate(existing.expiry_date) : expiryDate,
+        );
+      }
+      const statusChanged = dto.status !== existing.status;
+      const lot = await this.updateRow<SkuLotRow>(tx, {
+        table: 'sku_lots',
+        id: existing.id,
+        enumColumns: { quality_status: 'LotQualityStatus', status: 'LotStatus' },
+        jsonColumns: new Set(['metadata']),
+        patch: {
+          batch: normalizeNullableString(dto.batch),
+          supplier_lot: normalizeNullableString(dto.supplierLot),
+          quality_status: dto.qualityStatus ?? undefined,
+          status: dto.status ?? undefined,
+          manufactured_at: manufacturedAt,
+          expiry_date: expiryDate,
+          quarantine_reason: normalizeNullableString(dto.quarantineReason),
+          metadata: dto.metadata === undefined ? undefined : JSON.stringify(dto.metadata),
+          released_at: statusChanged && dto.status === LotStatus.RELEASED ? new Date() : undefined,
+          quarantined_at: statusChanged && dto.status === LotStatus.QUARANTINED ? new Date() : undefined,
+        },
+        select: LOT_SELECT,
+      });
+      await this.writeAudit(tx, actor, warehouse.id, 'sku_lot.updated', 'sku_lot', lot.id, lot);
+      return toLotResponse(lot);
     });
-    await this.writeAudit(actor, warehouse.id, 'sku_lot.updated', 'sku_lot', lot.id, lot);
-    return toLotResponse(lot);
   }
 
   async listSerialNumbers(
@@ -298,13 +315,24 @@ export class TraceabilityService {
   ): Promise<SerialNumberResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
     const sku = await this.resolveSku(dto.skuReference);
-    const lot = dto.lotReference ? await this.resolveLot(warehouse.id, dto.lotReference) : null;
     const location = dto.lastSeenLocationReference
       ? await this.resolveLocation(warehouse.id, dto.lastSeenLocationReference)
       : null;
+    const serialNumber = normalizeSerial(dto.serialNumber);
+    if (!serialNumber) throw new BadRequestException('Serial number cannot be empty');
 
-    try {
-      const rows = await this.prisma.$queryRawUnsafe<SerialNumberRow[]>(
+    return this.transaction(async (tx) => {
+      const lot = dto.lotReference ? await this.resolveLot(warehouse.id, dto.lotReference, tx) : null;
+      const stock = await this.resolveLinkedStock(tx, warehouse.id, dto.stockQuantId);
+      const ownerClientId = await this.resolveOwnerClient(tx, dto.ownerClientId)
+        ?? lot?.owner_client_id ?? stock?.ownerClientId ?? null;
+      assertTraceabilityOwner(actor, warehouse.id, ownerClientId);
+      if (lot && (lot.sku_id !== sku.id || lot.owner_client_id !== ownerClientId)) {
+        throw new ConflictException('Serial lot must belong to the same SKU and owner');
+      }
+      const lastSeenLocationId = location?.id ?? stock?.locationId ?? null;
+      assertStockIdentity(stock, sku.id, lot?.id ?? null, ownerClientId, lastSeenLocationId);
+      const [serial] = await tx.$queryRawUnsafe<SerialNumberRow[]>(
         `
           INSERT INTO serial_numbers
             (warehouse_id, owner_client_id, sku_id, lot_id, stock_quant_id, serial_number, status,
@@ -313,36 +341,32 @@ export class TraceabilityService {
             ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5::uuid, $6, $7::"SerialNumberStatus",
              CASE WHEN $7::"SerialNumberStatus" IN ('AVAILABLE', 'EXPECTED') THEN NOW() ELSE NULL END,
              $8::uuid, $9::jsonb, NOW(), NOW())
+          ON CONFLICT (warehouse_id, serial_number) DO NOTHING
           RETURNING ${SERIAL_COLUMNS}
         `,
         warehouse.id,
-        dto.ownerClientId ?? null,
+        ownerClientId,
         sku.id,
-        lot?.id ?? null,
-        dto.stockQuantId ?? null,
-        normalizeSerial(dto.serialNumber),
+        lot?.id ?? stock?.lotId ?? null,
+        stock?.id ?? null,
+        serialNumber,
         dto.status ?? SerialNumberStatus.AVAILABLE,
-        location?.id ?? null,
+        lastSeenLocationId,
         JSON.stringify(dto.metadata ?? {}),
       );
-      const serial = assertSingle(rows, 'Serial number was not created');
-      await this.recordSerialEvent(warehouse.id, serial, {
+      if (!serial) throw new ConflictException('Serial number already exists in this warehouse');
+      await this.recordSerialEvent(tx, warehouse.id, serial, {
         eventType: 'CREATED',
-        toLocationId: location?.id ?? null,
-        stockQuantId: dto.stockQuantId ?? null,
+        toLocationId: lastSeenLocationId,
+        stockQuantId: stock?.id ?? null,
         actorUserId: actor.id,
         referenceType: 'SERIAL_NUMBER',
         referenceId: serial.id,
         metadata: { status: serial.status },
       });
-      await this.writeAudit(actor, warehouse.id, 'serial_number.created', 'serial_number', serial.id, serial);
+      await this.writeAudit(tx, actor, warehouse.id, 'serial_number.created', 'serial_number', serial.id, serial);
       return toSerialResponse(serial);
-    } catch (error: unknown) {
-      if (isUniqueViolation(error)) {
-        throw new ConflictException('Serial number already exists in this warehouse');
-      }
-      throw error;
-    }
+    });
   }
 
   async updateSerialNumber(
@@ -352,39 +376,49 @@ export class TraceabilityService {
     actor: AuthenticatedUser,
   ): Promise<SerialNumberResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
-    const existing = await this.resolveSerialNumber(warehouse.id, serialReference);
     const location = dto.lastSeenLocationReference === undefined
       ? undefined
       : dto.lastSeenLocationReference === null
         ? null
         : await this.resolveLocation(warehouse.id, dto.lastSeenLocationReference);
 
-    const patch: Record<string, unknown> = {
-      status: dto.status,
-      last_seen_location_id: location === undefined ? undefined : location?.id ?? null,
-      stock_quant_id: dto.stockQuantId,
-      metadata: dto.metadata === undefined ? undefined : JSON.stringify(dto.metadata),
-    };
+    return this.transaction(async (tx) => {
+      const existing = await this.lockSerialNumber(tx, warehouse.id, serialReference);
+      assertTraceabilityOwner(actor, warehouse.id, existing.owner_client_id);
+      const stockRef = dto.stockQuantId === undefined ? existing.stock_quant_id : dto.stockQuantId;
+      const stock = await this.resolveLinkedStock(tx, warehouse.id, stockRef);
+      const lastSeenLocationId = location === undefined
+        ? stock?.locationId ?? existing.last_seen_location_id
+        : location?.id ?? null;
+      assertStockIdentity(stock, existing.sku_id, existing.lot_id, existing.owner_client_id, lastSeenLocationId);
 
-    const serial = await this.updateRow<SerialNumberRow>({
-      table: 'serial_numbers',
-      id: existing.id,
-      enumColumns: { status: 'SerialNumberStatus' },
-      jsonColumns: new Set(['metadata']),
-      patch,
-      select: SERIAL_SELECT,
+      const serial = await this.updateRow<SerialNumberRow>(tx, {
+        table: 'serial_numbers',
+        id: existing.id,
+        enumColumns: { status: 'SerialNumberStatus' },
+        jsonColumns: new Set(['metadata']),
+        patch: {
+          status: dto.status ?? undefined,
+          last_seen_location_id: lastSeenLocationId,
+          stock_quant_id: stock?.id ?? null,
+          lot_id: existing.lot_id ?? stock?.lotId ?? undefined,
+          metadata: dto.metadata === undefined ? undefined : JSON.stringify(dto.metadata),
+        },
+        select: SERIAL_SELECT,
+      });
+      await this.recordSerialEvent(tx, warehouse.id, serial, {
+        eventType: dto.status ? `STATUS_${dto.status}` : 'UPDATED',
+        fromLocationId: existing.last_seen_location_id,
+        toLocationId: serial.last_seen_location_id,
+        stockQuantId: serial.stock_quant_id,
+        actorUserId: actor.id,
+        referenceType: 'SERIAL_NUMBER',
+        referenceId: serial.id,
+        metadata: { previousStatus: existing.status, status: serial.status },
+      });
+      await this.writeAudit(tx, actor, warehouse.id, 'serial_number.updated', 'serial_number', serial.id, serial);
+      return toSerialResponse(serial);
     });
-    await this.recordSerialEvent(warehouse.id, serial, {
-      eventType: dto.status ? `STATUS_${dto.status}` : 'UPDATED',
-      toLocationId: location === undefined ? serial.last_seen_location_id : location?.id ?? null,
-      stockQuantId: serial.stock_quant_id,
-      actorUserId: actor.id,
-      referenceType: 'SERIAL_NUMBER',
-      referenceId: serial.id,
-      metadata: { previousStatus: existing.status, status: serial.status },
-    });
-    await this.writeAudit(actor, warehouse.id, 'serial_number.updated', 'serial_number', serial.id, serial);
-    return toSerialResponse(serial);
   }
 
   async listSerialNumberEvents(
@@ -480,7 +514,7 @@ export class TraceabilityService {
       events: eventRows.map(toSerialEventResponse),
     };
 
-    await this.writeAudit(actor, warehouse.id, 'traceability.recall_report.generated', 'traceability_recall_report', reportId, {
+    await this.writeAudit(this.prisma, actor, warehouse.id, 'traceability.recall_report.generated', 'traceability_recall_report', reportId, {
       criteria: response.criteria,
       summary: response.summary,
     });
@@ -495,31 +529,88 @@ export class TraceabilityService {
     actor: AuthenticatedUser,
   ): Promise<SerialNumberEventResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
-    const serial = await this.resolveSerialNumber(warehouse.id, serialReference);
     const from = dto.fromLocationReference ? await this.resolveLocation(warehouse.id, dto.fromLocationReference) : null;
     const to = dto.toLocationReference ? await this.resolveLocation(warehouse.id, dto.toLocationReference) : null;
+    const eventType = normalizeCode(dto.eventType);
+    if (!eventType) throw new BadRequestException('Serial event type cannot be empty');
 
-    const event = await this.recordSerialEvent(warehouse.id, serial, {
-      eventType: normalizeCode(dto.eventType),
-      fromLocationId: from?.id ?? null,
-      toLocationId: to?.id ?? null,
-      stockQuantId: dto.stockQuantId ?? serial.stock_quant_id,
-      actorUserId: actor.id,
-      referenceType: normalizeNullableString(dto.referenceType),
-      referenceId: normalizeNullableString(dto.referenceId),
-      occurredAt: dto.occurredAt ? new Date(dto.occurredAt) : undefined,
-      metadata: dto.metadata ?? {},
-    });
-
-    if (to) {
-      await this.prisma.$executeRawUnsafe(
-        `UPDATE serial_numbers SET last_seen_location_id = $2::uuid, updated_at = NOW() WHERE id = $1::uuid`,
-        serial.id,
-        to.id,
+    return this.transaction(async (tx) => {
+      const serial = await this.lockSerialNumber(tx, warehouse.id, serialReference);
+      assertTraceabilityOwner(actor, warehouse.id, serial.owner_client_id);
+      const previous = await tx.serialNumberEvent.findFirst({
+        where: { serialNumberId: serial.id },
+        orderBy: [{ occurredAt: 'desc' }, { createdAt: 'desc' }],
+        select: { occurredAt: true },
+      });
+      const occurredAt = dto.occurredAt ? new Date(dto.occurredAt) : new Date();
+      const latest = previous?.occurredAt ?? toDate(serial.created_at);
+      const current = !dto.occurredAt || occurredAt >= latest;
+      if (current && from && serial.last_seen_location_id && from.id !== serial.last_seen_location_id) {
+        throw new ConflictException('Serial event source does not match the current location');
+      }
+      const stock = await this.resolveLinkedStock(
+        tx, warehouse.id, dto.stockQuantId ?? (current ? serial.stock_quant_id : null),
       );
-    }
+      const toLocationId = to?.id ?? (dto.stockQuantId ? stock?.locationId ?? null : null);
+      assertStockIdentity(stock, serial.sku_id, serial.lot_id, serial.owner_client_id, toLocationId ?? stock?.locationId ?? null);
 
-    return toSerialEventResponse(event);
+      const event = await this.recordSerialEvent(tx, warehouse.id, serial, {
+        eventType,
+        fromLocationId: from?.id ?? (current && toLocationId ? serial.last_seen_location_id : null),
+        toLocationId,
+        stockQuantId: stock?.id ?? null,
+        actorUserId: actor.id,
+        referenceType: normalizeNullableString(dto.referenceType),
+        referenceId: normalizeNullableString(dto.referenceId),
+        occurredAt,
+        metadata: dto.metadata ?? {},
+      });
+      if (current && toLocationId) {
+        await tx.serialNumber.update({
+          where: { id: serial.id },
+          data: { lastSeenLocationId: toLocationId, stockQuantId: stock?.id ?? null, lotId: serial.lot_id ?? stock?.lotId ?? null },
+        });
+      }
+      await this.writeAudit(tx, actor, warehouse.id, 'serial_number_event.created', 'serial_number_event', event.id, event);
+      return toSerialEventResponse(event);
+    });
+  }
+
+  private transaction<T>(operation: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
+    return withTransactionRetry(() => this.prisma.$transaction(operation));
+  }
+
+  private async resolveOwnerClient(tx: Prisma.TransactionClient, reference?: string | null): Promise<string | null> {
+    const id = normalizeNullableString(reference);
+    if (!id) return null;
+    if (!isUuid(id)) throw new BadRequestException('Owner must be a client ID');
+    const owner = await tx.wmsClient.findUnique({ where: { id }, select: { id: true } });
+    if (!owner) throw new NotFoundException('Owner client was not found');
+    return owner.id;
+  }
+
+  private async resolveLinkedStock(
+    tx: Prisma.TransactionClient, warehouseId: string, id?: string | null,
+  ): Promise<LinkedStock | null> {
+    if (id === undefined || id === null) return null;
+    if (!isUuid(id)) throw new BadRequestException('Stock quant must be an ID');
+    const candidate = await tx.stockQuant.findFirst({ where: { id, warehouseId }, select: { id: true } });
+    if (!candidate) throw new NotFoundException('Stock quant was not found in this warehouse');
+    await lockPostgresRowById(tx, 'stock_quants', candidate.id);
+    const stock = await tx.stockQuant.findFirst({
+      where: { id, warehouseId },
+      select: { id: true, skuId: true, lotId: true, ownerClientId: true, locationId: true },
+    });
+    if (!stock) throw new NotFoundException('Stock quant was not found in this warehouse');
+    return stock;
+  }
+
+  private async lockSerialNumber(
+    tx: Prisma.TransactionClient, warehouseId: string, reference: string,
+  ): Promise<SerialNumberRow> {
+    const candidate = await this.resolveSerialNumber(warehouseId, reference, tx);
+    await lockPostgresRowById(tx, 'serial_numbers', candidate.id);
+    return this.resolveSerialNumber(warehouseId, candidate.id, tx);
   }
 
   private async resolveWarehouse(warehouseReference: string): Promise<Warehouse> {
@@ -540,8 +631,10 @@ export class TraceabilityService {
     return location;
   }
 
-  private async resolveLot(warehouseId: string, lotReference: string): Promise<SkuLotRow> {
-    const rows = await this.prisma.$queryRawUnsafe<SkuLotRow[]>(
+  private async resolveLot(
+    warehouseId: string, lotReference: string, tx: Prisma.TransactionClient = this.prisma,
+  ): Promise<SkuLotRow> {
+    const rows = await tx.$queryRawUnsafe<SkuLotRow[]>(
       `${LOT_SELECT} WHERE warehouse_id = $1::uuid AND (id::text = $2 OR lot_code = $3) LIMIT 1`,
       warehouseId,
       lotReference,
@@ -552,8 +645,10 @@ export class TraceabilityService {
     return lot;
   }
 
-  private async resolveSerialNumber(warehouseId: string, serialReference: string): Promise<SerialNumberRow> {
-    const rows = await this.prisma.$queryRawUnsafe<SerialNumberRow[]>(
+  private async resolveSerialNumber(
+    warehouseId: string, serialReference: string, tx: Prisma.TransactionClient = this.prisma,
+  ): Promise<SerialNumberRow> {
+    const rows = await tx.$queryRawUnsafe<SerialNumberRow[]>(
       `${SERIAL_SELECT} WHERE warehouse_id = $1::uuid AND (id::text = $2 OR serial_number = $3) LIMIT 1`,
       warehouseId,
       serialReference,
@@ -712,6 +807,7 @@ export class TraceabilityService {
   }
 
   private async recordSerialEvent(
+    tx: Prisma.TransactionClient,
     warehouseId: string,
     serial: SerialNumberRow,
     input: {
@@ -726,12 +822,14 @@ export class TraceabilityService {
       metadata?: Record<string, unknown>;
     },
   ): Promise<SerialNumberEventRow> {
-    const rows = await this.prisma.$queryRawUnsafe<SerialNumberEventRow[]>(
+    const rows = await tx.$queryRawUnsafe<SerialNumberEventRow[]>(
       `
         INSERT INTO serial_number_events
           (warehouse_id, owner_client_id, serial_number_id, event_type, from_location_id, to_location_id,
            stock_quant_id, actor_user_id, reference_type, reference_id, metadata, occurred_at, created_at)
-        VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5::uuid, $6::uuid, $7::uuid, $8::uuid, $9, $10, $11::jsonb, COALESCE($12, NOW()), NOW())
+        VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5::uuid, $6::uuid, $7::uuid, $8::uuid, $9, $10, $11::jsonb,
+                COALESCE($12::timestamptz, clock_timestamp()) AT TIME ZONE 'UTC',
+                clock_timestamp() AT TIME ZONE 'UTC')
         RETURNING ${SERIAL_EVENT_COLUMNS}
       `,
       warehouseId,
@@ -745,12 +843,12 @@ export class TraceabilityService {
       input.referenceType ?? null,
       input.referenceId ?? null,
       JSON.stringify(input.metadata ?? {}),
-      input.occurredAt ?? null,
+      input.occurredAt?.toISOString() ?? null,
     );
     return assertSingle(rows, 'Serial event was not created');
   }
 
-  private async updateRow<T>(input: {
+  private async updateRow<T>(tx: Prisma.TransactionClient, input: {
     table: TraceabilityUpdateTable;
     id: string;
     patch: Record<string, unknown>;
@@ -774,22 +872,23 @@ export class TraceabilityService {
           assertSafeTraceabilityEnum(enumType);
           return `${column} = ${placeholder}::"${enumType}"`;
         }
-        if (column.endsWith('_at') || column.endsWith('_date')) return `${column} = ${placeholder}`;
+        if (column === 'manufactured_at' || column === 'expiry_date') return `${column} = ${placeholder}::date`;
         if (column.endsWith('_id')) return `${column} = ${placeholder}::uuid`;
         return `${column} = ${placeholder}`;
       }).join(', ');
-      await this.prisma.$executeRawUnsafe(
+      await tx.$executeRawUnsafe(
         `UPDATE ${input.table} SET ${assignments}, updated_at = NOW() WHERE id = $1::uuid`,
         input.id,
         ...entries.map(([, value]) => value),
       );
     }
 
-    const rows = await this.prisma.$queryRawUnsafe<T[]>(`${input.select} WHERE id = $1::uuid`, input.id);
+    const rows = await tx.$queryRawUnsafe<T[]>(`${input.select} WHERE id = $1::uuid`, input.id);
     return assertSingle(rows, 'Row was not found after update');
   }
 
   private async writeAudit(
+    tx: Prisma.TransactionClient,
     actor: AuthenticatedUser,
     warehouseId: string,
     action: string,
@@ -797,7 +896,7 @@ export class TraceabilityService {
     resourceId: string,
     metadata: unknown,
   ): Promise<void> {
-    await this.prisma.auditLog.create({
+    await tx.auditLog.create({
       data: {
         actorUserId: actor.id,
         warehouseId,
@@ -847,6 +946,7 @@ const TRACEABILITY_UPDATE_POLICIES: Record<TraceabilityUpdateTable, {
     select: SERIAL_SELECT,
     columns: new Set([
       'last_seen_location_id',
+      'lot_id',
       'metadata',
       'status',
       'stock_quant_id',
@@ -1116,10 +1216,36 @@ function assertSingle<T>(rows: T[], message: string): T {
   return row;
 }
 
-function isUniqueViolation(error: unknown): boolean {
-  return typeof error === 'object' && error !== null && 'code' in error && (error as { code?: unknown }).code === '23505';
+function calendarDate(value: Date | string | null | undefined): string | null | undefined {
+  if (value === undefined || value === null) return value;
+  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  const date = value.slice(0, 10);
+  const checked = new Date(`${date}T00:00:00Z`);
+  if (Number.isNaN(checked.getTime()) || checked.getUTCFullYear() < 1 || checked.toISOString().slice(0, 10) !== date) {
+    throw new BadRequestException('Invalid lot calendar date');
+  }
+  return date;
 }
 
-function hasPrismaCode(error: unknown, code: string): boolean {
-  return typeof error === 'object' && error !== null && 'code' in error && (error as { code?: unknown }).code === code;
+function assertLotDateOrder(manufacturedAt?: string | null, expiry?: string | null): void {
+  if (manufacturedAt && expiry && manufacturedAt > expiry) {
+    throw new ConflictException('Lot expiry cannot precede manufacture');
+  }
+}
+
+function assertTraceabilityOwner(actor: AuthenticatedUser, warehouseId: string, ownerClientId: string | null): void {
+  if (shouldEnforceClientAccess(actor) && (!ownerClientId || !hasClientAccess({
+    user: actor, clientReference: ownerClientId, warehouseReference: warehouseId,
+  }))) {
+    throw new ForbiddenException('Traceability reference is outside the active client scope');
+  }
+}
+
+function assertStockIdentity(
+  stock: LinkedStock | null, skuId: string, lotId: string | null, ownerClientId: string | null, locationId: string | null,
+): void {
+  if (stock && (stock.skuId !== skuId || stock.ownerClientId !== ownerClientId ||
+      (lotId !== null && stock.lotId !== lotId) || stock.locationId !== locationId)) {
+    throw new ConflictException('Stock quant must match the serial SKU, lot, owner and location');
+  }
 }

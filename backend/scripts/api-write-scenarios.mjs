@@ -367,6 +367,79 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.equal((await own('POST', rfPath + '/complete', {})).lines[0].completedQuantity, 2);
   });
 
+  await scenario('lot and serial traceability preserves identities and the latest recorded location', async () => {
+    const { sku } = await createSku('SERIAL');
+    const { sku: otherSku } = await createSku('SERIAL-OTHER');
+    const trace = '/traceability';
+    const sourceLocation = await own('GET', '/locations/A-01-01');
+    const target = await own('POST', '/locations', {
+      code: `SERIAL-${suffix}`, name: 'Traceability test bin', type: 'STORAGE', parentReference: 'A-01',
+    });
+    const lotBody = {
+      skuReference: sku.code, lotCode: `SERIAL-LOT-${suffix}`,
+      manufacturedAt: '2026-01-01', expiryDate: '2028-01-01',
+    };
+    const lot = await own('POST', trace + '/lots', lotBody);
+    await own('POST', trace + '/lots', lotBody, 409);
+    const lotPath = `${trace}/lots/${lot.id}`;
+    await own('PATCH', lotPath, { expiryDate: '2025-01-01' }, 409);
+    const released = await own('PATCH', lotPath, { status: 'RELEASED', supplierLot: '  SUPPLIER-1  ' });
+    assert.equal(released.supplierLot, 'SUPPLIER-1');
+    assert.ok(released.releasedAt);
+    assert.equal((await own('PATCH', lotPath, { status: 'RELEASED' })).releasedAt, released.releasedAt);
+    const unrelatedLot = await own('POST', trace + '/lots', { skuReference: otherSku.id, lotCode: `OTHER-${suffix}` });
+
+    const inbound = await own('POST', '/inbound-shipments', {
+      shipmentNumber: `SERIAL-ASN-${suffix}`, supplierName: 'Traceability fixture supplier',
+      lines: [{ lineNumber: '1', sku: sku.code, expectedQuantity: 2 }],
+    });
+    const receive = locationReference => own('POST', `/inbound-shipments/${inbound.id}/receive`, {
+      locationReference, lineReference: '1', quantity: 1, lotReference: lot.lotCode, createPutawayTask: false,
+    });
+    const { quant: atSource } = await receive(sourceLocation.id);
+    const { quant: atTarget } = await receive(target.id);
+    const { quant: unrelatedStock } = await own('POST', '/inventory/quants/receive', {
+      skuReference: otherSku.id, locationReference: sourceLocation.id, quantity: 1,
+    });
+    const serials = trace + '/serial-numbers';
+    const serialBody = { skuReference: sku.id, serialNumber: `SN-${suffix}`, stockQuantId: atSource.id };
+    await own('POST', serials, { ...serialBody, lotReference: unrelatedLot.id }, 409);
+    await own('POST', serials, { ...serialBody, stockQuantId: unrelatedStock.id }, 409);
+    await own('POST', serials, { ...serialBody, stockQuantId: 'not-a-stock-id' }, 400);
+    const created = await own('POST', serials, serialBody);
+    assert.equal(created.lotId, lot.id);
+    assert.equal(created.lastSeenLocationId, sourceLocation.id);
+    await own('POST', serials, serialBody, 409);
+    const serialPath = `${serials}/${created.id}`;
+    await own('PATCH', serialPath, { stockQuantId: atTarget.id, lastSeenLocationReference: sourceLocation.id }, 409);
+    await own('PATCH', serialPath, { stockQuantId: unrelatedStock.id }, 409);
+    const moved = await own('PATCH', serialPath, { stockQuantId: atTarget.id, status: 'AVAILABLE' });
+    assert.equal(moved.lastSeenLocationId, target.id);
+    assert.equal(moved.stockQuantId, atTarget.id);
+    const eventPath = serialPath + '/events';
+    const backdated = await own('POST', eventPath, {
+      eventType: 'OBSERVED', toLocationReference: sourceLocation.id, occurredAt: '2025-01-01T10:00:00.000Z',
+    });
+    assert.equal(backdated.stockQuantId, null);
+    assert.equal((await own('GET', serialPath)).lastSeenLocationId, target.id);
+    await own('POST', eventPath, { eventType: 'MOVED', toLocationReference: sourceLocation.id }, 409);
+    const transfer = {
+      eventType: 'MOVED', fromLocationReference: target.id, toLocationReference: sourceLocation.id, stockQuantId: atSource.id,
+    };
+    const attempts = await Promise.all([
+      own('POST', eventPath, transfer, [201, 409]),
+      own('POST', eventPath, transfer, [201, 409]),
+    ]);
+    assert.equal(attempts.filter(item => item.eventType === 'MOVED').length, 1);
+    const saved = await own('GET', serialPath);
+    assert.equal(saved.stockQuantId, atSource.id);
+    assert.equal(saved.lastSeenLocationId, sourceLocation.id);
+    const events = await own('GET', eventPath);
+    assert.deepEqual(events.map(event => event.eventType), ['MOVED', 'STATUS_AVAILABLE', 'CREATED', 'OBSERVED']);
+    assert.equal(events[1].fromLocationId, sourceLocation.id);
+    assert.equal(events[1].toLocationId, target.id);
+  });
+
   await scenario('putaway moves the planned stock exactly once and rejects mismatched confirmations', async () => {
     const { sku } = await createSku('PUTAWAY');
     const { sku: otherSku } = await createSku('PUTAWAY-OTHER');
