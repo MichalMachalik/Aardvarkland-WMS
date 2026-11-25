@@ -537,6 +537,67 @@ export async function runWriteScenarios(suite, { asAdmin, asManager, asWorker, b
     assert.equal(dashboard.activeSessions.find(item => item.id === session.id).lastError, 'SHORT_PICK');
   });
 
+  await scenario('scanner queue acknowledges only applied scans and retains failed and pending entries', async () => {
+    const { sku } = await createSku('OFFLINE');
+    await own('POST', '/inventory/quants/receive', { skuReference: sku.code, locationReference: 'A-01-01', quantity: 1 });
+    const order = await own('POST', '/outbound-orders', {
+      orderNumber: `OFFLINE-${suffix}`, lines: [{ lineNumber: '10', sku: sku.code, orderedQuantity: 1 }],
+    });
+    await own('POST', `/outbound-orders/${order.id}/allocate`, {});
+    await own('POST', `/outbound-orders/${order.id}/release-picking`, {});
+    const [task] = (await own('GET', `/tasks?type=PICK&sku=${sku.code}`)).filter(item => item.outboundOrderId === order.id);
+    const session = await asWorker('POST', `${warehouse}/rf/tasks/${task.id}/start`, {});
+    const sessionPath = `/rf/sessions/${session.sessionId}`;
+    const common = { sessionReference: session.sessionId, taskReference: task.id, stepKey: session.step.key };
+    const sync = (scans, dryRun = false) => asWorker('POST', `${warehouse}/rf/offline/sync`, { scans, dryRun });
+    const wrong = { ...common, idempotencyKey: `WRONG-${suffix}`, scannedValue: 'MISSING-LOCATION' };
+    const pending = { idempotencyKey: `WAIT-${suffix}`, scannedValue: 'UNASSIGNED' };
+    const correct = { ...common, idempotencyKey: `RIGHT-${suffix}`, scannedValue: session.step.expected.value };
+    const preview = await sync([correct], true);
+    assert.equal(preview.queued, 1);
+    const original = await sync([wrong, pending]);
+    assert.deepEqual(original.items.map(item => item.status), ['FAILED', 'QUEUED']);
+    assert.equal(original.items[0].errorCode, 'SCAN_MISMATCH');
+    assert.deepEqual((await sync([wrong, pending])).items.map(item => item.status), ['FAILED', 'QUEUED']);
+
+    const outcomes = await Promise.all(Array.from({ length: 6 }, () => sync([correct])));
+    assert.equal(outcomes.reduce((sum, item) => sum + item.synced, 0), 1);
+    assert.equal(outcomes.reduce((sum, item) => sum + item.duplicates, 0), 5);
+    const current = await own('GET', sessionPath);
+    assert.notEqual(current.step.key, session.step.key);
+
+    const reused = await sync([{ ...correct, scannedValue: 'different-input' }]);
+    assert.equal(reused.items[0].status, 'FAILED');
+    assert.equal(reused.items[0].errorCode, 'OFFLINE_KEY_CONFLICT');
+    const delayed = await sync([{ ...correct, idempotencyKey: `DELAY-${suffix}`, scannedValue: current.step.expected.value }]);
+    assert.equal(delayed.items[0].status, 'FAILED');
+    assert.equal((await own('GET', sessionPath)).step.key, current.step.key);
+
+    const { sku: countedSku } = await createSku('OFFLINE-COUNT');
+    await own('POST', '/inventory/quants/receive', { skuReference: countedSku.code, locationReference: 'A-01-01', quantity: 3 });
+    const plan = await own('POST', '/cycle-counts', { code: `OFFLINE-COUNT-${suffix}`, scopeType: 'SKU', scopeReference: countedSku.code });
+    await own('POST', `/cycle-counts/${plan.id}/release`, {});
+    const [countTask] = await own('GET', `/cycle-counts/${plan.id}/tasks`);
+    let count = await asWorker('POST', `${warehouse}/rf/tasks/${countTask.warehouseTaskId}/start`, {});
+    const countPath = `/rf/sessions/${count.sessionId}`;
+    for (let step = 0; step < 2 && ['LOCATION', 'SKU'].includes(count.step.expected.type); step += 1) {
+      count = await asWorker('POST', `${warehouse}${countPath}/scan`, { scannedValue: count.step.expected.value });
+    }
+    assert.equal(count.step.expected.type, 'QUANTITY');
+    const countScan = { sessionReference: count.sessionId, taskReference: countTask.warehouseTaskId, stepKey: count.step.key };
+    const invalidQuantity = await sync([{ ...countScan, idempotencyKey: `BAD-COUNT-${suffix}`, scannedValue: 'NOT-A-COUNT' }]);
+    assert.equal(invalidQuantity.items[0].status, 'FAILED');
+    const afterFailure = await own('GET', countPath);
+    assert.equal(afterFailure.status, 'ACTIVE');
+    assert.equal(afterFailure.step.key, count.step.key);
+    const zeroQuantity = await sync([{ ...countScan, idempotencyKey: `ZERO-COUNT-${suffix}`, scannedValue: '0', quantity: 0 }]);
+    assert.equal(zeroQuantity.items[0].status, 'SYNCED');
+    assert.equal((await own('GET', countPath)).status, 'COMPLETED');
+    const [submittedCount] = await own('GET', `/cycle-counts/${plan.id}/tasks`);
+    assert.equal(submittedCount.status, 'SUBMITTED');
+    assert.equal(submittedCount.countedQuantity, 0);
+  });
+
   await scenario('fake print agents claim, finish and replay a job without touching hardware', async () => {
     const printerCode = `TEST-PRINTER-${suffix}`;
     const agentCode = `TEST-AGENT-${suffix}`;

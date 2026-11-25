@@ -1,4 +1,4 @@
-import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, HttpException, Injectable, NotFoundException } from '@nestjs/common';
 
 import { AuthenticatedUser } from '../access-control/types';
 import { calculateCountVariance, MAX_COUNT_QUANTITY } from '../cycle-counts/cycle-counts.helpers';
@@ -397,98 +397,96 @@ export class RfWorkflowsService {
   ): Promise<RfInstructionResponse> {
     const warehouse = await this.resolveWarehouse(warehouseReference);
 
-    return this.transaction(async (tx: RfTransactionClient) => {
-      const session = await this.resolveSessionWithClient(tx, warehouse.id, sessionReference);
+    return this.transaction(tx => this.scanInSession(tx, warehouse.id, sessionReference, dto, actor));
+  }
 
-      if (session.status !== ScannerSessionStatus.ACTIVE) {
-        throw new ConflictException('RF session is not active');
-      }
+  private async scanInSession(
+    tx: RfTransactionClient,
+    warehouseId: string,
+    sessionReference: string,
+    dto: ScanRfStepDto,
+    actor: AuthenticatedUser,
+    offlineStepKey?: string,
+  ): Promise<RfInstructionResponse> {
+    const candidate = await this.resolveSessionWithClient(tx, warehouseId, sessionReference);
+    await lockPostgresRowById(tx, 'scanner_sessions', candidate.id);
+    const session = await this.resolveSessionWithClient(tx, warehouseId, candidate.id);
+    if (session.status !== ScannerSessionStatus.ACTIVE) {
+      throw new ConflictException('RF session is not active');
+    }
 
-      const task = session.taskId
-        ? await this.resolveTaskWithClient(tx, warehouse.id, session.taskId)
-        : null;
-      const step = await this.getOpenStepWithClient(tx, session.id);
+    const task = session.taskId ? await this.resolveTaskWithClient(tx, warehouseId, session.taskId) : null;
+    const step = await this.getOpenStepWithClient(tx, session.id);
+    if (!step) {
+      throw new ConflictException('RF session has no open step');
+    }
+    if (offlineStepKey && offlineStepKey !== step.stepKey) {
+      throw new ConflictException('The offline scan is for a different RF step');
+    }
 
-      if (!step) {
-        throw new ConflictException('RF session has no open step');
-      }
-
-      const expected = expectedFromStep(step);
-      const scannedValue =
-        dto.scannedValue?.trim() ?? (dto.quantity === undefined ? '' : String(dto.quantity));
-
-      if (!isExpectedScan(expected, scannedValue)) {
-        const retryStep = await tx.scannerWorkflowStep.update({
-          where: { id: step.id },
-          data: {
-            scannedValue,
-            quantity: dto.quantity ?? null,
-            errorCode: 'SCAN_MISMATCH',
-            metadata: toJson(dto.metadata),
-          },
-        });
-
-        return this.toInstruction(session, task, retryStep, 'SCAN_MISMATCH');
-      }
-
-      const completedStep = await tx.scannerWorkflowStep.update({
+    const expected = expectedFromStep(step);
+    const scannedValue = dto.scannedValue?.trim() ?? (dto.quantity === undefined ? '' : String(dto.quantity));
+    if (!isExpectedScan(expected, scannedValue)) {
+      const retryStep = await tx.scannerWorkflowStep.update({
         where: { id: step.id },
         data: {
-          status: 'COMPLETED',
           scannedValue,
           quantity: dto.quantity ?? null,
+          errorCode: 'SCAN_MISMATCH',
           metadata: toJson(dto.metadata),
-          completedAt: new Date(),
         },
       });
+      return this.toInstruction(session, task, retryStep, 'SCAN_MISMATCH');
+    }
 
-      const maybeNextStep = task ? getNextStepAfterScan(task, completedStep.stepKey) : null;
+    const completedStep = await tx.scannerWorkflowStep.update({
+      where: { id: step.id },
+      data: {
+        status: 'COMPLETED',
+        scannedValue,
+        quantity: dto.quantity ?? null,
+        metadata: toJson(dto.metadata),
+        completedAt: new Date(),
+      },
+    });
 
-      if (maybeNextStep) {
-        const nextStep = await tx.scannerWorkflowStep.create({
-          data: stepCreateData(
-            session.id,
-            warehouse.id,
-            task?.id ?? null,
-            maybeNextStep,
-            completedStep.sequence + 1,
-          ),
-        });
-        const updatedSession = await tx.scannerSession.update({
-          where: { id: session.id },
-          data: { currentStepKey: nextStep.stepKey, heartbeatAt: new Date() },
-        });
-
-        return this.toInstruction(updatedSession, task, nextStep);
-      }
-
+    const maybeNextStep = task ? getNextStepAfterScan(task, completedStep.stepKey) : null;
+    if (maybeNextStep) {
+      const nextStep = await tx.scannerWorkflowStep.create({
+        data: stepCreateData(session.id, warehouseId, task?.id ?? null, maybeNextStep, completedStep.sequence + 1),
+      });
       const updatedSession = await tx.scannerSession.update({
         where: { id: session.id },
-        data: {
-          status: ScannerSessionStatus.COMPLETED,
-          currentStepKey: null,
-          heartbeatAt: new Date(),
-          completedAt: new Date(),
-        },
+        data: { currentStepKey: nextStep.stepKey, heartbeatAt: new Date() },
       });
+      return this.toInstruction(updatedSession, task, nextStep);
+    }
 
-      await this.completeTaskAfterRfScan(tx, warehouse.id, task, dto, actor);
-      await tx.outboxEvent.create({
-        data: {
-          type: 'RF_WORKFLOW_COMPLETED',
-          aggregateType: 'scanner_session',
-          aggregateId: session.id,
-          payload: {
-            warehouseId: warehouse.id,
-            taskId: task?.id ?? null,
-            workflow: session.workflow,
-            completedStepKey: completedStep.stepKey,
-          },
-        },
-      });
-
-      return this.toInstruction(updatedSession, task, null);
+    const updatedSession = await tx.scannerSession.update({
+      where: { id: session.id },
+      data: {
+        status: ScannerSessionStatus.COMPLETED,
+        currentStepKey: null,
+        heartbeatAt: new Date(),
+        completedAt: new Date(),
+      },
     });
+
+    await this.completeTaskAfterRfScan(tx, warehouseId, task, dto, actor);
+    await tx.outboxEvent.create({
+      data: {
+        type: 'RF_WORKFLOW_COMPLETED',
+        aggregateType: 'scanner_session',
+        aggregateId: session.id,
+        payload: {
+          warehouseId,
+          taskId: task?.id ?? null,
+          workflow: session.workflow,
+          completedStepKey: completedStep.stepKey,
+        },
+      },
+    });
+    return this.toInstruction(updatedSession, task, null);
   }
 
   async reportTaskException(
@@ -964,132 +962,110 @@ export class RfWorkflowsService {
       };
     }
 
-    const session = offlineScan.sessionReference
-      ? await this.tryResolveSession(warehouseId, offlineScan.sessionReference)
-      : null;
-    const task = offlineScan.taskReference
-      ? await this.tryResolveTask(warehouseId, offlineScan.taskReference)
-      : null;
-    const inserted = await this.client.$queryRawUnsafe<RfOfflineQueueRow[]>(
-      `INSERT INTO rf_offline_scan_queue
-        (warehouse_id, session_id, task_id, scanner_device_id, idempotency_key, step_key, scanned_value, quantity, status, payload, metadata, recorded_at)
-       VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $8, 'QUEUED', $9::jsonb, $10::jsonb, COALESCE($11::timestamptz, now()))
-       ON CONFLICT (warehouse_id, idempotency_key) DO NOTHING
-       RETURNING *`,
-      warehouseId,
-      session?.id ?? null,
-      task?.id ?? session?.taskId ?? null,
-      scannerDeviceId,
-      idempotencyKey,
-      offlineScan.stepKey ?? null,
-      offlineScan.scannedValue ?? null,
-      offlineScan.quantity ?? null,
-      JSON.stringify(offlineScan),
-      JSON.stringify(offlineScan.metadata ?? {}),
-      offlineScan.recordedAt ?? null,
-    );
+    return this.transaction(async tx => {
+      const session = offlineScan.sessionReference
+        ? await this.tryResolveSession(tx, warehouseId, offlineScan.sessionReference)
+        : null;
+      const task = offlineScan.taskReference
+        ? await this.tryResolveTask(tx, warehouseId, offlineScan.taskReference)
+        : null;
+      const [inserted] = await tx.$queryRawUnsafe<RfOfflineQueueRow[]>(
+        `INSERT INTO rf_offline_scan_queue
+          (warehouse_id, session_id, task_id, scanner_device_id, idempotency_key, step_key, scanned_value, quantity, status, payload, metadata, recorded_at)
+         VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $8, 'QUEUED', $9::jsonb, $10::jsonb, COALESCE($11::timestamptz, now()))
+         ON CONFLICT (warehouse_id, idempotency_key) DO NOTHING
+         RETURNING *`,
+        warehouseId, session?.id ?? null, task?.id ?? session?.taskId ?? null, scannerDeviceId, idempotencyKey,
+        offlineScan.stepKey ?? null, offlineScan.scannedValue ?? null, offlineScan.quantity ?? null,
+        JSON.stringify(offlineScan), JSON.stringify(offlineScan.metadata ?? {}), offlineScan.recordedAt ?? null,
+      );
+      if (!inserted) {
+        const [existing] = await tx.$queryRawUnsafe<RfOfflineQueueRow[]>(
+          `SELECT * FROM rf_offline_scan_queue WHERE warehouse_id = $1::uuid AND idempotency_key = $2`,
+          warehouseId, idempotencyKey,
+        );
+        if (!existing) throw new ConflictException('Offline scan could not be retrieved');
+        return offlineReplayItem(existing, offlineScan);
+      }
 
-    if (inserted.length === 0) {
-      await this.client.$executeRawUnsafe(
-        `UPDATE rf_offline_scan_queue
-         SET status = CASE WHEN status = 'SYNCED' THEN 'SYNCED' ELSE 'DUPLICATE' END,
-             updated_at = now()
-         WHERE warehouse_id = $1::uuid AND idempotency_key = $2`,
-        warehouseId,
-        idempotencyKey,
-      );
-      const existing = await this.client.$queryRawUnsafe<RfOfflineQueueRow[]>(
-        `SELECT * FROM rf_offline_scan_queue WHERE warehouse_id = $1::uuid AND idempotency_key = $2 LIMIT 1`,
-        warehouseId,
-        idempotencyKey,
-      );
-      return offlineQueueItem(idempotencyKey, existing[0] ?? null, 'DUPLICATE', null, null);
-    }
+      let errorCode: string | null;
+      let errorMessage: string | null = null;
+      if (!session && offlineScan.sessionReference) {
+        errorCode = 'REPLAY_FAILED';
+        errorMessage = 'RF session was not found';
+      } else if (offlineScan.taskReference && (!task || (session && task.id !== session.taskId))) {
+        errorCode = 'REPLAY_FAILED';
+        errorMessage = 'The offline task does not match the RF session';
+      } else if (!session) {
+        return offlineQueueItem(idempotencyKey, inserted, 'QUEUED', null, null);
+      } else {
+        // A business rejection must preserve the queue receipt while rolling back the workflow.
+        await tx.$executeRawUnsafe('SAVEPOINT rf_offline_scan');
+        try {
+          const instruction = await this.scanInSession(
+            tx,
+            warehouseId,
+            session.id,
+            {
+              scannedValue: offlineScan.scannedValue,
+              quantity: offlineScan.quantity,
+              metadata: {
+                ...(offlineScan.metadata ?? {}),
+                offlineReplay: true,
+                offlineRecordedAt: offlineScan.recordedAt ?? null,
+                offlineIdempotencyKey: idempotencyKey,
+              },
+            },
+            actor,
+            offlineScan.stepKey,
+          );
+          errorCode = instruction.step.errorCode;
+          if (errorCode) errorMessage = instruction.step.instruction;
+        } catch (error: unknown) {
+          if (!(error instanceof HttpException) || error.getStatus() >= 500) throw error;
+          await tx.$executeRawUnsafe('ROLLBACK TO SAVEPOINT rf_offline_scan');
+          errorCode = 'REPLAY_FAILED';
+          errorMessage = error.message;
+        }
+        await tx.$executeRawUnsafe('RELEASE SAVEPOINT rf_offline_scan');
+      }
 
-    if (!session) {
-      return offlineQueueItem(idempotencyKey, inserted[0] ?? null, 'QUEUED', null, null);
-    }
-
-    try {
-      const instruction = await this.scan(
-        warehouseId,
-        session.id,
-        {
-          scannedValue: offlineScan.scannedValue,
-          quantity: offlineScan.quantity,
-          metadata: {
-            ...(offlineScan.metadata ?? {}),
-            offlineReplay: true,
-            offlineRecordedAt: offlineScan.recordedAt ?? null,
-            offlineIdempotencyKey: idempotencyKey,
-          },
-        },
-        actor,
-      );
-      const hasMismatch = instruction.step.errorCode !== null;
-      const status = hasMismatch ? 'FAILED' : 'SYNCED';
-      await this.client.$executeRawUnsafe(
+      const status = errorCode ? 'FAILED' : 'SYNCED';
+      await tx.$executeRawUnsafe(
         `UPDATE rf_offline_scan_queue
-         SET status = $3,
-             error_code = $4,
-             error_message = $5,
-             synced_at = CASE WHEN $3 = 'SYNCED' THEN now() ELSE synced_at END,
-             updated_at = now()
-         WHERE warehouse_id = $1::uuid AND idempotency_key = $2`,
-        warehouseId,
-        idempotencyKey,
-        status,
-        instruction.step.errorCode,
-        hasMismatch ? instruction.step.instruction : null,
+         SET status = $2, error_code = $3, error_message = $4,
+             synced_at = CASE WHEN $2 = 'SYNCED' THEN now() ELSE synced_at END, updated_at = now()
+         WHERE id = $1::uuid`,
+        inserted.id, status, errorCode, errorMessage?.slice(0, 500) ?? null,
       );
-      return {
-        idempotencyKey,
-        status,
-        sessionId: session.id,
-        taskId: task?.id ?? session.taskId ?? null,
-        errorCode: instruction.step.errorCode,
-        errorMessage: hasMismatch ? instruction.step.instruction : null,
-      };
-    } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : 'Offline scan replay failed';
-      await this.client.$executeRawUnsafe(
-        `UPDATE rf_offline_scan_queue
-         SET status = 'FAILED', error_code = 'REPLAY_FAILED', error_message = $3, updated_at = now()
-         WHERE warehouse_id = $1::uuid AND idempotency_key = $2`,
-        warehouseId,
-        idempotencyKey,
-        message.slice(0, 500),
-      );
-      return {
-        idempotencyKey,
-        status: 'FAILED',
-        sessionId: session.id,
-        taskId: task?.id ?? session.taskId ?? null,
-        errorCode: 'REPLAY_FAILED',
-        errorMessage: message,
-      };
-    }
+      return offlineQueueItem(idempotencyKey, inserted, status, errorCode, errorMessage);
+    });
   }
 
   private async tryResolveSession(
+    tx: RfTransactionClient,
     warehouseId: string,
     reference: string,
   ): Promise<ScannerSessionRecord | null> {
+    if (!isUuid(reference)) return null;
     try {
-      return await this.resolveSession(warehouseId, reference);
-    } catch {
-      return null;
+      return await this.resolveSessionWithClient(tx, warehouseId, reference);
+    } catch (error: unknown) {
+      if (error instanceof NotFoundException) return null;
+      throw error;
     }
   }
 
   private async tryResolveTask(
+    tx: RfTransactionClient,
     warehouseId: string,
     reference: string,
   ): Promise<WarehouseTaskRecord | null> {
     try {
-      return await this.resolveTask(warehouseId, reference);
-    } catch {
-      return null;
+      return await this.resolveTaskWithClient(tx, warehouseId, reference);
+    } catch (error: unknown) {
+      if (error instanceof NotFoundException) return null;
+      throw error;
     }
   }
 
@@ -1099,8 +1075,8 @@ export class RfWorkflowsService {
     await this.ensureOfflineSchema();
     const rows = await this.client.$queryRawUnsafe<OfflineStatsRow[]>(
       `SELECT
-         count(*) FILTER (WHERE status = 'QUEUED') AS queued,
-         count(*) FILTER (WHERE status = 'FAILED') AS failed,
+         count(*) FILTER (WHERE status = 'QUEUED' OR (status = 'DUPLICATE' AND synced_at IS NULL AND error_code IS NULL)) AS queued,
+         count(*) FILTER (WHERE status = 'FAILED' OR (status = 'DUPLICATE' AND error_code IS NOT NULL)) AS failed,
          count(*) FILTER (WHERE status = 'SYNCED' AND synced_at >= now() - interval '24 hours') AS synced_today
        FROM rf_offline_scan_queue
        WHERE warehouse_id = $1::uuid`,
@@ -1402,6 +1378,21 @@ function offlineQueueItem(
   };
 }
 
+function offlineReplayItem(row: RfOfflineQueueRow, scan: RfOfflineScanDto): RfOfflineSyncResponse['items'][number] {
+  const payload = toRecord(row.payload);
+  if ((payload['sessionReference'] ?? null) !== (scan.sessionReference ?? null)
+    || (payload['taskReference'] ?? null) !== (scan.taskReference ?? null)
+    || row.step_key !== (scan.stepKey ?? null) || row.scanned_value !== (scan.scannedValue ?? null)
+    || row.quantity !== (scan.quantity ?? null)) {
+    return offlineQueueItem(row.idempotency_key, row, 'FAILED', 'OFFLINE_KEY_CONFLICT', 'This scan ID already belongs to another scan.');
+  }
+  if (row.status === 'SYNCED' || row.synced_at) {
+    return offlineQueueItem(row.idempotency_key, row, 'DUPLICATE', null, null);
+  }
+  const status = row.status === 'FAILED' || row.error_code ? 'FAILED' : 'QUEUED';
+  return offlineQueueItem(row.idempotency_key, row, status, null, null);
+}
+
 function defaultExceptionTitle(code: RfExceptionCode): string {
   const titles: Record<RfExceptionCode, string> = {
     [RfExceptionCode.SHORT_PICK]: 'Short pick reported from RF',
@@ -1559,9 +1550,14 @@ interface RfOfflineQueueRow {
   task_id: string | null;
   scanner_device_id: string | null;
   idempotency_key: string;
+  step_key: string | null;
+  scanned_value: string | null;
+  quantity: number | null;
   status: string;
   error_code: string | null;
   error_message: string | null;
+  synced_at: Date | null;
+  payload: unknown;
 }
 
 interface OfflineStatsRow {

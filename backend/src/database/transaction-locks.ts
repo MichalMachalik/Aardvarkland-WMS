@@ -17,6 +17,7 @@ const SAFE_TABLE_NAMES = new Set([
   'pick_carts',
   'billing_events',
   'billing_invoices',
+  'scanner_sessions',
 ]);
 const SAFE_ADVISORY_LOCK_NAMESPACES = new Set([
   'stock_quant_identity',

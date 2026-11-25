@@ -11,7 +11,7 @@ import { ProgressBar } from '../../components/ui/ProgressBar';
 import { StatusPill } from '../../components/ui/StatusPill';
 import { useApiMutation } from '../../core/api/useApiMutation';
 import { useApiResource } from '../../core/api/useApiResource';
-import { getRfQueue, listScanners, reportRfTaskException, resolveScan, resumeRfSession, scanRfSession, startRfTask, syncRfOfflineQueue, updateScannerTelemetry } from '../../core/api/wms';
+import { getRfQueue, getRfSession, listScanners, reportRfTaskException, resolveScan, resumeRfSession, scanRfSession, startRfTask, syncRfOfflineQueue, updateScannerTelemetry } from '../../core/api/wms';
 import { config } from '../../app/config';
 import {
   loadRfOfflineQueue,
@@ -66,6 +66,8 @@ interface RfInstruction {
   metadata: unknown;
 }
 type PendingOfflineScan = StoredRfOfflineScan;
+const offlineSyncBatchSize = 100;
+
 interface OfflineSyncResponse {
   synced: number;
   failed: number;
@@ -512,24 +514,46 @@ export function RfPage() {
   };
   const syncPending = async () => {
     if (!pending.length) return;
-    const result = await mutation.run(text.actions.syncQueue, () => syncRfOfflineQueue<OfflineSyncResponse>(warehouseId, {
-      scannerDeviceReference: registeredScannerReference,
-      scans: pending,
-      metadata: { source: 'rf-ui', scannerDeviceReference },
-    }));
-    if (!result) return;
-    const confirmed = result.items.filter((item) => item.status === 'SYNCED' || item.status === 'DUPLICATE').map((item) => item.idempotencyKey);
-    try {
-      // Remove only server-acknowledged keys from the *current persisted* queue,
-      // not a stale React snapshot; concurrently queued scans must survive.
-      setPending(await removeRfOfflineScans(warehouseId, confirmed));
-    } catch {
-      setOfflineQueueError(true);
-      appendLog(`${text.error}: ${text.offlineQueue}`);
-      return;
+    const ordered = [...pending].sort((left, right) => Date.parse(left.recordedAt) - Date.parse(right.recordedAt));
+    const result = await mutation.run(text.actions.syncQueue, async () => {
+      const totals = { synced: 0, failed: 0, duplicates: 0 };
+      for (let offset = 0; offset < ordered.length; offset += offlineSyncBatchSize) {
+        const scans = ordered.slice(offset, offset + offlineSyncBatchSize).map(scan => ({
+          idempotencyKey: scan.idempotencyKey,
+          sessionReference: scan.sessionReference,
+          taskReference: scan.taskReference,
+          stepKey: scan.stepKey,
+          scannedValue: scan.scannedValue,
+          quantity: scan.quantity,
+          recordedAt: scan.recordedAt,
+          metadata: scan.metadata,
+        }));
+        const batch = await syncRfOfflineQueue<OfflineSyncResponse>(warehouseId, {
+          scannerDeviceReference: registeredScannerReference,
+          scans,
+        });
+        const confirmed = batch.items.filter(item => item.status === 'SYNCED' || item.status === 'DUPLICATE').map(item => item.idempotencyKey);
+        if (confirmed.length) {
+          try {
+            setPending(await removeRfOfflineScans(warehouseId, confirmed));
+          } catch (error) {
+            setOfflineQueueError(true);
+            throw error;
+          }
+        }
+        totals.synced += batch.synced;
+        totals.failed += batch.failed;
+        totals.duplicates += batch.duplicates;
+      }
+      return totals;
+    });
+    if (session?.sessionId && ordered.some(scan => scan.sessionReference === session.sessionId)) {
+      const refreshed = await getRfSession<RfInstruction>(warehouseId, session.sessionId).catch(() => undefined);
+      if (refreshed) setSession(currentSession => currentSession?.sessionId === refreshed.sessionId ? refreshed : currentSession);
     }
-    appendLog(`${text.log.sync}: ${result.synced} ${text.log.synced} · ${result.failed} ${text.log.failed} · ${result.duplicates} ${text.log.duplicates}`);
     queueResource.refresh();
+    if (!result) return;
+    appendLog(`${text.log.sync}: ${result.synced} ${text.log.synced} · ${result.failed} ${text.log.failed} · ${result.duplicates} ${text.log.duplicates}`);
   };
   const reportProblem = async (action: RfExceptionAction) => {
     if (!selectedTask || sessionCompleted) return;

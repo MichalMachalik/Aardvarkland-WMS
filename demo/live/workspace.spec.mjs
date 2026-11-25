@@ -580,6 +580,65 @@ test('packing keeps orders separate and resumes packages, labels and dispatch fr
   expect((await shipments(pickup))[0].status).toBe('SHIPPED');
 });
 
+test('the RF browser uploads stored scans in order and keeps every unconfirmed scan after an interrupted batch', async ({ page }) => {
+  test.skip(process.env.WMS_LIVE_UI_WRITE !== 'true', 'Requires a disposable warehouse database.');
+  const warehouse = '/api/warehouses/MAIN';
+  const { accessToken: worker } = await liveApi(page, '/api/auth/login', {
+    data: { email: roles.worker.email, password: roles.worker.password },
+  });
+  const session = await liveApi(page, warehouse + '/rf/sessions', { token: worker, data: { workflow: 'MOVE' } });
+  const run = randomUUID();
+  const scans = Array.from({ length: 101 }, (_, index) => ({
+    idempotencyKey: `${run}-${index}`,
+    warehouseId: 'MAIN',
+    scannedValue: `OFFLINE-${index}`,
+    recordedAt: new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString(),
+    metadata: {},
+    ...(index === 0 ? { sessionReference: session.sessionId, stepKey: session.step.key } : {}),
+    ...(index === 1 ? { sessionReference: randomUUID(), stepKey: session.step.key } : {}),
+  }));
+  await page.addInitScript(items => {
+    if (sessionStorage.getItem('rf-test-fixture-loaded')) return;
+    localStorage.setItem('wms-rf-offline-queue-v3:MAIN', JSON.stringify(items));
+    sessionStorage.setItem('rf-test-fixture-loaded', 'yes');
+  }, scans);
+  await login(page, roles.worker);
+  await desktopNav(page).getByRole('button', { name: 'Skenování', exact: true }).click();
+  const queueButton = page.locator('[data-e2e-action="rf-sync-offline"]');
+  await expect(queueButton).toContainText('(101)');
+
+  const calls = [];
+  await page.route('**/rf/offline/sync', async route => {
+    const body = route.request().postDataJSON();
+    calls.push(body);
+    if (calls.length === 2) await route.abort();
+    else await route.continue();
+  });
+  await queueButton.click();
+  await expect(queueButton).toContainText('(100)');
+  await expect(queueButton).toBeEnabled();
+  expect(calls.map(body => body.scans.length)).toEqual([100, 1]);
+  expect(calls.flatMap(body => body.scans.map(scan => scan.idempotencyKey))).toEqual(scans.map(scan => scan.idempotencyKey));
+  for (const body of calls) {
+    expect(Object.keys(body).every(key => ['scans', 'scannerDeviceReference'].includes(key))).toBe(true);
+    expect(body.scans.every(scan => !('warehouseId' in scan))).toBe(true);
+  }
+  const after = await liveApi(page, `${warehouse}/rf/sessions/${session.sessionId}`, { token: worker });
+  expect(after.status).toBe('COMPLETED');
+
+  await page.reload();
+  await expect(queueButton).toContainText('(100)');
+  const retry = page.waitForResponse(response => new URL(response.url()).pathname.endsWith('/rf/offline/sync'));
+  await queueButton.click();
+  const response = await retry;
+  expect(response.ok()).toBe(true);
+  const body = await response.json();
+  const result = body.data ?? body;
+  expect(result).toMatchObject({ synced: 0, duplicates: 0, failed: 1, queued: 99 });
+  await expect(queueButton).toContainText('(100)');
+  expect(calls[2].scans.map(scan => scan.idempotencyKey)).toEqual(scans.slice(1).map(scan => scan.idempotencyKey));
+});
+
 test('cycle counts isolate plans, hide the RF quantity and write only approved counts to stock', async ({ page, browser }) => {
   test.skip(process.env.WMS_LIVE_UI_WRITE !== 'true', 'Enable writes only on a disposable database.');
   test.setTimeout(60000);

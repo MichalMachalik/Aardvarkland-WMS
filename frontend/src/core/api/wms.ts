@@ -62,6 +62,7 @@ export const endpoints = {
   pickWaves: (warehouseId: string) => `/warehouses/${warehouseId}/pick-waves`,
   releasePickWave: (warehouseId: string, waveId: string) => `/warehouses/${warehouseId}/pick-waves/${waveId}/release`,
   rfSessions: (warehouseId: string) => `/warehouses/${warehouseId}/rf/sessions`,
+  rfSession: (warehouseId: string, sessionId: string) => `/warehouses/${warehouseId}/rf/sessions/${sessionId}`,
   rfQueue: (warehouseId: string) => `/warehouses/${warehouseId}/rf/queue`,
   rfStartTask: (warehouseId: string, taskId: string) => `/warehouses/${warehouseId}/rf/tasks/${taskId}/start`,
   rfScan: (warehouseId: string, sessionId: string) => `/warehouses/${warehouseId}/rf/sessions/${sessionId}/scan`,
@@ -217,6 +218,7 @@ export function printShipmentLabel<T>(warehouseId: string, shipmentId: string, l
 export function stageShipment<T>(warehouseId: string, shipmentId: string, body: MutationBody = {}) { return post<T>(endpoints.stageShipment(warehouseId, shipmentId), body, createWmsIdempotencyKey(`storage-stage-${shipmentId}`)); }
 export function shipShipment<T>(warehouseId: string, shipmentId: string, body: MutationBody = {}) { return post<T>(endpoints.shipShipment(warehouseId, shipmentId), body, createWmsIdempotencyKey(`storage-ship-${shipmentId}`)); }
 export function getRfQueue<T>(warehouseId: string, query?: QueryParams, options?: ReadOptions) { return get<T>(endpoints.rfQueue(warehouseId), query, options); }
+export function getRfSession<T>(warehouseId: string, sessionId: string, options?: ReadOptions) { return get<T>(endpoints.rfSession(warehouseId, sessionId), undefined, options); }
 export function startRfTask<T>(warehouseId: string, taskId: string, body: MutationBody = {}) { return post<T>(endpoints.rfStartTask(warehouseId, taskId), body, `storage-rf-start-${taskId}`); }
 export function scanRfSession<T>(warehouseId: string, sessionId: string, body: MutationBody = {}) { return post<T>(endpoints.rfScan(warehouseId, sessionId), body, createWmsIdempotencyKey(`storage-rf-scan-${sessionId}`)); }
 export function resumeRfSession<T>(warehouseId: string, sessionId: string, body: MutationBody = {}) { return post<T>(endpoints.rfResumeSession(warehouseId, sessionId), body, createWmsIdempotencyKey(`storage-rf-resume-${sessionId}`)); }
